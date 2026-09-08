@@ -73,7 +73,7 @@ jobs:
           echo "Tag ${TAG} -> version ${TAG#v}"
 
       - name: Check out the tagged tree
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           # Check out the tag itself, not the branch the dispatch happened to be started from,
           # so the version files read below are the ones the tag actually points at.
@@ -239,7 +239,7 @@ jobs:
         id: release
         # Pinned to the major version: v2 keeps security fixes coming without a new SHA every time,
         # and this action only ever handles this repository's own release metadata.
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ steps.tag.outputs.tag }}
           name: VRChat Archive Mod ${{ steps.tag.outputs.tag }}

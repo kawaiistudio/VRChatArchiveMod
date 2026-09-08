@@ -74,7 +74,7 @@ jobs:
 
     steps:
       - name: Check out the sources
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       # Pinned so the check is reproducible, and installed by setup-dotnet
       # whether or not the runner image happens to ship it. The number is
@@ -84,7 +84,7 @@ jobs:
       # nothing to do with the mod's own target framework (net6.0) — nothing
       # here compiles the mod.
       - name: Set up .NET SDK (for the parser host, not for the mod)
-        uses: actions/setup-dotnet@v4
+        uses: actions/setup-dotnet@v6
         with:
           dotnet-version: '8.0.x'
 

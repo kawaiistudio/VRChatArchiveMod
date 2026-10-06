@@ -23,6 +23,10 @@ namespace VRChatArchiveMod.Core
 	{
 		private const float TtlSeconds = 1f;
 
+		// How long a FAILED lookup is remembered. A hit is cheap to refresh; a miss costs three
+		// GetComponent walks of a whole avatar rig, so it must not be retried on the normal TTL.
+		private const float MissBackoffSeconds = 30f;
+
 		private static bool _resolved;
 		private static Type _playerType;
 		private static PropertyInfo _mApiUser;
@@ -44,13 +48,13 @@ namespace VRChatArchiveMod.Core
 				GameObject go = api.gameObject;
 				if (go == null) return null;
 				int id = go.GetInstanceID();
-				float now = Time.realtimeSinceStartup;
+				float now = VaClock.Now;
 
 				if (Cache.TryGetValue(id, out Entry e) && now - e.At < TtlSeconds) return e.User;
 
-				var comp = go.GetComponent(_playerIl2Type)
-				        ?? go.GetComponentInParent(_playerIl2Type)
-				        ?? go.GetComponentInChildren(_playerIl2Type);
+				var comp = go.GetComponentSafe(_playerIl2Type)
+				        ?? go.GetComponentInParentSafe(_playerIl2Type)
+				        ?? go.GetComponentInChildrenSafe(_playerIl2Type);
 
 				APIUser user = null;
 				if (comp != null)
@@ -59,8 +63,21 @@ namespace VRChatArchiveMod.Core
 					if (player != null) user = _mApiUser.GetValue(player) as APIUser;
 				}
 
-				if (e == null) Cache[id] = new Entry { User = user, At = now };
-				else { e.User = user; e.At = now; }
+				// A LOOKUP THAT FAILED MUST NOT BE RETRIED EVERY SECOND.
+				//
+				// The three GetComponent calls above walk the player's hierarchy, and
+				// GetComponentInChildren walks an ENTIRE avatar rig -- hundreds of transforms. On build
+				// 1903 VRC.Player's members cannot be placed, so that search finds nothing, and with the
+				// miss expiring on the one-second TTL the whole walk was paid again a second later, for
+				// every player, for ever. Measured in production: ESP = 391 ms/s with THREE players in the
+				// room, and Windows marking VRChat "not responding".
+				//
+				// A hit still refreshes on the normal TTL; a MISS is remembered far longer, so not finding
+				// something costs once instead of sixty times a minute. Same defect already fixed for the
+				// nameplate resolve and for LocalUserId -- worth naming, because it keeps coming back.
+				float stamp = user != null ? now : now + (MissBackoffSeconds - TtlSeconds);
+				if (e == null) Cache[id] = new Entry { User = user, At = stamp };
+				else { e.User = user; e.At = stamp; }
 
 				if (now >= _nextSweep) { _nextSweep = now + 30f; Sweep(now); }
 				return user;

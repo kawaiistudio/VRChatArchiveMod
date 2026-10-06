@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using UnityEngine;
 using VRChatArchiveMod.Core;
 
@@ -34,7 +34,7 @@ namespace VRChatArchiveMod.Modules
 
 
 		// MANAGED CLOCK for the gate: Stopwatch is a QueryPerformanceCounter read — no interop, no
-		// allocation. Time.realtimeSinceStartup is an il2cpp_runtime_invoke that BOXES its float on
+		// allocation. VaClock.Now is an il2cpp_runtime_invoke that BOXES its float on
 		// the il2cpp heap: one native call plus one native allocation per frame, spent nine frames
 		// out of ten on deciding "not yet". Measured at 20-100 us a call on this machine (SpawnSound,
 		// whose whole frame is two of these reads, sits at 2.5-13 ms/s in the same runs).
@@ -57,6 +57,9 @@ namespace VRChatArchiveMod.Modules
 				if (nowTs < _nextApplyTs) return;
 				_nextApplyTs = nowTs + ApplyEveryTs;
 
+				// While flying, MovementModule zeros locomotion speed so the avatar stays in neutral upright pose.
+				if (ModConfig.FlyEnabled.Value) return;
+
 				// PER KIND. Each switch owns one value: what is off keeps the world's own number,
 				// what is on is held to yours.
 				bool w = ModConfig.WalkMod.Value, r = ModConfig.RunMod.Value, j = ModConfig.JumpMod.Value;
@@ -72,8 +75,15 @@ namespace VRChatArchiveMod.Modules
 					return;
 				}
 
+				// A MISSING API IS NOT A NEW WORLD (2026-09-13). This used to clear _captured, which is
+				// the snapshot of the world's OWN locomotion values. The local API is momentarily null
+				// around a respawn or an avatar load — while our overrides are still applied — so the
+				// next tick re-captured the numbers THIS MODULE was currently forcing and recorded them
+				// as "the world's own". Every later restore then wrote the modded speeds back, and the
+				// world's real values were gone for the session. The snapshot is invalidated only by a
+				// genuine world change, which OnSceneLoaded already handles.
 				var api = PlayerRef.LocalApi();
-				if (api == null) { _captured = false; return; }
+				if (api == null) return;
 
 				if (!_captured) Capture(api);
 
@@ -179,6 +189,19 @@ namespace VRChatArchiveMod.Modules
 				ModConfig.RunSpeed.Value = _origRun;
 				ModConfig.StrafeSpeed.Value = _origStrafe;
 				ModConfig.JumpImpulse.Value = _origJump;
+				ModConfig.WalkMod.Value = false;
+				ModConfig.RunMod.Value = false;
+				ModConfig.JumpMod.Value = false;
+				ForceJumpModule.Deactivate();
+				var api = PlayerRef.LocalApi();
+				if (api != null && _captured)
+				{
+					try { api.SetWalkSpeed(_origWalk); } catch { }
+					try { api.SetRunSpeed(_origRun); } catch { }
+					try { api.SetStrafeSpeed(_origStrafe); } catch { }
+					try { api.SetJumpImpulse(_origJump); } catch { }
+				}
+				Toast.Show("Movement reset to world");
 			}
 			catch { }
 		}

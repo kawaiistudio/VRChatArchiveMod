@@ -93,6 +93,7 @@ namespace VRChatArchiveMod.Modules
 		private static readonly List<Behaviour> _disabledIk = new List<Behaviour>();
 		private static float _nextResolve;
 		private static int _copiedFrames;
+		private static bool _reenableLogged;
 
 		// Every humanoid bone except the enum's terminator. Hips are included for ROTATION only —
 		// the root position stays ours (see the file header).
@@ -133,6 +134,7 @@ namespace VRChatArchiveMod.Modules
 			_local = _target = null;
 			_nextResolve = 0f;
 			_copiedFrames = 0;
+			ResetProbe();
 			Status = "mimicking " + TargetName;
 			VRChatArchiveModPlugin.Logger.LogInfo("[MimicPose] mimicking " + TargetName + " (" + TargetUid + ")");
 		}
@@ -150,16 +152,99 @@ namespace VRChatArchiveMod.Modules
 
 		public override void OnSceneLoaded(int buildIndex) { if (Active) Stop("world changed"); }
 
+		// WHO STILL WRITES AFTER US. The copy is written in LateUpdate; with the Animator and IK
+		// paused, nothing should move those bones again before the next frame. So the rotations we
+		// wrote are remembered, and at the start of the next frame compared with what is there: any
+		// bone that moved was rewritten after the copy, by something still running. Measured over the
+		// first 120 frames of each mimic and logged once, so "the hands still don't follow" comes with
+		// the list of bones being taken back and by how much.
+		private static readonly HumanBodyBones[] ProbeBones =
+		{
+			HumanBodyBones.Hips, HumanBodyBones.Spine, HumanBodyBones.Head,
+			HumanBodyBones.LeftUpperArm, HumanBodyBones.LeftLowerArm, HumanBodyBones.LeftHand, HumanBodyBones.LeftIndexProximal,
+			HumanBodyBones.RightUpperArm, HumanBodyBones.RightLowerArm, HumanBodyBones.RightHand, HumanBodyBones.RightIndexProximal,
+			HumanBodyBones.LeftUpperLeg, HumanBodyBones.LeftLowerLeg, HumanBodyBones.RightUpperLeg, HumanBodyBones.RightLowerLeg,
+		};
+		private static readonly Quaternion[] _probeWritten = new Quaternion[ProbeBones.Length];
+		private static readonly bool[] _probeHas = new bool[ProbeBones.Length];
+		private static readonly float[] _probeSum = new float[ProbeBones.Length];
+		private static bool _probeArmed, _probeDone;
+		private static int _probeFrames;
+		private const int ProbeFrames = 120;
+
+		private static void ResetProbe()
+		{
+			_probeArmed = false; _probeDone = false; _probeFrames = 0;
+			for (int i = 0; i < ProbeBones.Length; i++) { _probeSum[i] = 0f; _probeHas[i] = false; }
+		}
+
+		private static void SnapshotProbe()
+		{
+			if (_probeDone || _local == null) return;
+			for (int i = 0; i < ProbeBones.Length; i++)
+			{
+				Transform t = null;
+				try { t = _local.GetBoneTransform(ProbeBones[i]); } catch { }
+				_probeHas[i] = t != null;
+				if (t != null) _probeWritten[i] = t.localRotation;
+			}
+			_probeArmed = true;
+		}
+
+		public override void OnUpdate()
+		{
+			if (!Active || !_probeArmed || _probeDone || _local == null) return;
+			try
+			{
+				for (int i = 0; i < ProbeBones.Length; i++)
+				{
+					if (!_probeHas[i]) continue;
+					var t = _local.GetBoneTransform(ProbeBones[i]);
+					if (t != null) _probeSum[i] += Quaternion.Angle(_probeWritten[i], t.localRotation);
+				}
+				_probeArmed = false;
+				if (++_probeFrames < ProbeFrames) return;
+				_probeDone = true;
+				var sb = new System.Text.StringBuilder();
+				for (int i = 0; i < ProbeBones.Length; i++)
+				{
+					if (!_probeHas[i]) continue;
+					float avg = _probeSum[i] / _probeFrames;
+					if (avg >= 0.5f) sb.Append(ProbeBones[i]).Append(' ').Append(avg.ToString("0.0")).Append("° ");
+				}
+				VRChatArchiveModPlugin.Logger.LogInfo(sb.Length == 0
+					? "[MimicPose] nothing rewrites the copied pose after us (" + _probeFrames + " frames measured) - the pose on your avatar is exactly the copy."
+					: "[MimicPose] still rewritten after the copy (average per frame over " + _probeFrames + " frames): " + sb.ToString().Trim());
+			}
+			catch { _probeDone = true; }
+		}
+
 		public override void OnLateUpdate()
 		{
 			if (!Active) return;
 			try
 			{
-				float now = Time.realtimeSinceStartup;
+				float now = VaClock.Now;
 				if (now >= _nextResolve || _local == null || _target == null)
 				{
 					_nextResolve = now + 2f;   // avatars change; re-find both rigs on a slow tick
 					if (!Resolve()) return;
+				}
+
+				// KEEP THEM PAUSED. VRChat switches its own IK back on (calibration, seat, avatar
+				// reset); one flipped back on silently undoes the copy. Cheap: a handful of bools.
+				for (int k = 0; k < _disabledIk.Count; k++)
+				{
+					try
+					{
+						var c = _disabledIk[k];
+						if (c != null && c.enabled)
+						{
+							c.enabled = false;
+							if (!_reenableLogged) { _reenableLogged = true; VRChatArchiveModPlugin.Logger.LogInfo("[MimicPose] VRChat switched " + MenuCard.Il2CppNameOf(c) + " back on; paused it again."); }
+						}
+					}
+					catch { }
 				}
 
 				// MUSCLE SPACE FIRST. A humanoid pose expressed as Unity muscle values is independent
@@ -189,6 +274,7 @@ namespace VRChatArchiveMod.Modules
 
 				CopyParams();
 				_copiedFrames++;
+				SnapshotProbe();
 			}
 			catch (Exception e)
 			{
@@ -300,8 +386,16 @@ namespace VRChatArchiveMod.Modules
 		{
 			try
 			{
+				// THE PLAYER ROOT, NOT THE AVATAR. This used to search local.transform (the avatar) only,
+				// while LogRig searched from the player root. PoseLocalUpdate lives on the player object,
+				// above the avatar, so the log listed it as "(on)" and the pause never reached it: every
+				// frame it re-applied the avatar's own pose over the copy, and 2026-09-23 showed
+				// "local IK paused (1 component(s))" with PoseLocalUpdate still running. Same root as
+				// LogRig now, so what the log names is exactly what gets paused.
 				var root = local.transform;
-				var comps = root.GetComponentsInChildren<Behaviour>(true);
+				Transform top = root;
+				try { for (int g = 0; top.parent != null && g < 8; g++) top = top.parent; } catch { top = root; }
+				var comps = top.GetComponentsInChildren<Behaviour>(true);
 				if (comps == null) return;
 				LogRig(root);
 				for (int i = 0; i < comps.Length; i++)
@@ -313,8 +407,20 @@ namespace VRChatArchiveMod.Modules
 					if (!IsLegOrBodyIk(n)) continue;
 					try { if (c.enabled) { c.enabled = false; _disabledIk.Add(c); } } catch { }
 				}
+				// AND OUR OWN ANIMATOR. With IK paused the copy was still only "trying" (owner,
+				// 2026-09-23: legs, arms and hands half-followed): the local Animator keeps playing our
+				// locomotion, idle and hand-gesture layers every frame, and the copy is fighting it for
+				// the same bones - fingers most of all, since a gesture layer owns them outright.
+				// Paused, the copied pose is the ONLY thing that moves the avatar, down to the fingers.
+				// Put back with the rest on stop.
+				try { if (local.enabled) { local.enabled = false; _disabledIk.Add(local); } } catch { }
+				_reenableLogged = false;
 				if (_disabledIk.Count > 0)
-					VRChatArchiveModPlugin.Logger.LogInfo("[MimicPose] local IK paused (" + _disabledIk.Count + " component(s)) so the copied pose is what gets sent.");
+				{
+					var names = new System.Text.StringBuilder();
+					foreach (var c in _disabledIk) { try { names.Append(MenuCard.Il2CppNameOf(c)).Append(' '); } catch { } }
+					VRChatArchiveModPlugin.Logger.LogInfo("[MimicPose] local IK paused (" + _disabledIk.Count + " component(s): " + names.ToString().Trim() + ") so the copied pose is what gets sent.");
+				}
 			}
 			catch { }
 		}

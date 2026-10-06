@@ -2,18 +2,54 @@ VRChat Archive Mod — NOTICE
 ===========================
 
 The MIT License in LICENSE covers the source code in this repository authored
-by the project. It does NOT cover the third-party components or the embedded
-media assets described in the README's "Credits & Third-party" section, which
-remain the property of their respective owners and are NOT redistributed here:
+by the project: the C# mod (src/), the native C++ engine and its loader (cpp/),
+the port kit (tools/pack-port/) and the offline tools (tools/*.py).
 
-  - Proprietary VRChat / Unity / BepInEx / Il2CppInterop reference assemblies
-    (the ignored libs/ directory) — obtain them from your own install.
-  - Embedded media (the ignored ressources/ directory): loading-screen
-    artwork/music, soundboard/spawn audio clips, and Bad Apple!! chatbox frame
-    data are the property of their respective owners and are not included.
-  - FewTags (by Fewdys) and Inigo Quilez's shader work — see the README's
-    Credits & Third-party section for attribution.
+It does NOT cover the third-party components and the media listed below. They
+remain the property of their respective owners, under their own licences, and
+none of them is redistributed in this repository.
+
+Not in the repository, needed to build or run
+---------------------------------------------
+  - VRChat, Unity and the il2cpp runtime (GameAssembly.dll, UnityPlayer.dll,
+    VRChat_Data/**) — VRChat Inc. / Unity Technologies. The mod runs inside the
+    game; nothing of the game is here.
+  - The interop assemblies generated from a VRChat install (libs/interop/) —
+    derived from VRChat's and Unity's property.
+  - BepInEx 6 (IL2CPP) — LGPL-2.1. Its compiled core (libs/bepinex/) is not
+    committed; obtain it from https://builds.bepinex.dev.
+  - Il2CppInterop — LGPL-3.0. Part of the BepInEx IL2CPP distribution.
+  - HarmonyX — MIT. Part of the BepInEx distribution.
+  - Dobby — Apache-2.0. The inline-hook backend the C++ engine uses through the
+    dobby.dll that BepInEx IL2CPP already ships; not vendored here.
+  - RuntimeUnityEditor by ManlyMarco — GPL-3.0. src/Modules/RuntimeEditorHost.cs
+    can load an IL2CPP build of it from an embedded, gzipped copy
+    (ressources/rue/, gitignored). The copy is NOT in this repository. Anyone
+    who embeds it in a binary they distribute must comply with the GPL-3.0 for
+    that binary; dropping the two <EmbeddedResource> lines from the csproj
+    removes the dependency entirely.
+  - Mono's `mcs` C# compiler — loaded by RuntimeUnityEditor's REPL, from the
+    same embedded, gitignored resource. Mono project licensing applies.
+  - Embedded media (ressources/, gitignored): soundboard and spawn audio clips,
+    panel artwork, the Bad Apple!! soundtrack and baked frame data (Team
+    Shanghai Alice and respective artists), third-party music supplied by
+    individual users. Property of their respective owners; not included.
+
+Code and techniques credited
+----------------------------
+  - FewTags by Fewdys — src/Modules/FewTagsModule.cs is a close derivation of
+    the FewTags plate technique and reads its public tag database at runtime.
+  - Íñigo Quílez — a retired overlay in MenuSkinModule ports his domain-warping
+    fbm shader (https://iquilezles.org/articles/warp).
+  - js6pak/libil2cpp-archive — the per-Unity-version il2cpp-api-functions.h
+    that the export remap in tools/pack-port/ is aligned against. The header
+    itself is not committed; the tools fetch it by tag.
+  - dwgx/vrchat-il2cpp-re — published research on VRChat's metadata encryption
+    and Unity 6 il2cpp layouts, used as a reference (and, for the metadata
+    algorithm, ruled out for the October 2026 build). No code copied.
+  - Comments in a few modules describe behaviour observed in other VRChat
+    tools, for maintainability only; no third-party code is copied there.
 
 "VRChat" and related marks are the property of VRChat Inc. This project is
 unofficial and unaffiliated. Loading third-party code into VRChat may violate
-its Terms of Service; see the Disclaimer section of the README.
+its Terms of Service; see the Disclaimer section of README.md.

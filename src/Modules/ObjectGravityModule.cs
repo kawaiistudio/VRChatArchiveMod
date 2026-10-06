@@ -72,7 +72,7 @@ namespace VRChatArchiveMod.Modules
 			if (!Active) return;
 			try
 			{
-				float now = Time.realtimeSinceStartup;
+				float now = VaClock.Now;
 				if (now < _nextReassert) return;
 				_nextReassert = now + 0.1f;
 				ReassertAll(now);
@@ -90,7 +90,7 @@ namespace VRChatArchiveMod.Modules
 				// taken — the whole point is that no single frame pays for all of it.
 				if (_scan != null) { StepScan(); return; }
 
-				float now = Time.realtimeSinceStartup;
+				float now = VaClock.Now;
 				if (now < _nextSweep) return;
 				// Only DISCOVERY is rate-limited: FindObjectsOfType walks the whole object table.
 				_nextSweep = now + 2f;
@@ -110,7 +110,7 @@ namespace VRChatArchiveMod.Modules
 				// next few frames instead, so the first pickups float almost immediately and the
 				// rest follow without a hitch.
 				Active = true; _nextSweep = 0f; _nextReassert = 0f; _scan = null;
-				ReassertAll(Time.realtimeSinceStartup); BeginScan();
+				ReassertAll(VaClock.Now); BeginScan();
 				Status = "object gravity removed — scanning…";
 			}
 			VaTagsModule.LastStatus = Status;
@@ -145,7 +145,17 @@ namespace VRChatArchiveMod.Modules
 					}
 					if (h.Body.useGravity) h.Body.useGravity = false;
 				}
-				catch { Forget(i); }
+				catch
+				{
+					// RESTORE BEFORE FORGETTING (2026-09-13). Discovery already wrote useGravity =
+					// false, so an entry dropped here on a merely TRANSIENT throw left that pickup
+					// floating for the rest of the session: _bodies is the only ledger RestoreAll()
+					// walks, and _ids kept the object's id so discovery could not re-adopt it either.
+					// Try to hand gravity back first — if the body really is gone this throws again
+					// and is swallowed, which is the same outcome as before.
+					try { if (h.Body != null && NativeGuard.Alive(h.Body)) h.Body.useGravity = h.Was; } catch { }
+					Forget(i);
+				}
 			}
 		}
 
@@ -176,7 +186,7 @@ namespace VRChatArchiveMod.Modules
 			{
 				// NON-GENERIC: FindObjectsOfType<VRC_Pickup>() returns nothing on this build.
 				if (_pickupIl2 == null) _pickupIl2 = Il2CppInterop.Runtime.Il2CppType.Of<VRC.SDKBase.VRC_Pickup>();
-				_scan = UnityEngine.Object.FindObjectsOfType(_pickupIl2);
+				_scan = VRChatArchiveMod.Core.Live.AllOfType(_pickupIl2);
 				_scanAt = 0; _scanAdded = 0; _scanSkipped = 0; _scanMs = 0.0;
 			}
 			catch (Exception e)

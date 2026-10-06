@@ -4,7 +4,13 @@ using UnityEngine;
 namespace VRChatArchiveMod.Core
 {
 	// Il2Cpp-injected MonoBehaviour that pumps the module update loop each frame.
-	// Registered via ClassInjector and attached to a persistent GameObject in Plugin.Load().
+	//
+	// NOT USED ON VRCHAT BUILD 1903. ClassInjector now gets as far as finishing AddComponent (the token
+	// repair fixed that much), but Unity never calls a single callback on the resulting component: the
+	// injected Il2CppClass is built to a layout this build does not use, so its method table is wrong
+	// and the first invocation ends the process. Core/FramePump drives the modules instead, riding on
+	// Unity's own per-frame methods, and is the default. VA_RUNNER=inject selects this one to re-test
+	// injection after a VRChat update or an interop regeneration.
 	public class ModRunner : MonoBehaviour
 	{
 		public ModRunner(IntPtr ptr) : base(ptr) { }

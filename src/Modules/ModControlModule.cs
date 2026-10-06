@@ -69,9 +69,63 @@ namespace VRChatArchiveMod.Modules
 		// main thread — runs it on the next frame.
 		private static readonly Queue<Action> MainWork = new Queue<Action>();
 
+		// THE FAST LANE (2026-09-13): TOGGLES NEVER WAIT BEHIND A BATCH.
+		//
+		// MainWork is PACED — one step per 10 ms — because bulk networked work (a RUN ALL of a
+		// hundred udon events) must not burst. That pacing is right for bulk and wrong for a toggle:
+		// a user flipping forceJump while a 1137-step udonOwn batch was queued waited up to 40 s,
+		// and TWICE, because ApplyAction's toggle cases re-enter OnMain from inside the queued work.
+		// A toggle that lands seconds late is indistinguishable from a broken one.
+		//
+		// So actions that are LOCAL, cheap and cannot emit a burst — every "*Stop", forceJump, ghost,
+		// the rotator/boxDrop/elevator setters, menu switches — go on a second queue that PumpMain
+		// drains COMPLETELY every frame, ahead of the paced lane. _fastContext is set while that
+		// drain runs, so an OnMain() re-entered from inside a fast job (the second hop above) lands
+		// on the fast lane too and executes in the same frame: a toggle is applied end to end on the
+		// frame it arrives. Main-thread only, like everything in this queue.
+		private static readonly Queue<Action> MainWorkFast = new Queue<Action>();
+		private static bool _fastContext;
+		private const int FastLaneCap = 512;   // should never be approached: fast jobs are single steps
+
+		private static readonly HashSet<string> ToggleClassActions = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+		{
+			// stopping something must be instant above all
+			"orbitStop", "objectOrbitStop", "elevatorPlayerStop", "chatMimicStop", "mimicStop", "voiceMimicStop",
+			"resetMovement",
+			// local switches
+			"forceJump", "ghost", "fastSync", "rotator", "rotatorFlip", "rotatorReset", "trueView",
+			"boxDrop", "boxDropX", "boxDropY", "boxDropZ", "portalInfinite",
+			"menuBackgrounds", "launchpadConsole", "archiveLogToggle",
+			"playerGrab", "playerGrabAim", "forcePickup", "forceGrab",
+			// setters that only change a parameter
+			"elevatorSpeed", "elevatorHeight", "elevatorAutoCorrect", "mimicMirror",
+			"markPut", "markClear", "markShape", "markMode",
+			// local one-shots with no network burst
+			"antiCrashRescan", "photonGuardReset", "refreshTags", "refreshFavs", "sbPlay", "sbPreview", "whoBlockedMe",
+		};
+
+		private static bool IsToggleClassAction(string id) => !string.IsNullOrEmpty(id) && ToggleClassActions.Contains(id);
+
+		private static void OnMainFast(Action work)
+		{
+			if (work == null) return;
+			lock (MainWorkFast)
+			{
+				if (MainWorkFast.Count >= FastLaneCap)
+				{
+					VRChatArchiveModPlugin.Logger.LogWarning("[ModControl] fast lane full, command dropped.");
+					return;
+				}
+				MainWorkFast.Enqueue(work);
+			}
+		}
+
 		private static void OnMain(Action work)
 		{
 			if (work == null) return;
+			// Re-entered from a fast job (a toggle case doing its own OnMain): stay on the fast lane so
+			// the second hop runs this frame instead of joining the paced queue behind a batch.
+			if (_fastContext) { OnMainFast(work); return; }
 			lock (MainWork)
 			{
 				// A backstop, not a policy: nothing here should ever queue 64 deep, and a queue that grew
@@ -104,6 +158,24 @@ namespace VRChatArchiveMod.Modules
 
 		private static void PumpMain()
 		{
+			// FAST LANE FIRST, DRAINED TO EMPTY, NOT PACED. Each job is a single local step (a
+			// toggle, a stop, a setter), so running all of them is microseconds; and the loop keeps
+			// going until the queue is empty so a job enqueued BY a job — the toggle cases' inner
+			// OnMain, redirected here by _fastContext — runs in this same frame.
+			for (int guard = 0; guard < FastLaneCap * 2; guard++)
+			{
+				Action fast;
+				lock (MainWorkFast)
+				{
+					if (MainWorkFast.Count == 0) break;
+					fast = MainWorkFast.Dequeue();
+				}
+				_fastContext = true;
+				try { fast(); }
+				catch (Exception e) { VRChatArchiveModPlugin.Logger.LogWarning("[ModControl] fast command failed: " + e.Message); }
+				finally { _fastContext = false; }
+			}
+
 			long now = MainClock.ElapsedMilliseconds;
 			long elapsed = now - _mainLastMs;
 			_mainLastMs = now;
@@ -204,7 +276,7 @@ namespace VRChatArchiveMod.Modules
 				// early-out — so switching VA tags off silently killed this whole channel. It lives here
 				// now, before the ModControl switch too, so the mod always knows whether the desktop
 				// client is there. Poll throttles itself, so a second caller would be harmless.
-				VaAuth.Poll(Time.realtimeSinceStartup);
+				VaAuth.Poll(VaClock.Now);
 
 				// Anything the client asked for that has to touch Unity runs HERE, on the frame — not
 				// on the socket continuation that received it. Ahead of the link check on purpose, so
@@ -217,7 +289,7 @@ namespace VRChatArchiveMod.Modules
 
 				SubscribeOnce();
 
-				float now = Time.realtimeSinceStartup;
+				float now = VaClock.Now;
 
 				// THE WORLD ID ARRIVES LATE, and something has to notice.
 				//
@@ -330,6 +402,23 @@ namespace VRChatArchiveMod.Modules
 		// to the user turns "who am I told about" into "who do I get to follow", and lets them
 		// delete the very announcement they are the audience for. Not theirs to edit.
 		// The chatbox lines seen since the last sync, drained so each is delivered exactly once.
+		// One line about the decryptor for the client's sync: what AssetBundlePatch is deciding right
+		// now and what it has done since launch. Never throws — the sync must not die on a counter.
+		private static string DecryptorStatus()
+		{
+			try
+			{
+				// The decryptor is no longer compiled into the mod: it is delivered by the server only to
+				// an entitled account and armed at runtime. So the honest status is the ARM STATE the
+				// module reports (fetching / ON / not entitled), plus how many bundles it has decrypted.
+				// [open-source build] The plaintext-cache decryptor (AssetBundlePatchModule) is not part of
+				// this repository; it is a server-gated paid feature injected at runtime in the private
+				// build. With nothing to arm, the honest status is empty.
+				return "";
+			}
+			catch { return ""; }
+		}
+
 		private static string ChatMimicLinesJson()
 		{
 			try
@@ -526,6 +615,17 @@ namespace VRChatArchiveMod.Modules
 			}
 			catch { }
 
+			// Elevator, same shape as the ring so the client's switch shows the real state.
+			bool elevator = false; string elevatorCenter = ""; int elevatorCount = 0; bool elevatorAuto = false;
+			try
+			{
+				elevator = ElevatorModule.Active;
+				elevatorCenter = ElevatorModule.CenterName ?? "";
+				elevatorCount = ElevatorModule.Count;
+				elevatorAuto = ModConfig.ElevatorAutoCorrect.Value;
+			}
+			catch { }
+
 			// And Force Grab, read once here so a pickup dropped mid-build cannot split the pair.
 			bool forceGrab = false; string forceGrabName = "";
 			try
@@ -572,12 +672,27 @@ namespace VRChatArchiveMod.Modules
 			  .Append(",\"objectOrbit\":").Append(objOrbit ? "true" : "false")
 			  .Append(",\"objectOrbitCenter\":").Append(Json(objOrbitCenter))
 			  .Append(",\"objectOrbitCount\":").Append(objOrbitCount)
+			  .Append(",\"elevator\":").Append(elevator ? "true" : "false")
+			  .Append(",\"elevatorCenter\":").Append(Json(elevatorCenter))
+			  .Append(",\"elevatorCount\":").Append(elevatorCount)
+			  .Append(",\"elevatorAutoCorrect\":").Append(elevatorAuto ? "true" : "false")
 			  // The soundboard: its clip list (so the client can draw a button per clip without
 			  // hardcoding them) and the recent who-played-what feed. Both are a few dozen bytes.
 			  .Append(",\"soundboard\":").Append(BuildSoundboard())
 			  // Whether the chatbox animation is running, so the client's button can read TOGGLED
 			  // rather than pretending it started something it cannot see.
 			  .Append(",\"badApple\":").Append(BadAppleModule.Playing ? "true" : "false")
+			  // WHICH BUILD IS TALKING, so the client can tell "the mod is connected" from "the
+			  // right mod is connected" without re-hashing the DLL.
+			  .Append(",\"modVersion\":").Append(Json(PluginInfo.Version))
+			  // THE IN-GAME DECRYPTOR (Premium+ since 2026-09-09). on/off is the live decision the
+			  // AssetBundle prefix is making right now, from the tier the client's bridge reports;
+			  // the status line carries the level seen, the level needed and the counts since
+			  // launch, so a Free user is told why the cache stays encrypted instead of filing
+			  // "the auto archiver finds nothing".
+			  // [open-source build] decryptor removed (paid feature); always reported off here.
+			  .Append(",\"decryptor\":false")
+			  .Append(",\"decryptorStatus\":").Append(Json(DecryptorStatus()))
 			  // Force Pickup is a state, so the client's toggle can show what is really on.
 			  .Append(",\"forceJump\":").Append(ForceJumpModule.Active ? "true" : "false")
 			  // GHOST: the local player's network serializer held off (others see you frozen).
@@ -593,10 +708,17 @@ namespace VRChatArchiveMod.Modules
 			  // view can follow. The status line carries WHY when the view half could not be armed.
 			  .Append(",\"rotator\":").Append(PlayerRotatorModule.Active ? "true" : "false")
 			  .Append(",\"rotatorStatus\":").Append(Json(PlayerRotatorModule.Status ?? ""))
+			  .Append(",\"boxDrop\":").Append(BoxDropModule.Active ? "true" : "false")
+			  .Append(",\"boxDropStatus\":").Append(Json(BoxDropModule.Status ?? ""))
+			  .Append(",\"portalInfinite\":").Append(PortalInfiniteModule.Active ? "true" : "false")
+			  .Append(",\"portalInfiniteStatus\":").Append(Json(PortalInfiniteModule.Status ?? ""))
 			  // MENU BACKGROUNDS: state and how many options were unlocked, so the client's switch
 			  // reflects reality instead of whatever it was last clicked to.
 			  .Append(",\"forceJoinStatus\":").Append(Json(Core.ForceJoin.LastStatus ?? ""))
 			  .Append(",\"launchpadConsole\":").Append(LaunchpadConsoleModule.Active ? "true" : "false")
+			  // Which feed the in-game console is showing, so the client's button can name the one it
+			  // is about to switch TO instead of always toasting the same generic line.
+			  .Append(",\"archiveFeed\":").Append(Json(Core.ArchiveFeed.Showing == Core.ArchiveFeed.Kind.Cache ? "cache" : "archiver"))
 			  .Append(",\"menuBackgrounds\":").Append(VrcPlusBackgroundsModule.Active ? "true" : "false")
 			  .Append(",\"menuBackgroundsCount\":").Append(VrcPlusBackgroundsModule.Count)
 			  .Append(",\"menuBackgroundsStatus\":").Append(Json(VrcPlusBackgroundsModule.Status ?? ""))
@@ -606,6 +728,8 @@ namespace VRChatArchiveMod.Modules
 			  .Append(",\"mark\":").Append(MarkModule.HasMark ? "true" : "false")
 			  .Append(",\"markArt\":").Append(MarkModule.ArtPlaying ? "true" : "false")
 			  .Append(",\"markMode\":").Append(Json(MarkModule.Mode ?? "local"))
+			  .Append(",\"markClip\":").Append(Json(MarkModule.CurrentClip ?? "badapple"))
+			  .Append(",\"markClips\":").Append(MarkClipsJson())
 			  // VRCHAT NETWORK telemetry (grid, objects owned, move budget, outbound events/s, backlog) so
 			  // the client can show what the network mode is really doing; "" when it is not running.
 			  .Append(",\"markNet\":").Append(Json(MarkModule.NetInfo ?? ""))
@@ -649,7 +773,7 @@ namespace VRChatArchiveMod.Modules
 		{
 			int bundleBlocked = 0, photonBlocked = 0, photonSuspended = 0, udonBlocked = 0, avatarsScanned = 0, avatarNeutralized = 0;
 			string bundleLast = "", photonLast = "", udonLast = "", avatarLast = "";
-			try { bundleBlocked = AssetBundlePatchModule.Blocked; bundleLast = AssetBundlePatchModule.LastBlocked ?? ""; } catch { }
+			// [open-source build] AssetBundlePatchModule (plaintext-cache decryptor) removed; counters stay 0.
 			try { photonBlocked = PhotonGuardModule.Blocked; photonSuspended = PhotonGuardModule.SuspendedCount; photonLast = PhotonGuardModule.LastBlocked ?? ""; } catch { }
 			try { udonBlocked = UdonLogModule.BlockedTotal; udonLast = UdonLogModule.LastBlocked ?? ""; } catch { }
 			try { avatarsScanned = AntiCrashModule.AvatarsScanned; avatarNeutralized = AntiCrashModule.NeutralizedTotal; avatarLast = AntiCrashModule.LastAvatar ?? ""; } catch { }
@@ -1068,22 +1192,46 @@ namespace VRChatArchiveMod.Modules
 					}
 					else if (kind == "action")
 					{
-						// MAIN THREAD ONLY. Apply() runs in the continuation of an awaited HTTP call \u2014 a
-						// thread-pool thread with no IL2CPP GC attachment. An action touches Unity/IL2CPP, and
-						// ObjectOrbit's Collect() alone does Resources.FindObjectsOfTypeAll and allocates
-						// thousands of proxies; doing that here is a \"Fatal error in GC: Collecting from unknown
-						// thread\". So EVERY action is queued onto the frame (the udon/force cases already do this
-						// internally; this covers the older clone/teleport/orbit/objectOrbit/video ones too).
-						// \"Applied\" therefore means ACCEPTED \u2014 the action runs on the next frame.
-						OnMain(() => ApplyAction(cid, cval));
-						applied = true;
+						// PURE-MANAGED ACTIONS SKIP THE FRAME QUEUE ENTIRELY.
+						//
+						// The queue below is PACED at one step per 10 ms so bulk networked actions cannot
+						// burst. archiveLog is not a networked action at all \u2014 it appends one string to a
+						// locked ring buffer (ArchiveFeed.Add) and touches no Unity/IL2CPP object \u2014 yet it
+						// was paying the same 10 ms toll. The uploader emits a line per file, several per
+						// second, so the console fell up to 42 s behind and, far worse, 4241 log lines in one
+						// session filled the 4096-deep queue and made it DROP whatever landed next: 1119
+						// commands lost, which is exactly what a user sees as "the toggle does nothing".
+						// Running it inline (like "set" above, for the same reason) keeps the queue for the
+						// things that genuinely need a frame.
+						if (IsThreadSafeAction(cid))
+						{
+							applied = ApplyAction(cid, cval);
+						}
+						else
+						{
+							// MAIN THREAD ONLY. Apply() runs in the continuation of an awaited HTTP call \u2014 a
+							// thread-pool thread with no IL2CPP GC attachment. An action touches Unity/IL2CPP, and
+							// ObjectOrbit's Collect() alone does Resources.FindObjectsOfTypeAll and allocates
+							// thousands of proxies; doing that here is a "Fatal error in GC: Collecting from unknown
+							// thread". So EVERY action is queued onto the frame (the udon/force cases already do this
+							// internally; this covers the older clone/teleport/orbit/objectOrbit/video ones too).
+							// "Applied" therefore means ACCEPTED \u2014 the action runs on the next frame.
+							// Toggle-class (local, single-step, no burst) → fast lane: applied THIS frame,
+							// never queued behind a paced batch. Everything else keeps its 10 ms pacing.
+							if (IsToggleClassAction(cid)) OnMainFast(() => ApplyAction(cid, cval));
+							else OnMain(() => ApplyAction(cid, cval));
+							applied = true;
+						}
 					}
 					else applied = false;
 
 					if (applied)
 					{
 						done++;
-						VRChatArchiveModPlugin.Logger.LogInfo("[ModControl] applied " + kind + " " + cid + " = " + Str(c, "value"));
+						// Everything EXCEPT the uploader's per-file log firehose gets a line: settings and
+						// one-shot actions are rare and worth tracing, archiveLog is neither.
+						if (!IsNoisyAction(kind, cid))
+							VRChatArchiveModPlugin.Logger.LogInfo("[ModControl] applied " + kind + " " + cid + " = " + Str(c, "value"));
 						Remember(seq);
 					}
 					else
@@ -1104,6 +1252,27 @@ namespace VRChatArchiveMod.Modules
 				else if (Linked) Status = "linked";
 			}
 			catch (Exception e) { Status = "reply not understood: " + e.Message; }
+		}
+
+		/// <summary>Actions that touch NOTHING in Unity/IL2CPP and are safe to run straight on the
+		/// HTTP continuation thread, so they never consume a slot in the paced frame queue.
+		///
+		/// Keep this list tiny and provable: an action qualifies only if every path it can take is
+		/// pure managed code with its own locking. archiveLog is the one that matters — it is a
+		/// per-file firehose from the uploader, and routing it through the frame queue is what
+		/// saturated that queue and silently dropped real commands.</summary>
+		private static bool IsThreadSafeAction(string id)
+		{
+			return string.Equals(id, "archiveLog", StringComparison.OrdinalIgnoreCase);
+		}
+
+		/// <summary>True for commands that arrive constantly and must not write one log line each.
+		/// The uploader sends a line per file; logging every one of them cost 4241 disk writes in a
+		/// single session and buried everything else in the log.</summary>
+		private static bool IsNoisyAction(string kind, string id)
+		{
+			return string.Equals(kind, "action", StringComparison.Ordinal)
+				&& string.Equals(id, "archiveLog", StringComparison.OrdinalIgnoreCase);
 		}
 
 		// id is "Section/Key". The value arrives as text and is converted to the setting's real type
@@ -1163,6 +1332,30 @@ namespace VRChatArchiveMod.Modules
 			return false;
 		}
 
+		// The object player's clip list: the built-in bake first, then whatever local clip files sit in
+		// the mod's clips folder, so the client can offer them without knowing where they live.
+		private static string MarkClipsJson()
+		{
+			var cb = new System.Text.StringBuilder("[\"badapple\"");
+			try
+			{
+				foreach (var c in MarkModule.ListClips())
+					if (!string.Equals(c, "badapple", StringComparison.OrdinalIgnoreCase))
+						cb.Append(',').Append(Json(c));
+			}
+			catch { }
+			return cb.Append(']').ToString();
+		}
+
+		// A number typed into a client box. Empty or unparseable = 0, which every caller reads as
+		// "use the default". Invariant culture so a dot is always the decimal point.
+		private static float ParseFloat(string value)
+		{
+			if (string.IsNullOrWhiteSpace(value)) return 0f;
+			return float.TryParse(value.Trim(), System.Globalization.NumberStyles.Float,
+				System.Globalization.CultureInfo.InvariantCulture, out float f) ? f : 0f;
+		}
+
 		// One-shot things that are not a setting: wear an avatar, clone a player, reset movement.
 		private static bool ApplyAction(string id, string value)
 		{
@@ -1173,6 +1366,13 @@ namespace VRChatArchiveMod.Modules
 					case "wear":
 						if (string.IsNullOrEmpty(value)) return Refuse();
 						VaTagsModule.WearById(value, "");
+						return true;
+
+					// LOAD LOCAL (client v367): a .vrca the client just put in the test-avatar folder,
+					// named by its file name. See VaTagsModule.WearLocal.
+					case "wearLocal":
+						if (string.IsNullOrEmpty(value)) return Refuse();
+						VaTagsModule.WearLocal(value);
 						return true;
 
 					// Everything that acts ON A PLAYER takes their user id and looks the live entry up
@@ -1266,6 +1466,47 @@ namespace VRChatArchiveMod.Modules
 						ObjectOrbitModule.Stop("stopped from the client");
 						return true;
 
+					// ELEVATOR — the world's loose props gathered into a platform UNDER the selected
+					// player that rises up the Y axis. Same class of action as the ring: it only ever
+					// moves objects (owned pickups when synced), never the player; whoever stands on the
+					// platform is carried by their own physics, the way any world elevator works.
+					case "elevatorPlayer":
+						{
+							var p = FindPlayer(value);
+							if (p == null) return Refuse();
+							ElevatorModule.ToggleOnPlayer(p);
+							return true;
+						}
+
+					case "elevatorPlayerStop":
+						ElevatorModule.Stop("stopped from the client");
+						return true;
+
+					// ELEVATOR number boxes from the client. value = the typed number; 0 (or empty/bad)
+					// means "use the configured default". Applied live, so a change takes effect on the
+					// current ride without restarting it.
+					case "elevatorSpeed":
+						ElevatorModule.SpeedOverride = ParseFloat(value);
+						return true;
+
+					case "elevatorHeight":
+						ElevatorModule.HeightOverride = ParseFloat(value);
+						return true;
+
+					// ELEVATOR auto-correct toggle from the client switch. value = 1/true (on) or 0/false.
+					// Written straight to the config so it persists and Mod Settings shows the same state.
+					case "elevatorAutoCorrect":
+						try
+						{
+							string v = (value ?? "").Trim().ToLowerInvariant();
+							ModConfig.ElevatorAutoCorrect.Value = (v == "1" || v == "true" || v == "on" || v == "yes");
+						}
+						catch { }
+						return true;
+
+					// (selfLift / selfLiftStop — the old "Probe Lifter" that raised YOU via ProbPusherModule
+					// — were removed; the client's renamed ELEVATOR switch drives elevatorPlayer above.)
+
 					// Push a URL into every video player in the world. value = the URL.
 					//
 					// MUST run on the Unity main thread. ApplyAction runs on a THREAD POOL thread (the
@@ -1310,6 +1551,22 @@ namespace VRChatArchiveMod.Modules
 						OnMain(() => ForceJumpModule.Toggle());
 						return true;
 
+					// HUD: one switch over everything drawn on screen (radar, panels, glows, Udon overlay).
+					// Off remembers what was on; on puts exactly that back. Menus are not touched.
+					case "hud":
+						OnMain(() =>
+						{
+							if (value == "on") Core.HudMaster.Set(true);
+							else if (value == "off") Core.HudMaster.Set(false);
+							else Core.HudMaster.Toggle();
+						});
+						return true;
+
+					// TRUEVIEW: a proxied player keeps their real avatar, nameplate and hitbox.
+					case "trueView":
+						OnMain(() => TrueViewModule.Toggle());
+						return true;
+
 					// GHOST: toggle the local player's FlatBufferNetworkSerializer — frozen for everyone
 					// else, moving for yourself. Exactly the UnityExplorer gesture, as one button.
 					case "ghost":
@@ -1344,6 +1601,21 @@ namespace VRChatArchiveMod.Modules
 						return true;
 					case "rotatorReset":
 						OnMain(() => PlayerRotatorModule.ResetUpright());
+						return true;
+					case "boxDrop":
+						OnMain(() => BoxDropModule.Toggle());
+						return true;
+					case "portalInfinite":
+						OnMain(() => PortalInfiniteModule.Toggle());
+						return true;
+					case "boxDropX":
+						OnMain(() => BoxDropModule.SetAxis('x', ParseFloat(value)));
+						return true;
+					case "boxDropY":
+						OnMain(() => BoxDropModule.SetAxis('y', ParseFloat(value)));
+						return true;
+					case "boxDropZ":
+						OnMain(() => BoxDropModule.SetAxis('z', ParseFloat(value)));
 						return true;
 					// FLOAT OBJECTS: useGravity = false on every pickup's Rigidbody (yours float for everyone).
 					case "floatObjects":
@@ -1426,7 +1698,17 @@ namespace VRChatArchiveMod.Modules
 					case "markOrbit": OnMain(() => MarkModule.OrbitAroundMark()); return true;
 					case "markShape": { string shp = value; OnMain(() => MarkModule.Shape(shp)); return true; }
 					case "markMode": { string mm = value; OnMain(() => MarkModule.SetMode(mm)); return true; }   // local | vrchat for shapes / TP / orbit
-					case "markBadApple": { string md = value; OnMain(() => MarkModule.ToggleBadApple(md)); return true; }   // value = local | vrchat
+					// value = "local" | "vrchat", optionally "<mode>:<clip>" to pick which clip to play
+					// ("badapple" = the built-in bake, anything else = a local file in the clips folder).
+					case "markBadApple":
+						{
+							string raw = value ?? "";
+							int cut = raw.IndexOf(':');
+							string md = cut >= 0 ? raw.Substring(0, cut) : raw;
+							string clip = cut >= 0 ? raw.Substring(cut + 1) : "";
+							OnMain(() => MarkModule.ToggleBadApple(md, clip));
+							return true;
+						}
 
 					// FORCE PICKUP: a toggle, not a one-shot. Unlocks the world's locked pickups so you
 					// grab them with your own hands; toggling off puts every one back.

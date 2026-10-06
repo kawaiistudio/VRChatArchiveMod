@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using UnityEngine;
 using VRChatArchiveMod.Core;
@@ -47,6 +47,7 @@ namespace VRChatArchiveMod.Modules
 
 		private static readonly List<Original> Touched = new List<Original>();
 		private static float _nextSweep;
+		private static bool _loggedNoPickups;
 
 		// Re-swept on a slow timer, not per frame: a world spawns pickups as you play (a shop hands
 		// you an item, a game respawns props), and a one-shot unlock would only ever cover what
@@ -60,7 +61,7 @@ namespace VRChatArchiveMod.Modules
 				if (Input.GetKey(KeyCode.RightShift) && Input.GetKeyDown(KeyCode.G)) Toggle();
 
 				if (!Active) return;
-				float now = Time.realtimeSinceStartup;
+				float now = VaClock.Now;
 				if (now < _nextSweep) return;
 				_nextSweep = now + SweepSeconds;
 				Sweep();
@@ -108,12 +109,32 @@ namespace VRChatArchiveMod.Modules
 			VRChatArchiveModPlugin.Logger.LogInfo("[ForcePickup] off — restored.");
 		}
 
-		// A world change destroys every pickup we recorded, so the record means nothing after it and
-		// keeping it would make the restore write to freed objects.
+		// A world change usually destroys every pickup we recorded — but NOT ALWAYS, and that is the
+		// bug this used to have (2026-09-13). OnSceneLoaded also fires for additive and UI scene
+		// loads, where the world's pickups survive; clearing the ledger then left every unlocked
+		// object with pickupable = true and proximity = 100000 for the rest of the session, with
+		// nothing left to restore it.
+		//
+		// Restoring first is safe in BOTH cases: the loop proves liveness with NativeGuard.Alive and
+		// simply skips anything the load did destroy, so this costs nothing on a real world change
+		// and is the whole fix on a partial one.
 		public override void OnSceneLoaded(int buildIndex)
 		{
+			for (int i = 0; i < Touched.Count; i++)
+			{
+				var o = Touched[i];
+				try
+				{
+					if (o == null || o.P == null || !Core.NativeGuard.Alive(o.P)) continue;
+					o.P.pickupable = o.Pickupable;
+					o.P.proximity = o.Proximity;
+					o.P.DisallowTheft = o.DisallowTheft;
+				}
+				catch { }
+			}
 			Touched.Clear();
 			Unlocked = 0;
+			_loggedNoPickups = false;
 			if (Active) _nextSweep = 0f;   // re-unlock in the new world
 		}
 
@@ -129,7 +150,7 @@ namespace VRChatArchiveMod.Modules
 				// (Core/Menu.cs) with the NON-generic overload fed an explicit Il2CppType, so use that:
 				// resolve the class once, enumerate, and TryCast each result back.
 				var il2 = Il2CppInterop.Runtime.Il2CppType.Of<VRC.SDKBase.VRC_Pickup>();
-				var found = UnityEngine.Object.FindObjectsOfType(il2);
+				var found = VRChatArchiveMod.Core.Live.AllOfType(il2);
 
 				float wantProximity = 100f;
 				try { wantProximity = Mathf.Max(1f, ModConfig.ForcePickupRange.Value); } catch { }
@@ -181,9 +202,17 @@ namespace VRChatArchiveMod.Modules
 				// world, so a later sweep never lowers it.
 				Unlocked = Touched.Count;
 				if (scanned == 0)
-					VRChatArchiveModPlugin.Logger.LogInfo(
-						"[ForcePickup] no VRC_Pickup found in this world — it likely uses a custom/Udon "
-						+ "pickup system, which Force Pickup cannot unlock (use FORCE GRAB for raw objects).");
+				{
+					if (!_loggedNoPickups)
+					{
+						_loggedNoPickups = true;
+						VRChatArchiveModPlugin.Logger.LogInfo(
+							"[ForcePickup] no VRC_Pickup found in this world — it likely uses a custom/Udon "
+							+ "pickup system, which Force Pickup cannot unlock (use FORCE GRAB for raw objects).");
+					}
+					// Back off sweep when this world has no VRC_Pickups at all so we don't spam FindObjectsOfType
+					_nextSweep = VaClock.Now + 15f;
+				}
 			}
 			catch (Exception e) { Status = "sweep failed: " + e.Message; }
 		}

@@ -283,7 +283,7 @@ namespace VRChatArchiveMod.Modules
 
 				Probe("direct: FindObjectsOfType(BaseVRCVideoPlayer)");
 				var il2 = Il2CppType.From(_basePlayerType);
-				var players = UnityEngine.Object.FindObjectsOfType(il2);
+				var players = VRChatArchiveMod.Core.Live.AllOfType(il2);
 				if (players == null) return 0;
 				Probe("direct: " + players.Length + " player component(s) found");
 
@@ -324,12 +324,12 @@ namespace VRChatArchiveMod.Modules
 			{
 				if (_basePlayerType != null)
 				{
-					var players = UnityEngine.Object.FindObjectsOfType(Il2CppType.From(_basePlayerType));
+					var players = VRChatArchiveMod.Core.Live.AllOfType(Il2CppType.From(_basePlayerType));
 					VRChatArchiveModPlugin.Logger.LogWarning("[VideoUrl] BaseVRCVideoPlayer count: " + (players?.Length ?? 0));
 				}
 				else VRChatArchiveModPlugin.Logger.LogWarning("[VideoUrl] BaseVRCVideoPlayer TYPE not found in interop.");
 
-				var uAll = UnityEngine.Object.FindObjectsOfType(Il2CppType.From(_udonType));
+				var uAll = VRChatArchiveMod.Core.Live.AllOfType(Il2CppType.From(_udonType));
 				VRChatArchiveModPlugin.Logger.LogWarning("[VideoUrl] UdonBehaviour count: " + (uAll?.Length ?? 0));
 			}
 			catch (Exception e) { VRChatArchiveModPlugin.Logger.LogWarning("[VideoUrl] dump threw: " + Short(e.Message)); }
@@ -352,7 +352,7 @@ namespace VRChatArchiveMod.Modules
 				if (_basePlayerType == null)
 					_basePlayerType = FindType("VRC.SDK3.Video.Components.Base.BaseVRCVideoPlayer") ?? FindType("BaseVRCVideoPlayer");
 				if (_basePlayerType == null) return outp;
-				var players = UnityEngine.Object.FindObjectsOfType(Il2CppType.From(_basePlayerType));
+				var players = VRChatArchiveMod.Core.Live.AllOfType(Il2CppType.From(_basePlayerType));
 				if (players == null) return outp;
 				var tops = new System.Collections.Generic.List<Transform>();
 				for (int i = 0; i < players.Length && outp.Count < 50; i++)

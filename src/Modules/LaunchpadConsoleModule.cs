@@ -70,7 +70,12 @@ namespace VRChatArchiveMod.Modules
 		{
 			try
 			{
-				if (!Active) { if (_panel != null) Drop(); return; }
+				// OFF RESTORES EVEN WHEN OUR PANEL IS ALREADY GONE (2026-09-13). The test used to be
+				// `_panel != null`, but the thing that most needs undoing is VRChat's own banner: Drop()
+				// re-shows _carousel and puts its CanvasGroup alpha back to 1. A rebuilt page leaves
+				// _panel null while _carousel is still hidden, and OFF then skipped the teardown
+				// entirely — the banner stayed invisible with the console switched off.
+				if (!Active) { if (_panel != null || _carousel != null) Drop(); return; }
 
 				// Independent of the panel: the heading is worth claiming even on a tick where the
 				// console itself could not be built, and it costs one string compare.
@@ -79,7 +84,7 @@ namespace VRChatArchiveMod.Modules
 				if (_panel == null || !_panel.Alive)
 				{
 					_panel = null;
-					float now = Time.realtimeSinceStartup;
+					float now = VaClock.Now;
 					if (now < _nextTry) return;
 					_nextTry = now + 3f;
 					if (_fails > 20) return;
@@ -110,9 +115,18 @@ namespace VRChatArchiveMod.Modules
 
 		public override void OnSceneLoaded(int buildIndex)
 		{
-			// The menu survives a world change, but the page can be rebuilt under us; drop the
-			// handles and let the next tick find them again.
-			if (_panel == null || !_panel.Alive) { _panel = null; _carousel = null; _fails = 0; _nextTry = 0f; }
+			// The menu survives a world change, but the page can be rebuilt under us.
+			//
+			// RESTORE BEFORE DROPPING THE HANDLES (2026-09-13). This used to null _carousel outright.
+			// Since the menu SURVIVES the load — as the line above says — VRChat's banner was still
+			// sitting there hidden at alpha 0, and the only handle that could bring it back had just
+			// been thrown away: the Launch Pad banner stayed blank for the rest of the session. Drop()
+			// restores it and is safe on already-destroyed objects, so it is right either way.
+			if (_panel == null || !_panel.Alive)
+			{
+				if (_carousel != null || _panel != null) Drop();
+				_panel = null; _carousel = null; _fails = 0; _nextTry = 0f;
+			}
 			_shown = -1;
 		}
 
@@ -215,7 +229,7 @@ namespace VRChatArchiveMod.Modules
 		{
 			try
 			{
-				float now = Time.realtimeSinceStartup;
+				float now = VaClock.Now;
 				if (now < _nextTitle) return;
 				_nextTitle = now + 0.5f;
 
@@ -303,7 +317,10 @@ namespace VRChatArchiveMod.Modules
 			_panel.SetRows(rows);
 			_panel.SetCount(PanelSkin.Tag("3BFF7A", "●") + " "
 				+ PanelSkin.Tag(PanelSkin.HexDim, Core.ArchiveFeed.CurrentTitle) + "   "
-				+ PanelSkin.Tag(PanelSkin.HexText, feed.Count.ToString()));
+				// The RUNNING TOTAL, not the length of the 200-entry ring the panel scrolls. The ring
+				// saturates within minutes of a busy session and then reads 200 for ever, which is
+				// indistinguishable from a console that has stopped receiving anything.
+				+ PanelSkin.Tag(PanelSkin.HexText, Core.ArchiveFeed.CurrentTotal.ToString("N0")));
 		}
 	}
 }

@@ -119,7 +119,21 @@ namespace VRChatArchiveMod.Modules
 			catch { }
 		}
 
-		public override void OnSceneLoaded(int buildIndex) { _held = null; _heldBody = null; _heldRaw = null; _rawBody = null; HeldName = ""; }
+		// DROP, DON'T JUST FORGET (2026-09-13). This used to null the references outright. When the
+		// held object survived the load — additive and UI scene loads fire this too — it kept the
+		// isKinematic = true we forced on it and never received the _onDrop event, so the world's own
+		// Udon still believed the prop was in someone's hand, permanently. Drop() performs the real
+		// release and is already safe on a destroyed target (it proves liveness before every write),
+		// so it is the correct call in both cases.
+		public override void OnSceneLoaded(int buildIndex)
+		{
+			// A held object that SURVIVED the load must be really released — physics handed back and
+			// _onDrop fired — or the world's Udon goes on believing it is in someone's hand forever.
+			// One that did NOT survive has nothing to restore, and every write in Drop() is guarded
+			// by a liveness proof anyway, so this is safe either way.
+			Drop();
+			_held = null; _heldBody = null; _heldRaw = null; _rawBody = null; HeldName = "";
+		}
 		public override void OnShutdown() => Drop();
 
 		// ------------------------------------------------------------------ grab / drop
@@ -178,7 +192,7 @@ namespace VRChatArchiveMod.Modules
 					{
 						// Non-generic enumeration: FindObjectsOfType<VRC_Pickup>() is empty on this build (see ForcePickup).
 						var il2g = Il2CppInterop.Runtime.Il2CppType.Of<VRC.SDKBase.VRC_Pickup>();
-						var foundG = UnityEngine.Object.FindObjectsOfType(il2g);
+						var foundG = VRChatArchiveMod.Core.Live.AllOfType(il2g);
 						for (int gi = 0; foundG != null && gi < foundG.Length; gi++)
 						{
 							var p = foundG[gi] != null ? foundG[gi].TryCast<VRC.SDKBase.VRC_Pickup>() : null;
@@ -338,15 +352,20 @@ namespace VRChatArchiveMod.Modules
 			try
 			{
 				if (_held == null) return;
+				// LIVENESS BEFORE THE TOUCH. A destroyed il2cpp object keeps a non-null managed
+				// wrapper, and reading .gameObject off it is an access violation .NET cannot catch —
+				// it ends the process. Reached from OnSceneLoaded, where the held object may well
+				// have just been destroyed, so the guard is load-bearing, not decorative.
+				if (!Core.NativeGuard.Alive(_held)) return;
 				var go = _held.gameObject;
-				if (go == null) return;
+				if (go == null || !Core.NativeGuard.Alive(go)) return;
 
 				Type ub = FindType("VRC.Udon.UdonBehaviour");
 				var mi = ub?.GetMethod("SendCustomEvent", new[] { typeof(string) });
 				if (mi == null) return;
 
 				var il2 = Il2CppInterop.Runtime.Il2CppType.From(ub);
-				var comps = go.GetComponents(il2);
+				var comps = go.GetComponentsSafe(il2);
 				if (comps == null) return;
 				for (int i = 0; i < comps.Length; i++)
 				{

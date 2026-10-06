@@ -38,9 +38,9 @@ namespace VRChatArchiveMod.Core
 						if (e?.ChangedSetting == null) return;
 						string changed = e.ChangedSetting.Definition.Section + "/" + e.ChangedSetting.Definition.Key;
 						if (changed != id) return;
+						string trace = Environment.StackTrace;
 						VRChatArchiveModPlugin.Logger.LogInfo(
-							"[ConfigWatch] " + changed + " -> " + e.ChangedSetting.BoxedValue
-							+ "  (" + (ApplyingFrom ?? "in-game menu or code") + ")");
+							$"[ConfigWatch] [{DateTime.Now:HH:mm:ss.fff}] {changed} -> {e.ChangedSetting.BoxedValue}  ({ApplyingFrom ?? "in-game menu or code"})\n{trace}");
 					}
 					catch { }
 				};

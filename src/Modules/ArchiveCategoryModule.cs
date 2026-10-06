@@ -56,7 +56,7 @@ namespace VRChatArchiveMod.Modules
 			{
 				// No gate: the Archive category is always on.
 
-				float now = Time.realtimeSinceStartup;
+				float now = VaClock.Now;
 				if (now < _next) return;
 				_next = now + 2f;
 
@@ -66,8 +66,11 @@ namespace VRChatArchiveMod.Modules
 				var obs = panel.field_Private_ReactiveProperty_1_List_1_ObjectPublicStBo1BoILSt1NuBoInUnique_0;
 				if (obs == null) { Status = "panel not initialised"; return; }
 
-				var live = obs.prop_T_0;
-				if (live == null || live.Count == 0) { Status = "no categories yet"; return; }
+				// SNAPSHOT, NEVER live[i]. List<T>.get_Item is mis-bound on VRChat 1903 and invoking it
+				// ends the process inside il2cpp_runtime_invoke -- it is what crashed the game from
+				// ArchiveHijackModule.PickTarget. Il2CppSeq.Items reads _items/_size, which are fields.
+				var live = Core.Il2CppSeq.Items(obs.prop_T_0);
+				if (live.Count == 0) { Status = "no categories yet"; return; }
 
 				Hook(panel);
 
@@ -215,7 +218,9 @@ namespace VRChatArchiveMod.Modules
 			catch (Exception e) { VRChatArchiveModPlugin.Logger.LogWarning("[ArchiveCat] fill: " + e.Message); }
 		}
 
-		private static int IndexOfOurs(Il2CppSystem.Collections.Generic.List<Category> live)
+		// Takes the SNAPSHOT, not the native list: indexing the native one calls get_Item, which is
+		// mis-bound on this build and kills the process. Callers already hold the snapshot.
+		private static int IndexOfOurs(System.Collections.Generic.List<Category> live)
 		{
 			for (int i = 0; i < live.Count; i++)
 			{

@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Linq;
@@ -75,6 +75,26 @@ namespace VRChatArchiveMod.Modules
 			public bool InStation;
 			public bool InVR;
 			public object Player;
+			// RESOLVED ONCE, REUSED WHILE IT LIVES (2026-09-13). The roster pass used to re-resolve
+			// the VRCPlayerApi and walk api -> gameObject -> transform for EVERY player on EVERY
+			// pass: four il2cpp crossings each, 35 players, for two references that only change when
+			// the player's avatar is rebuilt. Both are kept here and re-resolved only when the
+			// cached one fails its liveness proof, which is exactly when it really did change.
+			public object ApiObj;
+			// How many times ReadApiFields has been retried for this player. The APIUser loads
+			// asynchronously, so a retry is right — but it returned "unresolved" forever for anyone
+			// whose profile never arrives, re-running the whole badge read every pass for the rest
+			// of the session. Capped, so a player who never resolves stops costing anything.
+			public int ApiTries;
+			// Counts roster passes for this player, so the avatar re-read (the one uncached
+			// per-player cost left in the roster) can run on one pass in three instead of every pass.
+			public int AvatarPass;
+			public string BlockedAvatarLogged;
+			// VRChat's "this player is blocked / hidden from me" flag, READ IN THE ROSTER PASS
+			// (2026-09-13). BlockedByProbe used to walk all 40 players a second time each second just
+			// to read this one boolean, repeating the liveness syscalls the roster already paid; now
+			// it is filled here and that module only copies it.
+			public bool Blocked;
 			public Transform Transform;
 			// The position we actually SHOW. Transform.position when we have a live transform, else
 			// VRCPlayerApi.GetPosition() \u2014 resolved in RefreshRoster so a player whose Transform never
@@ -85,6 +105,16 @@ namespace VRChatArchiveMod.Modules
 		}
 
 		public static readonly List<PlayerEntry> Roster = new List<PlayerEntry>();
+
+		// BUMPED ON EVERY RefreshRoster (2026-09-13). Readers that only FORMAT the roster —
+		// InstancePanels rebuilds its rich-text rows every 20 frames — can compare this and skip the
+		// rebuild when nothing has changed: the roster refreshes every 60 frames, so two polls in
+		// three were re-formatting identical data. Main-thread only, like the roster itself.
+		public static int RosterVersion;
+
+		// Edge memory for "tags on AND show plates on", so that switch can tear down / apply on the
+		// frame it flips instead of waiting out the 60-frame roster throttle.
+		private bool _platesWere;
 
 		// STABLE PER-PLAYER DATA IS COMPUTED ONCE, then reused every refresh.
 		//
@@ -148,11 +178,47 @@ namespace VRChatArchiveMod.Modules
 		// animation pass was recomputing both on EVERY tick for EVERY plate — a string split into a
 		// fresh array plus a ToLowerInvariant, fifteen times a second per tag on screen. Resolved
 		// once, at build time, instead.
-		private sealed class Plate
+		// internal, not private: FewTagsModule animates ITS plates with this same engine rather
+		// than growing a second, divergent copy of fourteen effects (see NewPlate/Animate below).
+		internal sealed class Plate
 		{
 			public GameObject Go; public TextMeshProUGUI Tmp; public VaTag Tag; public bool StaticBuilt;
 			public string[] G;      // per-glyph split of Tag.Text
 			public string Fx;       // lowercased effect name
+		}
+
+		// The effects that actually RE-COMPOSE the label every tick. Everything else (none, grad,
+		// and any unrecognised id landing in `default:`) writes its text once and is finished, so
+		// the tick must skip it forever after. The old test was `Fx == "none"`, which let "grad" —
+		// the member badge, i.e. EVERY mod user — plus every typo'd id back into the full per-glyph
+		// pass fifteen times a second for zero visual change.
+		private static readonly HashSet<string> AnimatedFx = new HashSet<string>(StringComparer.Ordinal)
+		{
+			"scroll", "cyln", "lbl", "rain", "rainbow", "sr", "pulse", "wave",
+			"jump", "shake", "gt", "blink", "glitch", "glow",
+		};
+
+		internal static bool IsAnimated(string fx) => fx != null && AnimatedFx.Contains(fx);
+
+		// One warning per failing effect id, not one per plate per tick.
+		private static readonly HashSet<string> _animFailLogged = new HashSet<string>(StringComparer.Ordinal);
+
+		// Build a plate for a label this module did not create (FewTags). Same shape, same engine.
+		internal static Plate NewPlate(GameObject go, TextMeshProUGUI tmp, VaTag tag) => new Plate
+		{
+			Go = go, Tmp = tmp, Tag = tag,
+			G = Glyphs(tag.Text ?? ""),
+			Fx = (tag.Fx ?? "none").ToLowerInvariant(),
+		};
+
+		// One animation step for an externally-owned plate. `force` writes even when the plate is
+		// static — used once right after the plate is built so it never shows a frame of raw,
+		// unstyled text while waiting for the next tick.
+		internal static void Animate(Plate p, float t, bool force = false)
+		{
+			if (p == null || p.Tmp == null || p.Tag == null) return;
+			if (!force && p.StaticBuilt && !IsAnimated(p.Fx)) return;
+			AnimatePlate(p, t);
 		}
 		// FewLines: how many rows FewTags occupied when this set was built. If FewTags later
 		// adds or drops a plate, our stack has to be rebuilt or the two overlap again.
@@ -184,12 +250,20 @@ namespace VRChatArchiveMod.Modules
 				bool vaOn = ModConfig.VaTagsEnabled.Value;
 				bool rosterNeeded = vaOn
 					|| ModConfig.InstancePanelsEnabled.Value
+					// The wing panels read the same roster, and they are MENU panels: the HUD master
+					// switch turns the on-screen ones off and leaves these on, so they would have been
+					// left showing a roster nobody refreshed — a frozen player list is worse than none.
+					|| ModConfig.WingPlayersEnabled.Value
+					|| ModConfig.WingLogEnabled.Value
 					|| ModConfig.JoinNotifierEnabled.Value
 					// Player Grab finds its targets (and the holder) through this roster: with tags off
 					// and no panels it was never refreshed, so there was nobody to grab.
 					|| PlayerGrabModule.Active;
 
 				if (!vaOn && _plates.Count > 0) RemoveAllPlates();
+
+				// LOAD LOCAL from the client: outside the tags gate, it is not a tags feature.
+				if (_localWant != null) PumpLocalWear();
 
 				if (vaOn)
 				{
@@ -208,7 +282,7 @@ namespace VRChatArchiveMod.Modules
 					// something actually moved.
 					if (RecordsLoaded > 0) EnsureRankTag();
 
-					float now = Time.realtimeSinceStartup;
+					float now = VaClock.Now;
 					// VaAuth.Poll used to run here, which tied the auth probe to VaTags being ON:
 					// switch tags off and the client bridge was never probed, so the control channel
 					// never connected. ModControlModule owns the probe now, above its own gates.
@@ -220,12 +294,67 @@ namespace VRChatArchiveMod.Modules
 					}
 				}
 
+				// THE PLATES SWITCH ACTS ON ITS OWN EDGE, ABOVE THE 60-FRAME THROTTLE (2026-09-13).
+				//
+				// Show-plates teardown used to live at the bottom of this method, behind the frame
+				// counter, so turning plates off left every plate hanging over every player for up to
+				// a second, and turning them on was just as late. Only the parent VaTagsEnabled path
+				// was instant. Handling the edge here makes both directions immediate: OFF removes on
+				// the very frame it flips, ON primes the counter so the apply pass runs this frame.
+				bool platesOn = vaOn;
+				try { platesOn = vaOn && ModConfig.VaTagsShowPlates.Value; } catch { }
+				if (platesOn != _platesWere)
+				{
+					_platesWere = platesOn;
+					if (!platesOn) { if (_plates.Count > 0) RemoveAllPlates(); }
+					else _frame = 60;   // apply on this frame rather than up to 60 frames from now
+				}
+
 				if (!rosterNeeded) return;
 
 				if (++_frame < 60) return;
 				_frame = 0;
+				// The roster pass is the most expensive single thing in the mod and was completely
+				// opaque: the profiler said "VaTags = 236 ms/s" and nothing about what that bought.
+				// Now a slow pass says how many players it walked and how many it could reuse from
+				// cache, which is exactly the ratio that tells cheap from pathological.
+				long tRoster = Core.PerfLog.Start();
 				RefreshRoster();
-				if (vaOn && ModConfig.VaTagsShowPlates.Value) ApplyPlates();
+				Core.PerfLog.Slow("VaTags/roster", tRoster, 8.0,
+					Roster.Count + " player(s), " + _entryCache.Count + " cached, "
+					+ _plates.Count + " plate set(s)");
+				if (platesOn)
+				{
+					// MEASURED. The roster pass was timed and this one was not, so when the profiler
+					// said "VaTags = 908 ms" the timed half honestly reported 8 ms and the cost had
+					// nowhere to show. Anything expensive enough to matter gets its own stopwatch.
+					// THE BREAKER GOES ON THE WHOLE PASS, not on a call inside it.
+					//
+					// Two attempts put a stopwatch around a specific call -- MakePlate, then
+					// ResolveNameplate -- and neither fired while the pass still reported 11 100 ms.
+					// Guessing which call is slow costs the owner a frozen play session per guess, and
+					// it had already cost several. So this measures the thing the log ALREADY prints:
+					// if the pass as a whole overruns, plates stop for the session, wherever the time
+					// went. It cannot miss, because it is the same number that showed the problem.
+					//
+					// The first overrun is still felt once; every one after it is prevented. Tags are
+					// decoration, and decoration never justifies freezing the game.
+					long tPlates = Core.PerfLog.Start();
+					var passClock = System.Diagnostics.Stopwatch.StartNew();
+					ApplyPlates();
+					double passMs = passClock.Elapsed.TotalMilliseconds;
+					Core.PerfLog.Slow("VaTags/plates", tPlates, 8.0,
+						_wantPlates + " wanted, " + _resolveFail + " unresolved, " + _plates.Count + " live set(s)");
+
+					if (!_platesBroken && passMs > SlowPassMs)
+					{
+						_platesBroken = true;
+						try { RemoveAllPlates(); } catch { }
+						VRChatArchiveModPlugin.Logger.LogWarning("[VaTags] COUPE-CIRCUIT : la passe des plaques a pris "
+							+ ((int)passMs) + " ms (limite " + SlowPassMs + "). Les plaques de tags sont DESACTIVEES pour "
+							+ "cette session — c'est ce qui figeait le jeu. Tout le reste du mod continue normalement.");
+					}
+				}
 				else if (_plates.Count > 0) RemoveAllPlates();
 			}
 			catch (Exception e) { VRChatArchiveModPlugin.Logger.LogError($"[VaTags] update threw: {e}"); }
@@ -239,7 +368,7 @@ namespace VRChatArchiveMod.Modules
 		public override void OnLateUpdate()
 		{
 			if (!ModConfig.VaTagsEnabled.Value || !ModConfig.VaTagsShowPlates.Value) return;
-			float t = Time.realtimeSinceStartup;
+			float t = VaClock.Now;
 			if (t < _nextAnim) return;
 			_nextAnim = t + 0.0667f;
 			foreach (var set in _plates.Values)
@@ -248,9 +377,20 @@ namespace VRChatArchiveMod.Modules
 					if (p.Tmp == null || p.Tag == null) continue;
 					// A tag with no effect has nothing to animate: once its text is written it never
 					// changes again. Re-running the whole per-glyph pass on it fifteen times a second
-					// was pure waste, and most tags in the database are static.
-					if (p.Fx == "none" && p.StaticBuilt) continue;
-					try { AnimatePlate(p, t); } catch { }
+					// was pure waste, and most tags in the database are static. Test the EFFECT, not
+					// the literal "none": "grad" (the member badge on every mod user) and any typo'd
+					// id are static too and used to be re-composed forever.
+					if (p.StaticBuilt && !IsAnimated(p.Fx)) continue;
+					// Never silent: a throw in one effect freezes that plate on its last string,
+					// which looks exactly like a static tag. Logged ONCE per effect so a broken tag
+					// is diagnosable without spamming 15 lines a second.
+					try { AnimatePlate(p, t); }
+					catch (Exception ex)
+					{
+						if (_animFailLogged.Add(p.Fx ?? "?"))
+							VRChatArchiveModPlugin.Logger.LogWarning(
+								"[VaTags] effect '" + (p.Fx ?? "?") + "' threw, plate frozen: " + ex.Message);
+					}
 				}
 		}
 
@@ -277,17 +417,53 @@ namespace VRChatArchiveMod.Modules
 		public static bool LooksLikeUserId(string s)
 			=> !string.IsNullOrEmpty(s) && s.StartsWith("usr_", StringComparison.OrdinalIgnoreCase) && s.Length == 40;
 
+		// A TRUE teleport: set the local player's position to the target's, through the SDK.
+		//
+		// The old version wrote local.transform.position directly. That is a move the active locomotion
+		// overwrites the very next frame — which is why it failed while flying / no-clip (the fly loop, or
+		// VRChat's own controller, put you straight back). VRCPlayerApi.TeleportTo is an ABSOLUTE position
+		// set that goes through VRChat's own teleport path (it resets the controller and cancels
+		// momentum), so it LANDS regardless of what locomotion is running. Position1 -> position2, clean.
 		public static void TeleportTo(PlayerEntry entry)
 		{
 			try
 			{
+				if (entry == null) { LastStatus = "TP failed: no target"; return; }
+
+				// The target's AUTHORITATIVE pose from the SDK, not a transform that may be a frame stale.
+				Vector3 pos; Quaternion rot = Quaternion.identity;
+				var tapi = entry.ApiObj as VRC.SDKBase.VRCPlayerApi;
+				if (tapi != null)
+				{
+					pos = tapi.GetPosition();
+					try { rot = tapi.GetRotation(); } catch { }
+				}
+				else
+				{
+					Transform t = entry.Transform;
+					if (t == null) { LastStatus = "TP failed: player is no longer in the instance"; return; }
+					pos = t.position; rot = t.rotation;
+				}
+
+				// Land just beside them, not clipping inside: a step back along their facing, a touch up.
+				Vector3 fwd = rot * Vector3.forward;
+				Vector3 landing = pos - fwd * 1.0f + Vector3.up * 0.2f;
+
+				var api = PlayerRef.LocalApi();
+				if (api != null)
+				{
+					api.TeleportTo(landing, rot);                 // the real, absolute set
+					try { PlayerRef.ZeroVelocity(PlayerRef.LocalPlayer()); } catch { }
+					LastStatus = $"teleported to {entry.Name}";
+					return;
+				}
+
+				// Fallback only if the SDK api is unreachable: the old transform write.
 				var local = PlayerRef.LocalPlayer();
 				if (local == null) { LastStatus = "TP failed: local player not found"; return; }
-				Transform t = entry?.Transform;
-				if (t == null) { LastStatus = "TP failed: player is no longer in the instance"; return; }
-				local.transform.position = t.position - t.forward * 1.0f + Vector3.up * 0.2f;
+				local.transform.position = landing;
 				PlayerRef.ZeroVelocity(local);
-				LastStatus = $"teleported to {entry.Name}";
+				LastStatus = $"teleported to {entry.Name} (repli transform)";
 			}
 			catch (Exception e) { LastStatus = "TP failed: " + Short(e.Message); }
 		}
@@ -417,6 +593,129 @@ namespace VRChatArchiveMod.Modules
 				LastStatus = "wear failed: " + Short(e.Message);
 				VRChatArchiveModPlugin.Logger.LogError("[VaTags] wear threw: " + e);
 			}
+		}
+
+		// ---------------------------------------------------------------- LOAD LOCAL (client v367)
+		//
+		// WEAR A LOCAL TEST AVATAR BY ITS FILE NAME, WITHOUT THE AVATAR MENU.
+		//
+		// The client's LOAD LOCAL writes a bundle into VRChat's test-avatar folder, and the game (started
+		// with --watch-avatars) registers it as "local:sdk_<file name>" in the SDK's own store,
+		// ApiContentModel<ApiAvatar>.localContent — in VRCCore, IsLocal is literally
+		// localContent.ContainsKey(id). The menu row that lists those, SDK Test Avatars, is the row
+		// ARCHIVE FAVORITES takes over, so the owner had no way to pick one. This wears it straight from
+		// that store, with the same PageAvatar call as WEAR: the game's own record, nothing built by hand.
+		// Registration follows the file write by a moment, so the lookup is retried for LocalWaitSec.
+		private static string _localWant;
+		private static string _localName;
+		private static float _localUntil;
+		private static float _localNextTry;
+		private static bool _localStoreWarned;
+		private const float LocalWaitSec = 30f;
+
+		public static void WearLocal(string name)
+		{
+			name = (name ?? "").Trim();
+			if (name.EndsWith(".vrca", StringComparison.OrdinalIgnoreCase)) name = name.Substring(0, name.Length - 5).TrimEnd();
+			if (name.Length == 0) { LastStatus = "no local avatar name given"; return; }
+			_clone = null;
+			_localName = name.StartsWith("local:", StringComparison.Ordinal) ? name.Substring(name.IndexOf('_') + 1) : name;
+			_localWant = name.StartsWith("local:", StringComparison.Ordinal) ? name : "local:sdk_" + name;
+			_localUntil = VaClock.Now + LocalWaitSec;
+			_localNextTry = 0f;
+			LastStatus = "loading local avatar " + _localName + "…";
+			VRChatArchiveModPlugin.Logger.LogInfo("[VaTags] wearLocal: " + _localWant);
+		}
+
+		// Polled from OnUpdate, whatever the tags switch says: this is not a tags feature.
+		private static void PumpLocalWear()
+		{
+			if (_localWant == null) return;
+			float now = VaClock.Now;
+			if (now < _localNextTry) return;
+			_localNextTry = now + 0.5f;
+
+			VRC.Core.ApiAvatar av = FindLocalAvatar(_localWant, _localName);
+			if (av == null)
+			{
+				if (now < _localUntil)
+				{
+					LastStatus = $"waiting for VRChat to list {_localName}… ({Mathf.CeilToInt(_localUntil - now)}s)";
+					return;
+				}
+				LastStatus = "VRChat has not listed " + _localName + " — start VRChat from the Mods Loader (it watches the test-avatar folder) or restart the game once";
+				VRChatArchiveModPlugin.Logger.LogWarning("[VaTags] wearLocal: " + _localWant + " never appeared in localContent.");
+				_localWant = null;
+				return;
+			}
+
+			string id = _localWant, shown = _localName;
+			_localWant = null;
+			MethodInfo change = PageAvatarChange();
+			if (change == null)
+			{
+				LastStatus = "switching avatars is unavailable on this build";
+				return;
+			}
+			try
+			{
+				change.Invoke(null, new object[] { av, "" });
+				LastStatus = "✓ wearing " + shown + " (local — only you see it)";
+				VRChatArchiveModPlugin.Logger.LogInfo("[VaTags] wearLocal: change requested into " + id);
+			}
+			catch (Exception e)
+			{
+				LastStatus = "local wear failed: " + Short(e.InnerException?.Message ?? e.Message);
+				VRChatArchiveModPlugin.Logger.LogWarning("[VaTags] wearLocal threw: " + e);
+			}
+		}
+
+		private static VRC.Core.ApiAvatar FindLocalAvatar(string id, string name)
+		{
+			try
+			{
+				var store = VRC.Core.ApiContentModel<VRC.Core.ApiAvatar>.localContent;
+				if (store == null) return null;
+				if (store.ContainsKey(id)) return store[id];
+				// The same file under another prefix, should a build ever change "sdk_".
+				foreach (var kv in store)
+				{
+					string k = kv.Key ?? "";
+					if (k.StartsWith("local:", StringComparison.Ordinal)
+						&& k.EndsWith("_" + name, StringComparison.OrdinalIgnoreCase)) return kv.Value;
+				}
+			}
+			catch (Exception e)
+			{
+				if (!_localStoreWarned)
+				{
+					_localStoreWarned = true;
+					VRChatArchiveModPlugin.Logger.LogWarning("[VaTags] wearLocal: localContent unreadable: " + e.Message);
+				}
+			}
+			return null;
+		}
+
+		// PageAvatar's static "change into avatar" (ApiAvatar, string) — the call VRChat's own button
+		// makes. Resolved by shape, not by name: the method name is obfuscated and rotates per build.
+		private static MethodInfo _pageAvatarChange;
+		private static MethodInfo PageAvatarChange()
+		{
+			if (_pageAvatarChange != null) return _pageAvatarChange;
+			try
+			{
+				Type pageAvatar = Assembly.Load("Assembly-CSharp").GetType("PageAvatar");
+				if (pageAvatar == null) return null;
+				foreach (var m in pageAvatar.GetMethods(BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic))
+				{
+					var ps = m.GetParameters();
+					if (m.ReturnType == typeof(void) && ps.Length == 2
+						&& ps[0].ParameterType.Name == "ApiAvatar" && ps[1].ParameterType == typeof(string))
+					{ _pageAvatarChange = m; break; }
+				}
+			}
+			catch { }
+			return _pageAvatarChange;
 		}
 
 		private static List<(string Label, Action Run)> BuildCloneStrategies(object remoteApiAvatar, string avatarId)
@@ -592,7 +891,7 @@ namespace VRChatArchiveMod.Modules
 				try
 				{
 					run();
-					c.DeadlineAt = Time.realtimeSinceStartup + CloneTimeoutSec;
+					c.DeadlineAt = VaClock.Now + CloneTimeoutSec;
 					LastStatus = $"cloning{(string.IsNullOrEmpty(c.TargetName) ? "" : " " + c.TargetName)}… "
 						+ $"(try {c.Index + 1}/{c.Strategies.Count})";
 					VRChatArchiveModPlugin.Logger.LogInfo($"[VaTags] clone: ran '{label}', waiting for the swap…");
@@ -623,7 +922,7 @@ namespace VRChatArchiveMod.Modules
 			// and with several strategies that is a long silence on a line that says "cloning…" —
 			// indistinguishable from the mod having hung. Showing the seconds left says "still
 			// trying" without adding a single second to the attempt.
-			float left = c.DeadlineAt - Time.realtimeSinceStartup;
+			float left = c.DeadlineAt - VaClock.Now;
 			if (left > 0f)
 			{
 				LastStatus = $"cloning{(string.IsNullOrEmpty(c.TargetName) ? "" : " " + c.TargetName)}… "
@@ -806,11 +1105,62 @@ namespace VRChatArchiveMod.Modules
 			try
 			{
 				var local = PlayerRef.LocalPlayer();
-				if (local == null) return null;
-				ResolveAvatar(local, out string id, out _);
-				return id;
+				if (local != null)
+				{
+					ResolveAvatar(local, out string id, out _);
+					if (!string.IsNullOrEmpty(id)) return id;
+				}
+				// FALLBACK: THE ACCOUNT RECORD, because the player object cannot be read on this build.
+				//
+				// ResolveAvatar goes VRC.Player -> ApiAvatar, and on VRChat 1903 VRC.Player's members
+				// cannot be placed at all -- the startup log says so outright ("ses membres ne peuvent
+				// pas etre places"). So this returned empty, and with it every button that needs to know
+				// which avatar is on screen. The diagnostic caught it exactly:
+				//
+				//     id introuvable — CTA='Applied' avatar porte='' id porte=''
+				//
+				// The pane WAS correctly recognised as showing the worn avatar, and then the worn avatar
+				// had no id. APIUser is readable here -- it already supplies displayName and the
+				// VRC+/18+/platform badges -- and it carries currentAvatar, the same id VRChat prints at
+				// login.
+				return CurrentAvatarFromAccount();
 			}
 			catch { return null; }
+		}
+
+		// The worn avatar id straight off the local APIUser.
+		private static string CurrentAvatarFromAccount()
+		{
+			try
+			{
+				object apiUser = LocalApiUser();
+				if (apiUser == null) return null;
+				object cur = FewTagsModule.GetMember(apiUser, "currentAvatar");
+				// VRChat spells it either as the id itself or as the ApiAvatar behind it.
+				string id = cur as string;
+				if (string.IsNullOrEmpty(id) && cur != null) id = FewTagsModule.GetMember(cur, "id") as string;
+				if (string.IsNullOrEmpty(id)) return null;
+				return id.StartsWith("avtr_", StringComparison.OrdinalIgnoreCase) ? id : null;
+			}
+			catch { return null; }
+		}
+
+		// The local player's APIUser, taken from the roster this module already maintains rather than
+		// walking the players again.
+		private static object LocalApiUser()
+		{
+			try
+			{
+				var roster = Roster;
+				for (int i = 0; roster != null && i < roster.Count; i++)
+				{
+					var e = roster[i];
+					if (e == null || !e.IsLocal || e.Player == null) continue;
+					return FewTagsModule.GetMemberByTypeName(e.Player, "APIUser", "prop_APIUser_0", "field_Private_APIUser_0");
+				}
+			}
+			catch { }
+			return null;
 		}
 
 		// The worn avatar's NAME, by the same route. The Archive fav button uses it to recognise "the
@@ -907,7 +1257,7 @@ namespace VRChatArchiveMod.Modules
 					foreach (var p in vrcPlayerType.GetProperties(BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic))
 					{
 						if (p.PropertyType.Name != "VRCPlayer") continue;
-						try { self = p.GetValue(null); } catch { }
+						try { self = Core.ProxyGuard.GetValue(p, null); } catch { }
 						if (self != null) break;
 					}
 					object mgr = FewTagsModule.GetMemberByTypeName(self, "VRCAvatarManager", "prop_VRCAvatarManager_0", "field_Private_VRCAvatarManager_0");
@@ -933,7 +1283,7 @@ namespace VRChatArchiveMod.Modules
 						var comp = local as Component;
 						if (comp != null)
 						{
-							var found = comp.GetComponentInChildren(il2, true) ?? comp.GetComponentInParent(il2);
+							var found = comp.GetComponentInChildrenSafe(il2, true) ?? comp.GetComponentInParentSafe(il2);
 							// GetComponent* hands back a plain Component wrapper: re-wrap it as
 							// the concrete type, or reflection would scan Component and find
 							// none of the switch methods.
@@ -997,17 +1347,42 @@ namespace VRChatArchiveMod.Modules
 
 		// The local player's own user id — the menu's YOUR TAGS panel needs it because you
 		// never see your own nameplate, so your tags are invisible in-world.
+		//
+		// ASKED EVERY FRAME, BY MORE THAN ONE MODULE. Player grab calls this on every Update just to
+		// decide whether to start listening, and the roster pass calls it three more times. Each miss
+		// costs a local-player lookup plus three or four reflected reads across the il2cpp boundary --
+		// and before you are logged in EVERY call is a miss, so the answer was recomputed from scratch
+		// sixty times a second for nothing. The profiler put that one helper at 140 ms per second of
+		// wall clock inside PlayerGrab alone, with no players in the room.
+		//
+		// The id does not change during a session, so it is remembered. A miss is remembered too, but
+		// only briefly, so that logging in is picked up within half a second.
+		private static string _uidCache = "";
+		private static float _uidAt = -999f;
+
 		public static string LocalUserId()
 		{
-			foreach (var e in Roster) if (e.IsLocal && !string.IsNullOrEmpty(e.UserId)) return e.UserId;
+			float now;
+			try { now = VaClock.Now; } catch { now = 0f; }
+			if (_uidCache.Length > 0 && now - _uidAt < 5f) return _uidCache;
+			if (_uidCache.Length == 0 && now - _uidAt < 0.5f) return "";
+
+			_uidAt = now;
+			foreach (var e in Roster)
+				if (e.IsLocal && !string.IsNullOrEmpty(e.UserId)) { _uidCache = e.UserId; return _uidCache; }
 			try
 			{
 				var local = PlayerRef.LocalPlayer();
 				object apiUser = FewTagsModule.GetMemberByTypeName(local, "APIUser", "prop_APIUser_0", "field_Private_APIUser_0");
-				return FewTagsModule.GetMember(apiUser, "id") as string ?? "";
+				_uidCache = FewTagsModule.GetMember(apiUser, "id") as string ?? "";
 			}
-			catch { return ""; }
+			catch { _uidCache = ""; }
+			return _uidCache;
 		}
+
+		// A world change can hand you a different local player object; drop the memo rather than trust
+		// an id that was read against the previous scene.
+		internal static void ForgetLocalUserId() { _uidCache = ""; _uidAt = -999f; _ownerId = ""; _ownerAt = -999f; _plateMissAt.Clear(); }
 
 		// ---------------------------------------------------------------- API sync
 
@@ -1158,6 +1533,10 @@ namespace VRChatArchiveMod.Modules
 
 		private void RefreshRoster()
 		{
+			// Bumped BEFORE the rebuild: this and every reader run on the main thread in sequence, so
+			// nobody can observe a half-built roster with the new version — a poll in a later frame
+			// sees the finished list either way. Readers use it to skip re-formatting unchanged data.
+			RosterVersion++;
 			Roster.Clear();
 			Transform localT = PlayerRef.LocalTransform();
 			string ownerId = CurrentInstanceOwnerId();
@@ -1200,7 +1579,17 @@ namespace VRChatArchiveMod.Modules
 					// The APIUser loads asynchronously: a player seen before their profile arrived was
 					// cached with empty badges/platform ("no data" rows). Keep re-reading until it
 					// really resolves, then stop — so those rows fill in instead of staying blank.
-					if (!entry.ApiResolved) entry.ApiResolved = ReadApiFields(entry, player);
+					// Retried while it can still land, NOT forever. ReadApiFields only reports
+					// "resolved" once the platform string arrives, so a player whose APIUser never
+					// loads (out of range, still joining, a profile the client never fetches) kept
+					// re-running the whole badge read — four il2cpp property reads plus the trust
+					// colour — on every pass for the rest of the session. A few dozen passes is more
+					// than enough for an async load; after that the entry keeps what it has.
+					if (!entry.ApiResolved && entry.ApiTries < 40)
+					{
+						entry.ApiTries++;
+						entry.ApiResolved = ReadApiFields(entry, player);
+					}
 
 					// THE POSITION SOURCE, fixed. It used to be (player as Component).transform \u2014 a base-cast
 					// of the Player proxy that can hand back a wrapper whose native liveness check fails even
@@ -1209,24 +1598,45 @@ namespace VRChatArchiveMod.Modules
 					// the player through, so it is the reliable source; the component cast (now a TryCast, not
 					// a plain 'as') stays only as a fallback. A dead proxy's .transform is an uncatchable
 					// access violation, so both paths gate on NativeGuard before touching it.
-					object apiV = null;
-					try { apiV = FewTagsModule.GetMemberByTypeName(player, "VRCPlayerApi", "prop_VRCPlayerApi_0", "field_Public_VRCPlayerApi_0"); }
-					catch { }
-
-					Transform tr = null;
-					if (apiV != null)
+					// RESOLVED ONCE, REUSED WHILE ALIVE (2026-09-13). This whole block used to run for
+					// every player on every pass: resolve the VRCPlayerApi by type name, read its
+					// gameObject, cast it, prove it alive, then walk to .transform — four il2cpp
+					// crossings each, thirty-five players, several times a minute, for two references
+					// that only change when the player's avatar is rebuilt.
+					//
+					// Both are cached on the entry now and re-resolved ONLY when the cached one fails
+					// its liveness proof — which is exactly the case the old code was re-resolving
+					// for. Same references, same fallbacks, same result; the work is just not repeated
+					// while nothing has changed.
+					object apiV = entry.ApiObj;
+					if (apiV != null && !Core.NativeGuard.Alive(apiV)) apiV = null;
+					if (apiV == null)
 					{
-						try
-						{
-							var goApi = (FewTagsModule.GetMember(apiV, "gameObject") as Il2CppInterop.Runtime.InteropTypes.Il2CppObjectBase)?.TryCast<GameObject>();
-							if (goApi != null && Core.NativeGuard.Alive(goApi)) tr = goApi.transform;
-						}
+						try { apiV = FewTagsModule.GetMemberByTypeName(player, "VRCPlayerApi", "prop_VRCPlayerApi_0", "field_Public_VRCPlayerApi_0"); }
 						catch { }
+						entry.ApiObj = apiV;
 					}
+
+					// The cached transform is good until the object behind it dies (avatar swap,
+					// player leaving), which is precisely what Alive() answers.
+					Transform tr = entry.Transform;
+					if (tr != null && !Core.NativeGuard.Alive(tr)) tr = null;
 					if (tr == null)
 					{
-						var comp = (player as Il2CppInterop.Runtime.InteropTypes.Il2CppObjectBase)?.TryCast<Component>() ?? player as Component;
-						tr = FewTagsModule.AliveOrNull(comp)?.transform;
+						if (apiV != null)
+						{
+							try
+							{
+								var goApi = (FewTagsModule.GetMember(apiV, "gameObject") as Il2CppInterop.Runtime.InteropTypes.Il2CppObjectBase)?.TryCast<GameObject>();
+								if (goApi != null && Core.NativeGuard.Alive(goApi)) tr = goApi.transform;
+							}
+							catch { }
+						}
+						if (tr == null)
+						{
+							var comp = (player as Il2CppInterop.Runtime.InteropTypes.Il2CppObjectBase)?.TryCast<Component>() ?? player as Component;
+							tr = FewTagsModule.AliveOrNull(comp)?.transform;
+						}
 					}
 					entry.Transform = tr;
 
@@ -1256,10 +1666,47 @@ namespace VRChatArchiveMod.Modules
 					}
 					catch { }
 
-					// The avatar can change while they stand there; keep reading it, it is what the
-					// clone/metadata features rely on.
-					ResolveAvatar(player, out string avId, out string avName);
-					entry.AvatarId = avId; entry.AvatarName = avName;
+					// THE AVATAR RE-READ IS THE ROSTER'S LAST UNCACHED COST (2026-09-13).
+					//
+					// ResolveAvatar walks player -> ApiAvatar (or player -> VRCPlayer -> ApiAvatar),
+					// three GetMemberByTypeName calls, each an il2cpp property invoke gated by a
+					// VirtualQuery liveness syscall. With everything else on the entry now cached,
+					// this is what kept a fully-cached 35-player pass at ~265 ms (the [VaTags/roster]
+					// timer proved it: "35 cached" and still hundreds of ms).
+					//
+					// An avatar does change while someone stands there, so it cannot be cached once
+					// and forgotten — but it does not change between two passes a couple of seconds
+					// apart. Re-read on first sight and then one pass in three: clone and metadata
+					// still see a swap within ~3-6 s, and two thirds of the crossings are gone. The
+					// entry keeps its last value on a skipped pass, which is the correct answer while
+					// nothing changed.
+					entry.AvatarPass++;
+					if (entry.AvatarPass == 1 || (entry.AvatarPass % 3) == 0)
+					{
+						ResolveAvatar(player, out string avId, out string avName);
+						// Someone who blocked you is swapped to a local invisible shell; keep the last real
+						// id for the archive instead of letting that shell overwrite it.
+						bool blockedMe = !entry.IsLocal && BlockedByProbeModule.BlockedMe.Contains(entry.UserId ?? "");
+						if (blockedMe && !string.IsNullOrEmpty(entry.AvatarId) && avId != entry.AvatarId)
+						{
+							if (entry.BlockedAvatarLogged != avId)
+							{
+								entry.BlockedAvatarLogged = avId;
+								VRChatArchiveModPlugin.Logger.LogInfo("[BlockedAvatar] " + entry.Name + " t'a bloque — avatar garde "
+									+ entry.AvatarId + " (le jeu lit maintenant " + (avId ?? "rien") + ")");
+							}
+						}
+						else { entry.AvatarId = avId; entry.AvatarName = avName; }
+					}
+
+					// FOLDED IN FROM BlockedByProbe (2026-09-13): read the block flag HERE, in the
+					// pass that already walked this player and proved it live, so that module does not
+					// repeat the entire 40-player walk — and its 40 VirtualQuery liveness syscalls —
+					// a second time each second. It only copies entry.Blocked afterwards.
+					try { BlockedByProbeModule.DumpBooleanProfile(player, entry.UserId, entry.IsLocal); } catch { }
+					if (!entry.IsLocal) { try { BlockedByProbeModule.DumpPlayerLayout(player); } catch { } }
+					if (!entry.IsLocal && BlockedByProbeModule.WantBlockProbe())
+						entry.Blocked = BlockedByProbeModule.ReadBlockedFlag(player);
 
 					Roster.Add(entry);
 				}
@@ -1286,6 +1733,8 @@ namespace VRChatArchiveMod.Modules
 		private static Type _roomMgrType;
 		private static PropertyInfo _instanceProp;
 		private static bool _rmResolved;
+		private static string _ownerId = "";
+		private static float _ownerAt = -999f;
 		public static string CurrentInstanceOwnerId()
 		{
 			try
@@ -1299,8 +1748,17 @@ namespace VRChatArchiveMod.Modules
 							?? _roomMgrType.GetProperties(BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic)
 								.FirstOrDefault(p => p.PropertyType.Name == "ApiWorldInstance");
 				}
-				object inst = _instanceProp?.GetValue(null);
-				return FewTagsModule.GetMember(inst, "ownerId") as string ?? "";
+				// MEMOISED, because the roster asks for it on every pass and the answer changes only
+				// when the instance does. Both calls below go through the recovered RoomManager: a
+				// property read on a class placed by member shape, then a member lookup by name on
+				// ApiWorldInstance. That is the same 'expensive failing lookup, retried every frame'
+				// shape already fixed for LocalUserId and the nameplate container -- here it was the
+				// whole of the 254 ms roster pass that ran with ZERO players in it.
+				float now = VaClock.Now;
+				if (now - _ownerAt < (_ownerId.Length > 0 ? 5f : 1f)) return _ownerId;
+				_ownerAt = now;
+				object inst = Core.ProxyGuard.GetValue(_instanceProp, null);
+				return _ownerId = FewTagsModule.GetMember(inst, "ownerId") as string ?? "";
 			}
 			catch { return ""; }
 		}
@@ -1327,7 +1785,7 @@ namespace VRChatArchiveMod.Modules
 		{
 			// Refreshed at most once a second: this walks reflection, and the menu asks for it
 			// every frame it is open.
-			float now = Time.realtimeSinceStartup;
+			float now = VaClock.Now;
 			if (now - _instAt < 1f) return _instCache;
 			_instAt = now;
 
@@ -1370,14 +1828,34 @@ namespace VRChatArchiveMod.Modules
 			}
 			catch { }
 
-			try { var ps = VRC.SDKBase.VRCPlayerApi.AllPlayers; info.Present = ps != null ? ps.Count : 0; } catch { }
+			// LAST RESORT: VRCHAT'S OWN LOG. RoomManager and ApiWorldInstance are obfuscated, and on a
+			// build where they cannot be placed everything above returns empty — silently. The world id
+			// is then missing from the sync, and every feature keyed on it (the client's Udon world
+			// profiles, its preset packs) goes quiet with no message at all. VRChat prints the id in
+			// plain text on every join, so that is read rather than leaving the field blank.
+			try
+			{
+				Core.WorldFromLog.Arm();
+				if (string.IsNullOrEmpty(info.WorldId) && Core.WorldFromLog.WorldId.Length > 0)
+				{
+					info.WorldId = Core.WorldFromLog.WorldId;
+					if (string.IsNullOrEmpty(info.InstanceId)) info.InstanceId = Core.WorldFromLog.InstanceId;
+				}
+				if (string.IsNullOrEmpty(info.WorldName) && Core.WorldFromLog.WorldName.Length > 0)
+					info.WorldName = Core.WorldFromLog.WorldName;
+			}
+			catch { }
+
+			try { var ps = VRChatArchiveMod.Core.VaPlayers.All(); info.Present = ps != null ? ps.Count : 0; } catch { }
 			_instCache = info;
 			return info;
 		}
 
 		private static object _instraw()
 		{
-			try { return _instanceProp?.GetValue(null); } catch { return null; }
+			// RoomManager is obfuscated and absent under its 1886 name here; its static getter through
+			// the placeholder is an access violation. ProxyGuard answers null instead.
+			try { return Core.ProxyGuard.GetValue(_instanceProp, null); } catch { return null; }
 		}
 
 		private static string Between(string s, string a, string b)
@@ -1483,10 +1961,32 @@ namespace VRChatArchiveMod.Modules
 		// The last (roster/want/fail/plates) shape reported, so the line repeats only on a change.
 		private static string _lastShape = "";
 		private int _wantPlates, _resolveFail;
+		private bool _budgetSaid;
+		// Once a single plate build has proven pathological, the feature stays off for the session.
+		private bool _platesBroken;
+		private int _slowStrikes;
+		// RECALIBRATED AGAINST THE REAL COST, not against the bug.
+		//
+		// 250 ms was chosen while a scene-wide sweep made one resolve take 14 673 ms -- anything would
+		// have caught that. With the sweep replaced by GameObject.Find the same resolve measures 303 ms,
+		// almost all of it first-time setup (locating the manager, indexing the containers), and the old
+		// ceiling then switched tag plates off for 303 ms of warm-up. A limit tuned to a fault it no
+		// longer has is a limit that only punishes the healthy case.
+		//
+		// 1200 ms leaves room for that warm-up and still catches the pathology by a factor of twelve.
+		private const double SlowPlateMs = 1200.0;
+		// The whole-pass ceiling. Above this the frame is visibly hitching, whatever caused it.
+		private const double SlowPassMs = 1200.0;
+
+		// When each user's nameplate resolve last failed. Cleared on success and on scene change:
+		// a new world rebuilds every nameplate, so nothing here survives it.
+		private static readonly Dictionary<string, float> _plateMissAt = new Dictionary<string, float>(StringComparer.Ordinal);
 
 		private void ApplyPlates()
 		{
 			_wantPlates = 0; _resolveFail = 0;
+			// Tripped by the circuit breaker below: never rebuild, and never freeze again this session.
+			if (_platesBroken) return;
 			if (_db.Count == 0)
 			{
 				if (_plates.Count > 0) RemoveAllPlates();
@@ -1497,8 +1997,34 @@ namespace VRChatArchiveMod.Modules
 			float spacing = FewTagsModule.EffectiveSpacing();
 			float configBaseY = ModConfig.VaTagsPlateY.Value;
 
+			// A HARD BUDGET, BECAUSE A PASS THAT OVERRUNS FREEZES THE GAME.
+			//
+			// Measured in production: "[VaTags/plates] pass took 11492.6 ms — 1 wanted". Eleven and a
+			// half seconds inside ONE frame, to build ONE plate set. Windows greys an unresponsive
+			// window, so the owner reported it as a crash -- and they were right to: an eleven second
+			// freeze is a crash as far as playing is concerned.
+			//
+			// The root cause of that one slow build is worth finding, but it must never again be able
+			// to hold the frame while we look for it. Work stops at the budget and resumes next pass;
+			// plates appear a fraction of a second later at worst, which nobody can see. Correctness is
+			// unaffected -- nothing here is all-or-nothing, each player's set is independent.
+			var budget = System.Diagnostics.Stopwatch.StartNew();
+			const double BudgetMs = 4.0;
+			int built = 0;
+
 			foreach (var entry in Roster)
 			{
+				if (budget.Elapsed.TotalMilliseconds > BudgetMs)
+				{
+					if (!_budgetSaid)
+					{
+						_budgetSaid = true;
+						VRChatArchiveModPlugin.Logger.LogInfo("[VaTags] budget de " + BudgetMs + " ms atteint apres "
+							+ built + " plaque(s) — le reste passe a la frame suivante plutot que de figer le jeu.");
+					}
+					break;
+				}
+
 				// The local player gets plates too: they show up in mirrors and confirm your
 				// own tag is really applied (VRChat hides your nameplate from yourself).
 				if (string.IsNullOrEmpty(entry.UserId)) continue;
@@ -1525,12 +2051,85 @@ namespace VRChatArchiveMod.Modules
 				// in a mirror, which is where people look at their own tags. Skipping it removed a
 				// feature that used to work.
 				_wantPlates++;
-				if (!FewTagsModule.ResolveNameplate(entry.Player, out GameObject quickStats, out Transform contents)) { _resolveFail++; continue; }
+				built++;
+
+				// A RESOLVE THAT FAILED DOES NOT GET RETRIED EVERY PASS.
+				//
+				// A player whose plate set cannot be built is never cached, so the loop came back to
+				// them on every pass and paid the full nameplate resolve again -- the same "expensive
+				// failing lookup, retried for ever" defect already fixed for LocalUserId, the nameplate
+				// container and CurrentInstanceOwnerId. With three tagged players in the room the
+				// profiler read VaTags=908 ms/s. Two seconds is far tighter than a nameplate ever
+				// appears, so a plate that becomes resolvable still lands promptly.
+				float nowP = VaClock.Now;
+				if (_plateMissAt.TryGetValue(entry.UserId, out float missAt) && nowP - missAt < 2f) { _resolveFail++; continue; }
+
+				// TIMED, because the breaker around MakePlate did NOT fire and the pass STILL took
+				// 11 100 ms. That rules MakePlate out and leaves this call: resolving a nameplate walks
+				// a hierarchy, and on a heavy avatar that walk is the only thing here big enough to eat
+				// eleven seconds. Measuring names the culprit instead of narrowing by halves across
+				// another of the owner's play sessions.
+				var rn = System.Diagnostics.Stopwatch.StartNew();
+				bool resolved = FewTagsModule.ResolveNameplate(entry.Player, out GameObject quickStats, out Transform contents);
+				double rnMs = rn.Elapsed.TotalMilliseconds;
+					// ONE SLOW PLAYER IS NOT A BROKEN FEATURE.
+					//
+					// The first version of this breaker switched tag plates off for the whole session the
+					// instant a single resolve ran long, and that is exactly what happened: one 13.6 s
+					// outlier -- the scene-wide diagnostic probe, now disarmed -- and the owner lost plates
+					// until a restart. Tripping on the first sample cannot tell an outlier from a fault, and
+					// it costs the feature either way.
+					//
+					// So a slow resolve now benches THAT PLAYER for a minute and counts a strike. Plates keep
+					// working for everyone else, and only a fault that keeps coming back is treated as one.
+					if (rnMs > SlowPlateMs)
+					{
+						_slowStrikes++;
+						_plateMissAt[entry.UserId] = nowP + 60f;
+						VRChatArchiveModPlugin.Logger.LogWarning("[VaTags] resoudre une nameplate a pris "
+							+ ((int)rnMs) + " ms (limite " + SlowPlateMs + ") pour '" + (entry.UserId ?? "?")
+							+ "' — ce joueur est mis de cote 60 s. Avertissement " + _slowStrikes + "/3.");
+						if (_slowStrikes >= 3)
+						{
+							_platesBroken = true;
+							VRChatArchiveModPlugin.Logger.LogWarning("[VaTags] COUPE-CIRCUIT : trois resolutions lentes. "
+								+ "Plaques de tags DESACTIVEES pour cette session.");
+						}
+						continue;
+					}
+				if (!resolved)
+				{
+					_resolveFail++;
+					_plateMissAt[entry.UserId] = nowP;
+					continue;
+				}
+				_plateMissAt.Remove(entry.UserId);
 
 				var set = new PlateSet { DbVersion = _dbVersion, FewLines = fewLines };
 				for (int i = 0; i < tags.Length; i++)
 				{
+					// A CIRCUIT BREAKER AROUND THE ONE CALL THAT FROZE THE GAME.
+					//
+					// The per-player budget above cannot help here: it is checked BETWEEN players, and
+					// the measured 11 195 ms was spent inside a SINGLE build. So the cost is timed where
+					// it happens, and if one plate is pathologically slow the feature stands down for the
+					// session rather than freezing every frame that rebuilds it.
+					//
+					// Standing down is the right trade: tags are decoration, and a decoration costing
+					// eleven seconds of frozen game is not worth showing. The log names the cost and the
+					// tag, so the real cause can be found without the owner losing a session to it.
+					var mk = System.Diagnostics.Stopwatch.StartNew();
 					GameObject go = FewTagsModule.MakePlate(quickStats, contents, baseY + i * spacing, tags[i].Text);
+					double mkMs = mk.Elapsed.TotalMilliseconds;
+					if (mkMs > SlowPlateMs)
+					{
+						_platesBroken = true;
+						VRChatArchiveModPlugin.Logger.LogWarning("[VaTags] COUPE-CIRCUIT : construire UNE plaque a pris "
+							+ ((int)mkMs) + " ms (limite " + SlowPlateMs + "). Plaques de tags DESACTIVEES pour cette "
+							+ "session — elles figeaient le jeu. Tag concerne : '" + (tags[i].Text ?? "") + "'.");
+						if (go != null) { try { UnityEngine.Object.Destroy(go); } catch { } }
+						break;
+					}
 					if (go == null) continue;
 					// The label MakePlate actually wrote to. Searching the clone again for
 					// "Trust Text" was wrong on two counts: the anchor is named GroupName on the
@@ -2038,10 +2637,19 @@ namespace VRChatArchiveMod.Modules
 		private static Color ParseColor(string hex, Color fallback)
 			=> !string.IsNullOrEmpty(hex) && ColorUtility.TryParseHtmlString(hex, out Color c) ? c : fallback;
 
+		// EVERY plate, not just the first (2026-09-13). This used to test Plates[0] alone, so a set
+		// whose FIRST plate had been destroyed — VRChat rebuilding part of a nameplate — counted as
+		// dead while plates 1..n were still parented and visible. PruneDeadSets then dropped the key
+		// from _plates, the only ledger RemoveAllPlates() walks, and those plates floated above the
+		// player for the rest of the session with tags switched off.
 		private static bool SetAlive(PlateSet ps)
 		{
-			if (ps.Plates.Count == 0) return false;
-			try { return ps.Plates[0].Go != null; } catch { return false; }
+			if (ps == null || ps.Plates.Count == 0) return false;
+			for (int i = 0; i < ps.Plates.Count; i++)
+			{
+				try { if (ps.Plates[i].Go != null) return true; } catch { }
+			}
+			return false;
 		}
 
 		private void PruneDeadSets()
@@ -2049,7 +2657,9 @@ namespace VRChatArchiveMod.Modules
 			List<string> dead = null;
 			foreach (var kv in _plates) if (!SetAlive(kv.Value)) (dead ??= new List<string>()).Add(kv.Key);
 			if (dead == null) return;
-			foreach (string uid in dead) _plates.Remove(uid);
+			// DestroySet, not a bare Remove: a "dead" set can still hold live plates (see SetAlive),
+			// and dropping the key without destroying them is exactly how plates get stranded.
+			foreach (string uid in dead) DestroySet(uid);
 		}
 
 		private void DestroySet(string uid)

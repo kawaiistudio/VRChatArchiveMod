@@ -90,7 +90,7 @@ namespace VRChatArchiveMod.Modules
 			// ---- STATUS: read-only, and proof the overlay costs nothing to keep live
 			Overlay.Page info = Overlay.AddPage("STATUS");
 			info.Group("SESSION")
-				.Label(() => "fps        " + Mathf.RoundToInt(1f / Mathf.Max(Time.smoothDeltaTime, 0.0001f)))
+				.Label(() => "fps        " + Mathf.RoundToInt(1f / Mathf.Max(VaClock.Delta, 0.0001f)))
 				.Label(() => "pages      " + Overlay.PageCount)
 				.Action("Close overlay", () => Overlay.Visible = false);
 		}

@@ -135,7 +135,7 @@ namespace VRChatArchiveMod.Core
 		private static Transform RootByType()
 		{
 			if (_rootByType != null) return _rootByType;
-			float now = Time.realtimeSinceStartup;
+			float now = VaClock.Now;
 			if (now < _rootNextTry) return null;
 			_rootNextTry = now + 2f;
 			try
@@ -187,7 +187,7 @@ namespace VRChatArchiveMod.Core
 			// down and rebuilt between worlds.
 			if (s.T != null) return s.T;
 
-			float now = Time.realtimeSinceStartup;
+			float now = VaClock.Now;
 			if (now < s.NextTry) return null;
 			s.NextTry = now + 2f;   // a menu that does not exist yet must not become a per-frame search
 

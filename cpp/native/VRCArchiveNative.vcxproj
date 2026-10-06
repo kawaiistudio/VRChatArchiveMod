@@ -1,0 +1,150 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+
+  <PropertyGroup Label="Globals">
+    <VCProjectVersion>17.0</VCProjectVersion>
+    <ProjectGuid>{A1B2C3D4-0001-4000-9000-00000000AB01}</ProjectGuid>
+    <RootNamespace>VRCArchiveNative</RootNamespace>
+    <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
+    <TargetName>VRChatArchiveNative</TargetName>
+  </PropertyGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="Configuration">
+    <ConfigurationType>DynamicLibrary</ConfigurationType>
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <PlatformToolset>v143</PlatformToolset>
+    <WholeProgramOptimization>true</WholeProgramOptimization>
+    <CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <ClCompile>
+      <LanguageStandard>stdcpp20</LanguageStandard>
+      <WarningLevel>Level3</WarningLevel>
+      <Optimization>MaxSpeed</Optimization>
+      <FunctionLevelLinking>true</FunctionLevelLinking>
+      <IntrinsicFunctions>true</IntrinsicFunctions>
+      <SDLCheck>false</SDLCheck>
+      <ConformanceMode>true</ConformanceMode>
+      <AdditionalIncludeDirectories>$(ProjectDir)include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <PreprocessorDefinitions>WIN32;NDEBUG;_WINDOWS;_USRDLL;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <ExceptionHandling>Sync</ExceptionHandling>
+    </ClCompile>
+    <Link>
+      <SubSystem>Windows</SubSystem>
+      <EnableCOMDATFolding>true</EnableCOMDATFolding>
+      <OptimizeReferences>true</OptimizeReferences>
+      <!-- No debug directory in the shipped DLL. GenerateDebugInformation=true writes a PDB and
+           stamps the image with its absolute build path plus symbol hints, a free map for a
+           reverse engineer. The mod ships as one obfuscated binary with nothing to debug in the
+           field, so the symbols are dropped entirely. -->
+      <GenerateDebugInformation>false</GenerateDebugInformation>
+      <SetChecksum>false</SetChecksum>
+    </Link>
+  </ItemDefinitionGroup>
+
+
+  <ItemGroup>
+    <ClCompile Include="src\clicktp.cpp" />
+    <ClCompile Include="src\vatags.cpp" />
+    <ClCompile Include="src\obf_selftest.cpp" />
+    <ClCompile Include="src\dllmain.cpp" />
+    <ClCompile Include="src\il2cpp.cpp" />
+    <ClCompile Include="src\log.cpp" />
+    <ClCompile Include="src\config.cpp" />
+    <ClCompile Include="src\engine.cpp" />
+    <ClCompile Include="src\recovery.cpp" />
+    <ClCompile Include="src\udon.cpp" />
+    <ClCompile Include="src\unity.cpp" />
+    <ClCompile Include="src\wings.cpp" />
+    <ClCompile Include="src\world.cpp" />
+    <ClCompile Include="src\worldobjects.cpp" />
+    <ClCompile Include="src\portals.cpp" />
+    <ClCompile Include="src\quickmenu.cpp" />
+    <ClCompile Include="src\clicks.cpp" />
+    <ClCompile Include="src\photon.cpp" />
+    <ClCompile Include="src\pickups.cpp" />
+    <ClCompile Include="src\player.cpp" />
+    <ClCompile Include="src\avatar.cpp" />
+    <ClCompile Include="src\blocked.cpp" />
+    <ClCompile Include="src\boxdrop.cpp" />
+    <ClCompile Include="src\audio.cpp" />
+    <ClCompile Include="src\soundboard.cpp" />
+    <ClCompile Include="src\badapple.cpp" />
+    <ClCompile Include="src\bridge.cpp" />
+    <ClCompile Include="src\uidump.cpp" />
+    <ClCompile Include="src\rotator.cpp" />
+    <ClCompile Include="src\screenui.cpp" />
+    <ClCompile Include="src\extras.cpp" />
+    <ClCompile Include="src\features.cpp" />
+    <ClCompile Include="src\anticrash.cpp" />
+    <ClCompile Include="src\mark.cpp" />
+    <ClCompile Include="src\mimic.cpp" />
+    <ClCompile Include="src\netself.cpp" />
+    <ClCompile Include="src\objects.cpp" />
+    <ClCompile Include="src\orbit.cpp" />
+    <ClCompile Include="src\trueview.cpp" />
+    <ClCompile Include="src\http.cpp" />
+    <ClCompile Include="src\feed.cpp" />
+    <ClCompile Include="src\glowesp.cpp" />
+    <ClCompile Include="src\hooks.cpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="include\il2cpp.hpp" />
+    <ClInclude Include="include\log.hpp" />
+    <ClInclude Include="include\module.hpp" />
+    <ClInclude Include="include\config.hpp" />
+    <ClInclude Include="include\clicktp.hpp" />
+    <ClInclude Include="include\vatags.hpp" />
+    <ClInclude Include="include\obf.hpp" />
+    <ClInclude Include="include\engine.hpp" />
+    <ClInclude Include="include\recovery.hpp" />
+    <ClInclude Include="include\udon.hpp" />
+    <ClInclude Include="include\unity.hpp" />
+    <ClInclude Include="include\wings.hpp" />
+    <ClInclude Include="include\world.hpp" />
+    <ClInclude Include="include\worldobjects.hpp" />
+    <ClInclude Include="include\portals.hpp" />
+    <ClInclude Include="include\quickmenu.hpp" />
+    <ClInclude Include="include\clicks.hpp" />
+    <ClInclude Include="include\photon.hpp" />
+    <ClInclude Include="include\pickups.hpp" />
+    <ClInclude Include="include\player.hpp" />
+    <ClInclude Include="include\avatar.hpp" />
+    <ClInclude Include="include\blocked.hpp" />
+    <ClInclude Include="include\boxdrop.hpp" />
+    <ClInclude Include="include\audio.hpp" />
+    <ClInclude Include="include\soundboard.hpp" />
+    <ClInclude Include="include\badapple.hpp" />
+    <ClInclude Include="include\bridge.hpp" />
+    <ClInclude Include="include\uidump.hpp" />
+    <ClInclude Include="include\rotator.hpp" />
+    <ClInclude Include="include\screenui.hpp" />
+    <ClInclude Include="include\extras.hpp" />
+    <ClInclude Include="include\features.hpp" />
+    <ClInclude Include="include\anticrash.hpp" />
+    <ClInclude Include="include\mark.hpp" />
+    <ClInclude Include="include\mimic.hpp" />
+    <ClInclude Include="include\netself.hpp" />
+    <ClInclude Include="include\objects.hpp" />
+    <ClInclude Include="include\orbit.hpp" />
+    <ClInclude Include="include\trueview.hpp" />
+    <ClInclude Include="include\http.hpp" />
+    <ClInclude Include="include\feed.hpp" />
+    <ClInclude Include="include\glowesp.hpp" />
+    <ClInclude Include="include\hooks.hpp" />
+    <ClInclude Include="include\obf_map.25686233.hpp" />
+  </ItemGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+</Project>

@@ -70,7 +70,7 @@ namespace VRChatArchiveMod.Modules
 					return;
 				}
 
-				float now = Time.realtimeSinceStartup;
+				float now = VaClock.Now;
 				if (now < _next) return;
 				_next = now + 2f;
 
@@ -81,7 +81,7 @@ namespace VRChatArchiveMod.Modules
 				else
 				{
 					// The trial survived its window: the section is genuinely accepted.
-					if (_trial && Time.realtimeSinceStartup > _trialUntil)
+					if (_trial && VaClock.Now > _trialUntil)
 					{
 						DisarmTrial();
 						VRChatArchiveModPlugin.Logger.LogInfo("[" + Name + "] forced section survived — it works.");
@@ -203,10 +203,12 @@ namespace VRChatArchiveMod.Modules
 				// Arm the watchdog. Anything that throws in the next few seconds is very likely the
 				// page choking on this entry, so we take it back out and keep the message.
 				_trial = true;
-				_trialUntil = Time.realtimeSinceStartup + 8f;
-				_watch ??= Core.Il2CppDelegates.TryConvert<UnityEngine.Application.LogCallback>(
-					(Action<string, string, UnityEngine.LogType>)OnTrialLog, Name);
-				if (_watch != null) UnityEngine.Application.add_logMessageReceived(_watch);
+				_trialUntil = VaClock.Now + 8f;
+				// Through Core.UnityLog: hooking Application.CallLogCallback needs no il2cpp delegate,
+				// and a watchdog that cannot start is a watchdog that never catches the crash it exists
+				// for -- the forced section would stay in place after breaking the page.
+				_watch ??= OnTrialLog;
+				Core.UnityLog.Subscribe(_watch, Name);
 
 				Status = "forced section added — watching for errors";
 				VRChatArchiveModPlugin.Logger.LogInfo($"[{Name}] FORCED a new section into {Kind}; watchdog armed for 8s.");
@@ -218,7 +220,7 @@ namespace VRChatArchiveMod.Modules
 			}
 		}
 
-		private UnityEngine.Application.LogCallback _watch;
+		private Action<string, string, UnityEngine.LogType> _watch;
 
 		private void OnTrialLog(string condition, string stack, UnityEngine.LogType type)
 		{
@@ -243,7 +245,7 @@ namespace VRChatArchiveMod.Modules
 		private void DisarmTrial()
 		{
 			_trial = false;
-			try { if (_watch != null) UnityEngine.Application.remove_logMessageReceived(_watch); } catch { }
+			try { Core.UnityLog.Unsubscribe(_watch); } catch { }
 		}
 
 		private static string Trunc(string s, int n)
@@ -319,7 +321,7 @@ namespace VRChatArchiveMod.Modules
 			int n = list.Count;
 			if (n < 2) { Status = "waiting — VRChat has " + n + " list(s) so far"; _lastCount = n; return false; }
 
-			float now = Time.realtimeSinceStartup;
+			float now = VaClock.Now;
 			if (n != _lastCount) { _lastCount = n; _steadySince = now; }
 			if (now - _steadySince < 2f) { Status = "waiting — the list is still filling"; return false; }
 			return true;

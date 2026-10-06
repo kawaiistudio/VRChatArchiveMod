@@ -97,42 +97,38 @@ VRChat's property. Committing either would be redistributing code we have no rig
 `.gitignore` states this at the point of exclusion, and the rule is not negotiable — a pull request
 that adds files under `libs/` will be closed.
 
-### `ressources/` — 26 embedded files, about 22.6 MiB
+### `ressources/` — 22 embedded files, about 20.9 MiB
 
-The `.csproj` embeds 26 files from `ressources/` into the DLL, each with an explicit `<LogicalName>`
+The `.csproj` embeds 22 files from `ressources/` into the DLL, each with an explicit `<LogicalName>`
 that the code looks up at runtime (`Core/AssetLoader.cs` and callers of
 `Assembly.GetManifestResourceStream`).
 
 | File | Size | Used by |
 |---|---|---|
 | `badapple.wav` | 9.2 MiB | `Core/BadAppleAudio.cs` — the object show's soundtrack, and its clock |
-| `era\music2017.wav` | 5.3 MiB | `Modules/EraLoadingModule.cs` — VRChat's 2017 loading track, 16-bit PCM (the only format `ClipFromWav` accepts) |
+| `tokens-1886.tsv.gz` | 3.4 MiB | `Core/TokenShiftFix.cs` — metadata token → member name table read out of the Il2CppInterop assemblies of the build they were generated for (`tools/pack-port/tokmap` produces it); lets the fix rebind by name when the tokens shift |
 | `spawn_darksquad.wav` | 2.1 MiB | `Modules/SpawnSoundModule.cs` — local spawn stinger |
 | `badapple_hd.frames.gz` | 1.9 MiB | `Modules/MarkModule.cs` — 64×48 object-art frames |
 | `spawn_te_op.wav` | 948 KiB | `Modules/SignatureSoundModule.cs` — one person's arrival clip; third-party music, supplied by the author |
 | `badapple.frames` | 775 KiB | `Modules/BadAppleModule.cs` — baked chatbox frames |
+| `rue\mcs.dll.gz` | 478 KiB | `Modules/RuntimeEditorHost.cs` — the Mono C# compiler RuntimeUnityEditor's REPL uses, gzipped; third-party, see NOTICE |
 | `menu_bg.png` | 455 KiB | `Core/AssetLoader.cs` — QuickMenu wallpaper |
 | `background.jpg` | 341 KiB | `Core/AssetLoader.cs` — overlay background |
 | `sb_scary.wav` | 218 KiB | `Modules/SoundboardModule.cs` |
 | `va_panel_players.jpg` | 213 KiB | `Modules/WingPlayersModule.cs` — left wing panel art |
 | `sb_gay.wav` | 184 KiB | `Modules/SoundboardModule.cs` |
 | `va_panel_log.jpg` | 178 KiB | `Modules/WingLogModule.cs` — right wing panel art |
+| `rue\RuntimeUnityEditor.Core.IL2CPP.dll.gz` | 177 KiB | `Modules/RuntimeEditorHost.cs` — RuntimeUnityEditor (IL2CPP build) by ManlyMarco, gzipped, loaded on demand; **GPL-3.0**, see NOTICE |
 | `watch_join.wav` | 171 KiB | `Modules/WatchlistModule.cs` — watchlist join alert |
 | `sb_respawn.wav` | 120 KiB | `Modules/SoundboardModule.cs` |
 | `sb_mambo.png` | 86 KiB | `Modules/SoundboardModule.cs` — clip artwork |
 | `sb_mambo.wav` | 35 KiB | `Modules/SoundboardModule.cs` |
 | `5560-heart-rem.png` | 30 KiB | `Core/AssetLoader.cs`, soundboard default artwork |
 | `kawaii_logo.png` | 28 KiB | `Modules/LaunchpadConsoleModule.cs` — console header mark |
-| `era\l17_ringglow.png` | 85 KiB | `Modules/EraLoadingModule.cs` — 2017 outer glow ring, 855×854, spins at 1°/s |
-| `era\l17_dashring.png` | 49 KiB | `Modules/EraLoadingModule.cs` — 2017 dashed ring, 604×604, spins at 10°/s |
-| `era\l17_midring.png` | 39 KiB | `Modules/EraLoadingModule.cs` — 2017 middle ring, 645×644, static |
-| `era\logo.png` | 24 KiB | `Modules/EraLoadingModule.cs` — 2017 wordmark, the one sprite drawn ScaleToFit |
-| `era\l17_diamond.png` | 8.3 KiB | `Modules/EraLoadingModule.cs` — 2017 centre diamond, 788×788 |
-| `era\l17_wave.png` | 7.4 KiB | `Modules/EraLoadingModule.cs` — 2017 progress sprite, 325×89, drawn twice (tinted track, then clipped fill) |
 | `logo_archive.jpg` | 4.8 KiB | `Core/AssetLoader.cs` |
 | `badapple.charset` | 97 B | `Modules/BadAppleModule.cs` — the hanzi grey ramp |
 
-Total: **16 772 670 bytes, 16.0 MiB**, of which `badapple.wav` alone is 9 663 054 bytes. It is that
+Total: **21 962 657 bytes, 20.9 MiB**, of which `badapple.wav` alone is 9 663 054 bytes. It is that
 large because this IL2CPP build has no MP3 decoder at all (see `Core/WavAudio.cs`), so the clip has to
 travel as mono 16-bit PCM WAV.
 
@@ -208,8 +204,7 @@ signal CI is for.
 - **C# syntax parsing.** Every `.cs` file is parsed for syntactic validity. This catches a stray brace
   or a truncated file. It is not a compile: it cannot see a missing type, a wrong overload, or an
   interop signature that changed.
-- **Python tool compilation.** `tools/*.py` are byte-compiled, which catches syntax errors in the three
-  scripts. They have no third-party imports beyond what each script documents.
+- **Python tool compilation.** `tools/*.py` are byte-compiled, which catches syntax errors in every script under `tools/`. They have no third-party imports beyond what each script documents.
 
 **Semantic correctness is verified by the maintainer building locally and running the result in
 VRChat.** There is no substitute, and no automation that can stand in for it. That is the single most
@@ -220,13 +215,16 @@ like — see [Commits and pull requests](#commits-and-pull-requests).
 
 ## How the code is organized
 
-114 files are tracked, 101 of them C#:
+315 files are tracked, 174 of them C#:
 
 ```
 src/Plugin.cs            entry point — 1 file
-src/Core/                infrastructure — 36 files
-src/Modules/             one feature per file — 63 files
-tools/*.py               3 offline tools, no game dependency
+src/Core/                infrastructure — 76 files
+src/Modules/             one feature per file — 88 files
+cpp/native/              the native (C++) engine — 43 .cpp, 46 .hpp, one .vcxproj (see cpp/README.md)
+cpp/loader/              the one-file BepInEx loader that carries the engine
+tools/pack-port/         the Unity 6 port kit — 5 Python tools, the StructFix patcher, probes (see tools/pack-port/README.md)
+tools/*.py               3 offline tools for the chatbox art, no game dependency
 ```
 
 [README.md's Architecture section](README.md#architecture) describes the runtime in full — the plugin

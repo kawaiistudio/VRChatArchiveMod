@@ -33,6 +33,16 @@ namespace VRChatArchiveMod.Modules
 		private Transform _vrcPlayerT;   // the real player root (capsule + camera live here)
 		private Transform _capsuleT;     // the CharacterController's transform
 		private bool _loggedHierarchy;
+		private static Transform _cachedVrcPlayerLocal;
+		private float _storedWalk = 2f, _storedStrafe = 2f, _storedRun = 4f;
+		private bool _speedsSuppressed;
+
+		public override void OnSceneLoaded(int buildIndex)
+		{
+			_cachedVrcPlayerLocal = null;
+			_hasHold = false;
+			_speedsSuppressed = false;
+		}
 
 		public override void OnUpdate()
 		{
@@ -71,6 +81,33 @@ namespace VRChatArchiveMod.Modules
 				if (ModConfig.NoclipEnabled.Value != _noclip)
 					SetNoclip(ModConfig.NoclipEnabled.Value);
 
+				// Perform fly translation in Update so Unity's Animator and VRIK evaluate for the
+				// current frame at the NEW position, eliminating any 1-frame avatar IK lag/clipping.
+				if (_flying)
+				{
+					UpdateFly();
+
+					// Keep locomotion speeds zeroed so VRChat's animator does not play strafe walk/run
+					// animations that twist the spine and push the neck collar into the 1st-person camera.
+					if (_speedsSuppressed)
+					{
+						var api = PlayerRef.LocalApi();
+						if (api != null)
+						{
+							try
+							{
+								if (api.GetWalkSpeed() > 0.01f || api.GetStrafeSpeed() > 0.01f || api.GetRunSpeed() > 0.01f)
+								{
+									api.SetWalkSpeed(0f);
+									api.SetStrafeSpeed(0f);
+									api.SetRunSpeed(0f);
+								}
+							}
+							catch { }
+						}
+					}
+				}
+
 				// Re-assert noclip every frame: VRChat re-enables the player collider on avatar
 				// loads and locomotion resets, which would silently restore collision. If our
 				// captured list has gone stale (avatar swap), re-scan.
@@ -82,7 +119,23 @@ namespace VRChatArchiveMod.Modules
 						try { if (_disabled[i] == null) { stale = true; break; } if (_disabled[i].enabled) _disabled[i].enabled = false; }
 						catch { stale = true; break; }
 					}
-					if (stale) { _disabled.Clear(); CollectPlayerColliders(_disabled); DisableAll(_disabled); }
+					if (stale)
+					{
+						// RE-ENABLE THE SURVIVORS BEFORE REBUILDING THE LIST (2026-09-13).
+						//
+						// The loop above BREAKS on the first dead or throwing collider, so every
+						// still-live collider AFTER it was left enabled = false and then dropped by
+						// the Clear(): _disabled is the only ledger SetNoclip(false) walks, so those
+						// colliders stayed disabled for the rest of the session and the player kept
+						// passing through the world with noclip switched off. Putting them back first
+						// costs nothing — they are re-collected and re-disabled immediately if they
+						// are still ours — and is the whole difference between a rescan and a leak.
+						for (int i = 0; i < _disabled.Count; i++)
+						{
+							try { var c = _disabled[i]; if (c != null && Core.NativeGuard.Alive(c)) c.enabled = true; } catch { }
+						}
+						_disabled.Clear(); CollectPlayerColliders(_disabled); DisableAll(_disabled);
+					}
 				}
 			}
 			catch (Exception e)
@@ -91,14 +144,18 @@ namespace VRChatArchiveMod.Modules
 			}
 		}
 
-		// Fly movement + rotation run in LateUpdate, AFTER VRChat's own locomotion has set the
-		// player transform this frame — otherwise the game overwrites our rotation/position the
-		// same frame and the arrow-key turning "doesn't take". Running last means we win.
+		// Fly position pinning and rotation run in LateUpdate.
 		public override void OnLateUpdate()
 		{
 			try
 			{
-				if (_flying) UpdateFly();
+				if (_flying && _hasHold)
+				{
+					// Re-assert position if no movement keys are currently held down so external
+					// forces/gravity cannot drift the player.
+					var root = GetVrcPlayerLocalTransform();
+					if (root != null && !IsFlyMoving()) root.position = _holdPos;
+				}
 				UpdateRotate();   // arrow-key turning works on the ground too
 			}
 			catch (Exception e)
@@ -130,7 +187,9 @@ namespace VRChatArchiveMod.Modules
 				{
 					// Stand slightly above the surface so we don't clip into it.
 					Vector3 dest = hit.point + Vector3.up * 0.15f;
-					player.transform.position = dest;
+					var root = GetVrcPlayerLocalTransform();
+					if (root != null) root.position = dest;
+					else player.transform.position = dest;
 					if (_flying) { _holdPos = dest; _hasHold = true; }
 					PlayerRef.ZeroVelocity(player);
 					VRChatArchiveModPlugin.Logger.LogInfo($"[Movement] click-teleport to {dest} ({hit.distance:F1}m).");
@@ -168,7 +227,7 @@ namespace VRChatArchiveMod.Modules
 		{
 			if (!ModConfig.ArrowRotateEnabled.Value) return;
 
-			float step = Time.deltaTime * ModConfig.FlyRotateSpeed.Value;
+			float step = VaClock.Delta * ModConfig.FlyRotateSpeed.Value;
 			float yaw = 0f;
 			if (Input.GetKey(KeyCode.LeftArrow)) yaw -= step;
 			if (Input.GetKey(KeyCode.RightArrow)) yaw += step;
@@ -202,7 +261,7 @@ namespace VRChatArchiveMod.Modules
 				Quaternion after;
 				try { after = api.GetRotation(); } catch { after = before; }
 				bool moved = Quaternion.Angle(after, before) > 0.01f;
-				float nowP = Time.realtimeSinceStartup;
+				float nowP = VaClock.Now;
 				if (nowP >= _nextRotProbe)
 				{
 					_nextRotProbe = nowP + 1f;
@@ -348,19 +407,100 @@ namespace VRChatArchiveMod.Modules
 			}
 		}
 
+		public static Transform GetVrcPlayerLocalTransform()
+		{
+			if (_cachedVrcPlayerLocal != null && NativeGuard.Alive(_cachedVrcPlayerLocal))
+				return _cachedVrcPlayerLocal;
+
+			try
+			{
+				var p = PlayerRef.LocalPlayer();
+				if (p != null && NativeGuard.Alive(p))
+				{
+					var r = p.transform.root;
+					if (r != null && r.name.StartsWith("VRCPlayer[Local]"))
+					{
+						_cachedVrcPlayerLocal = r;
+						VRChatArchiveModPlugin.Logger.LogInfo("[Movement] Resolved VRCPlayer[Local] from LocalPlayer root: " + r.name);
+						return _cachedVrcPlayerLocal;
+					}
+				}
+			}
+			catch { }
+
+			try
+			{
+				var scene = UnityEngine.SceneManagement.SceneManager.GetActiveScene();
+				if (scene.isLoaded)
+				{
+					var roots = scene.GetRootGameObjects();
+					if (roots != null)
+					{
+						for (int i = 0; i < roots.Length; i++)
+						{
+							var r = roots[i];
+							if (r != null && r.name.StartsWith("VRCPlayer[Local]"))
+							{
+								_cachedVrcPlayerLocal = r.transform;
+								VRChatArchiveModPlugin.Logger.LogInfo("[Movement] Resolved VRCPlayer[Local] from active scene roots: " + r.name);
+								return _cachedVrcPlayerLocal;
+							}
+						}
+					}
+				}
+			}
+			catch { }
+
+			try
+			{
+				var all = Resources.FindObjectsOfTypeAll<GameObject>();
+				if (all != null)
+				{
+					for (int i = 0; i < all.Count; i++)
+					{
+						var go = all[i];
+						if (go != null && go.activeInHierarchy && go.name.StartsWith("VRCPlayer[Local]"))
+						{
+							_cachedVrcPlayerLocal = go.transform;
+							VRChatArchiveModPlugin.Logger.LogInfo("[Movement] Resolved VRCPlayer[Local] from Resources scan: " + go.name);
+							return _cachedVrcPlayerLocal;
+						}
+					}
+				}
+			}
+			catch { }
+
+			var fallback = PlayerRef.LocalTransform();
+			if (fallback != null)
+			{
+				Transform r = fallback;
+				int guard = 0;
+				while (r.parent != null && guard++ < 32) r = r.parent;
+				return r;
+			}
+			return null;
+		}
+
+		private static bool IsFlyMoving()
+		{
+			return Input.GetKey(KeyCode.W) || Input.GetKey(KeyCode.S) ||
+			       Input.GetKey(KeyCode.D) || Input.GetKey(KeyCode.A) ||
+			       Input.GetKey(KeyCode.E) || Input.GetKey(KeyCode.Q);
+		}
+
 		private void UpdateFly()
 		{
-			var player = PlayerRef.LocalPlayer();
+			var root = GetVrcPlayerLocalTransform();
 			var cam = Camera.main;
-			if (player == null || cam == null) return;
+			if (root == null || cam == null) return;
 
-			PlayerRef.ZeroVelocity(player);
+			var player = PlayerRef.LocalPlayer();
+			if (player != null) PlayerRef.ZeroVelocity(player);
 
-			Transform t = player.transform;
 			Transform ct = cam.transform;
 
-			// Translation relative to the camera.
-			float speed = Time.deltaTime * (Input.GetKey(KeyCode.LeftShift) ? ModConfig.FlyBoostSpeed.Value : ModConfig.FlySpeed.Value);
+			// Translation relative to the camera directly applied to VRCPlayer[Local].
+			float speed = VaClock.Delta * (Input.GetKey(KeyCode.LeftShift) ? ModConfig.FlyBoostSpeed.Value : ModConfig.FlySpeed.Value);
 			Vector3 move = Vector3.zero;
 			if (Input.GetKey(KeyCode.W)) move += ct.forward;
 			if (Input.GetKey(KeyCode.S)) move -= ct.forward;
@@ -371,36 +511,65 @@ namespace VRChatArchiveMod.Modules
 
 			if (move != Vector3.zero)
 			{
-				t.position += move * speed;
-				_holdPos = t.position;   // moved this frame → new anchor
+				root.position += move * speed;
+				_holdPos = root.position;   // moved this frame → new anchor
 				_hasHold = true;
 			}
 			else if (_hasHold)
 			{
 				// No input: re-assert last position so gravity/velocity can't drift us down.
-				t.position = _holdPos;
+				root.position = _holdPos;
 			}
 			else
 			{
-				_holdPos = t.position;
+				_holdPos = root.position;
 				_hasHold = true;
 			}
-
 		}
 
 		// Fly on/off. Enabling captures the current position as the hold anchor so we float
-		// in place instead of falling. Collider handling lives entirely in SetNoclip.
+		// in place instead of falling.
 		private void SetFlying(bool value)
 		{
 			_flying = value;
 			if (value)
 			{
-				var p = PlayerRef.LocalPlayer();
-				if (p != null) { _holdPos = p.transform.position; _hasHold = true; }
+				var root = GetVrcPlayerLocalTransform();
+				if (root != null) { _holdPos = root.position; _hasHold = true; }
+				var api = PlayerRef.LocalApi();
+				if (api != null)
+				{
+					try
+					{
+						_storedWalk = api.GetWalkSpeed();
+						_storedStrafe = api.GetStrafeSpeed();
+						_storedRun = api.GetRunSpeed();
+						api.SetWalkSpeed(0f);
+						api.SetStrafeSpeed(0f);
+						api.SetRunSpeed(0f);
+						_speedsSuppressed = true;
+					}
+					catch { }
+				}
 			}
 			else
 			{
 				_hasHold = false;
+				if (_speedsSuppressed)
+				{
+					_speedsSuppressed = false;
+					var api = PlayerRef.LocalApi();
+					if (api != null)
+					{
+						try
+						{
+							api.SetWalkSpeed(_storedWalk > 0.1f ? _storedWalk : 2f);
+							api.SetStrafeSpeed(_storedStrafe > 0.1f ? _storedStrafe : 2f);
+							api.SetRunSpeed(_storedRun > 0.1f ? _storedRun : 4f);
+						}
+						catch { }
+					}
+				}
 				// Leaving fly must also drop noclip so collision comes back.
 				if (_noclip) SetNoclip(false);
 			}
@@ -428,7 +597,20 @@ namespace VRChatArchiveMod.Modules
 					int restored = 0;
 					for (int i = 0; i < _disabled.Count; i++)
 					{
-						try { if (_disabled[i] != null) { _disabled[i].enabled = true; restored++; } } catch { }
+						try
+						{
+							var col = _disabled[i];
+							if (col != null)
+							{
+								if (col is CharacterController cc)
+								{
+									try { cc.detectCollisions = true; } catch { }
+								}
+								col.enabled = true;
+								restored++;
+							}
+						}
+						catch { }
 					}
 					_disabled.Clear();
 					VRChatArchiveModPlugin.Logger.LogInfo($"[Movement] noclip OFF — restored {restored} collider(s).");
@@ -476,11 +658,8 @@ namespace VRChatArchiveMod.Modules
 		{
 			try
 			{
-				var player = PlayerRef.LocalPlayer();
-				if (player == null) return null;
-				Transform root = player.transform;
-				int guard = 0;
-				while (root.parent != null && guard++ < 32) root = root.parent;
+				var root = GetVrcPlayerLocalTransform();
+				if (root == null) return null;
 				return root.GetComponentInChildren<CharacterController>(true);
 			}
 			catch { return null; }
@@ -491,9 +670,8 @@ namespace VRChatArchiveMod.Modules
 		{
 			try
 			{
-				Transform root = player.transform;
-				int guard = 0;
-				while (root.parent != null && guard++ < 32) root = root.parent;
+				var root = GetVrcPlayerLocalTransform();
+				if (root == null) return;
 				var sb = new System.Text.StringBuilder("[Movement] local player rig from root:\n");
 				Walk(root, 0, sb);
 				VRChatArchiveModPlugin.Logger.LogInfo(sb.ToString());
@@ -519,7 +697,19 @@ namespace VRChatArchiveMod.Modules
 		{
 			for (int i = 0; i < cols.Count; i++)
 			{
-				try { if (cols[i] != null) cols[i].enabled = false; } catch { }
+				try
+				{
+					var c = cols[i];
+					if (c != null)
+					{
+						if (c is CharacterController cc)
+						{
+							try { cc.detectCollisions = false; } catch { }
+						}
+						c.enabled = false;
+					}
+				}
+				catch { }
 			}
 		}
 
@@ -529,11 +719,8 @@ namespace VRChatArchiveMod.Modules
 		{
 			try
 			{
-				var player = PlayerRef.LocalPlayer();
-				if (player == null) return;
-				Transform root = player.transform;
-				int guard = 0;
-				while (root.parent != null && guard++ < 32) root = root.parent;
+				var root = GetVrcPlayerLocalTransform();
+				if (root == null) return;
 
 				var cols = root.GetComponentsInChildren<Collider>(true);
 				if (cols == null) return;

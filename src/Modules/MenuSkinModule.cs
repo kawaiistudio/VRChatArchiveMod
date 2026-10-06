@@ -42,6 +42,8 @@ namespace VRChatArchiveMod.Modules
 		private Sprite _ours;
 		private float _nextCheck;
 		private int _fails;
+		// Edge memory for MenuSkinEnabled: lets OFF re-arm the resolve budget and ON apply at once.
+		private bool _wasSkinOn;
 
 		public override void OnUpdate()
 		{
@@ -51,15 +53,23 @@ namespace VRChatArchiveMod.Modules
 				{
 					Restore();
 					RestoreVeil();
+					// The resolve budget is spent per SESSION unless something clears it, and nothing
+					// did: after 41 unlucky resolves the skin could never be turned on again. The OFF
+					// state is the natural place to re-arm it, so the next ON gets a fresh budget.
+					_fails = 0;
+					_wasSkinOn = false;
 					return;
 				}
+				// ON EDGE: a fresh budget and an immediate pass, instead of inheriting a spent counter
+				// and waiting out the 2 s gate.
+				if (!_wasSkinOn) { _wasSkinOn = true; _fails = 0; _nextCheck = 0f; }
 
 				// The liquid layer animates PER FRAME while the menu is open — that is the whole
 				// point — so it runs before the 2s gate: upload the newest computed frame.
 				if (Core.QuickMenu.Visible) AnimateLiquid();
 				else if (_liquid != null) _liquid.enabled = false;
 
-				float now = Time.realtimeSinceStartup;
+				float now = VaClock.Now;
 				if (now < _nextCheck) return;
 				_nextCheck = now + 2f;                 // gentle: never per frame
 				// Nothing to reskin while the menu is closed, and the veil sweep walks the whole
@@ -176,7 +186,7 @@ namespace VRChatArchiveMod.Modules
 				if (!_baked) { BakeTick(); return; }
 
 				// Free after baking: pick the frame for the current time. ~14 fps loop.
-				_cycle += Time.deltaTime;
+				_cycle += VaClock.Delta;
 				int idx = ((int)(_cycle * 14f)) % LiquidFrames;
 				if (idx < 0) idx += LiquidFrames;
 				_liquid.texture = _frames[idx];
@@ -352,7 +362,7 @@ namespace VRChatArchiveMod.Modules
 
 		private void ClearVeil(Transform qm)
 		{
-			float now = Time.realtimeSinceStartup;
+			float now = VaClock.Now;
 			if (now < _nextVeil) return;
 			_nextVeil = now + 3f;          // pages appear as you browse; keep sweeping, gently
 
@@ -436,9 +446,19 @@ namespace VRChatArchiveMod.Modules
 
 		public override void OnSceneLoaded(int buildIndex)
 		{
-			// The menu survives scene loads, but our Image ref can go stale if it is rebuilt.
+			// RESTORE BEFORE FORGETTING (2026-09-13). The menu SURVIVES scene loads — as the original
+			// note here said — so nulling _original / clearing _veil left OUR wallpaper sprite on
+			// VRChat's Image and the veil Graphics still at alpha 0, with every handle that could undo
+			// them thrown away. Restore() then no-opped forever, and because Apply() early-returns
+			// when `img.sprite == sp`, _original was never re-learned either: the skin became
+			// permanent and its switch dead. Restore first; the refs are dropped straight after, so a
+			// genuinely rebuilt Image is still re-resolved on the next pass.
+			Restore();
+			RestoreVeil();
 			_bg = null; _bgPrev = null; _original = null; _originalPrev = null; _nextCheck = 0f;
-			_veil.Clear(); _nextVeil = 0f;   // those Graphics belonged to the old scene
+			_veil.Clear(); _nextVeil = 0f;
+			_fails = 0;        // new world, fresh resolve budget
+			_wasSkinOn = false;
 		}
 
 		// Paints one half of the crossfade, remembering what was there first.

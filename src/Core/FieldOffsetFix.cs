@@ -272,11 +272,26 @@ namespace VRChatArchiveMod.Core
 		private static void VRChatArchiveModFallback(string msg)
 			=> VRChatArchiveModPlugin.Logger.LogWarning(msg);
 
+		// A FIELD THAT DOES NOT EXIST MUST NOT READ OFFSET 0.
+		//
+		// Offset 0 of an il2cpp object is its CLASS POINTER. Handing that back as the value of a
+		// missing reference field produces a reference to something that is not an object, and the
+		// process dies later — in the garbage collector, inside coreclr, at a moment with no relation
+		// to the read. That is the access violation that kept ending the run once renamed classes
+		// became castable again: the class is recovered, its 1886 field names are not, and every read
+		// fell through to offset 0.
+		//
+		// The object header is `+0 klass, +8 monitor`, and the monitor slot is null on any object that
+		// is not currently locked. A missing field reads there instead: a reference field yields null,
+		// a numeric field yields zero, and every caller already handles both. No real field lives at
+		// that offset, so nothing valid is affected.
+		private const uint MissingFieldOffset = 8;
+
 		// Runs for every field access in the process, so it does exactly one load and nothing else.
 		// The pointer comes from il2cpp itself; validating it here would cost a syscall per access.
 		private static unsafe bool Prefix(IntPtr field, ref uint __result)
 		{
-			__result = field == IntPtr.Zero ? 0u : *(uint*)((byte*)field + _slot);
+			__result = field == IntPtr.Zero ? MissingFieldOffset : *(uint*)((byte*)field + _slot);
 			return false;
 		}
 	}

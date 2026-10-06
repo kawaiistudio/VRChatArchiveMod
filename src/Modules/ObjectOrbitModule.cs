@@ -160,30 +160,35 @@ namespace VRChatArchiveMod.Modules
 				$"[ObjectOrbit] {Held0.Count} object(s) around {CenterName} ({(_synced ? "SYNCED" : "local only")}).");
 		}
 
+		/// <summary>Puts ONE prop back where the world had it: parent, pose, and the rigidbody flags
+		/// the ring forced (kinematic + interpolation). Never throws and no-ops on a destroyed object,
+		/// so it is safe both from the orderly Stop() and from the per-frame failure path — which is
+		/// what keeps a transient error from stranding a prop outside every teardown ledger.</summary>
+		private static void RestoreHeld(Held h)
+		{
+			try
+			{
+				if (h == null || h.Go == null || h.T == null) return;
+				if (h.Parent != null) h.T.SetParent(h.Parent, true);
+				h.T.position = h.Pos;
+				h.T.rotation = h.Rot;
+				if (h.Body != null)
+				{
+					try
+					{
+						h.Body.interpolation = h.WasInterp;
+						h.Body.isKinematic = h.WasKinematic;
+						if (!h.Body.isKinematic) { h.Body.velocity = Vector3.zero; h.Body.angularVelocity = Vector3.zero; }
+					}
+					catch { }
+				}
+			}
+			catch { }
+		}
+
 		public static void Stop(string why)
 		{
-			for (int i = 0; i < Held0.Count; i++)
-			{
-				var h = Held0[i];
-				try
-				{
-					if (h == null || h.Go == null || h.T == null) continue;
-					if (h.Parent != null) h.T.SetParent(h.Parent, true);
-					h.T.position = h.Pos;
-					h.T.rotation = h.Rot;
-					if (h.Body != null)
-					{
-						try
-						{
-							h.Body.interpolation = h.WasInterp;
-							h.Body.isKinematic = h.WasKinematic;
-							if (!h.Body.isKinematic) { h.Body.velocity = Vector3.zero; h.Body.angularVelocity = Vector3.zero; }
-						}
-						catch { }
-					}
-				}
-				catch { }
-			}
+			for (int i = 0; i < Held0.Count; i++) RestoreHeld(Held0[i]);
 			Held0.Clear();
 			Active = false;
 			_center = null;
@@ -198,19 +203,19 @@ namespace VRChatArchiveMod.Modules
 			{
 				if (_center == null) { Stop("stopped — the centre is gone"); return; }
 
-				_angle += ModConfig.ObjOrbitSpeed.Value * Time.deltaTime;
+				_angle += ModConfig.ObjOrbitSpeed.Value * VaClock.Delta;
 				if (_angle >= 360f) _angle -= 360f;
 
 				float r = Mathf.Max(0.5f, ModConfig.ObjOrbitRadius.Value);
 				float h0 = ModConfig.ObjOrbitHeight.Value;
 				Vector3 c = _center.position;
 				bool spin = ModConfig.ObjOrbitSpin.Value;
-				float dt = Time.deltaTime;
+				float dt = VaClock.Delta;
 
 				bool reassertOwner = false;
 				if (_synced)
 				{
-					float nowT = Time.realtimeSinceStartup;
+					float nowT = VaClock.Now;
 					if (nowT >= _nextOwn) { _nextOwn = nowT + 2f; reassertOwner = true; }
 				}
 				// NO MOVE GATE. A ~15 Hz throttle used to sit here on the theory that moving fewer times
@@ -270,7 +275,13 @@ namespace VRChatArchiveMod.Modules
 					}
 					catch
 					{
-						Held0.RemoveAt(i);       // it died mid-write; stop touching it
+						// RESTORE BEFORE FORGETTING (2026-09-13). Dropping the entry on a merely
+						// transient failure (a contended write, a one-frame ownership hiccup) left a
+						// live world prop permanently isKinematic with our interpolation setting, at
+						// whatever position the ring had moved it to, and its parent never restored —
+						// Held0 is the only ledger Stop() walks, so nothing could ever put it back.
+						RestoreHeld(h);
+						Held0.RemoveAt(i);
 					}
 				}
 
@@ -350,7 +361,7 @@ namespace VRChatArchiveMod.Modules
 					// (Il2CppInterop's generic type resolution misses the class — the same gap that had Force
 					// Pickup unlocking 0). Resolve the il2cpp type once and TryCast each result back.
 					var il2 = Il2CppInterop.Runtime.Il2CppType.Of<VRC.SDKBase.VRC_Pickup>();
-					var found = UnityEngine.Object.FindObjectsOfType(il2);
+					var found = VRChatArchiveMod.Core.Live.AllOfType(il2);
 					if (found != null)
 						for (int fi = 0; fi < found.Length; fi++)
 						{

@@ -15,7 +15,7 @@ namespace VRChatArchiveMod.Modules
 	// distance. This is a VISUALIZATION of positions your client already receives — it is
 	// not a targeting/aimbot/tracking tool and never follows or singles out an individual.
 	//
-	// Players come from VRCPlayerApi.AllPlayers (stable SDK API). Trust rank comes from the
+	// Players come from VRChatArchiveMod.Core.VaPlayers.All() (stable SDK API). Trust rank comes from the
 	// player's APIUser (typed has*TrustLevel properties). Drawing happens on OnGui (Repaint).
 	public class EspModule : IModule
 	{
@@ -64,7 +64,8 @@ namespace VRChatArchiveMod.Modules
 				var cam = Camera.main;
 				if (cam == null) return;
 
-				var players = VRCPlayerApi.AllPlayers;
+				EnsureProjection(cam);
+				var players = VRChatArchiveMod.Core.VaPlayers.All();
 				if (players == null) return;
 
 				ResolveReflection();
@@ -83,6 +84,7 @@ namespace VRChatArchiveMod.Modules
 				// the one you are looking at — every projection, bone fetch and interop crossing was
 				// paid for people who could not be seen. Six plane tests reject them before any of
 				// that. Computed one time per frame, not per player.
+				var swPre = System.Diagnostics.Stopwatch.StartNew();
 				var frustum = GeometryUtility.CalculateFrustumPlanes(cam);
 
 				// PRE-PASS: collect every non-local player inside the distance cap, then keep only the
@@ -91,19 +93,55 @@ namespace VRChatArchiveMod.Modules
 				// from freezing the frame. Sorting a few dozen floats per frame is nothing next to that.
 				if (_order == null || _order.Length < count) { _order = new int[count]; _distBuf = new float[count]; }
 				int m = 0;
+				_tCount = count; _tFrames++;
 				for (int i = 0; i < count; i++)
 				{
 					VRCPlayerApi a;
-					try { a = players[i]; } catch { continue; }
-					if (a == null || a.isLocal) continue;
+					try { a = players[i]; } catch { _tThrow++; continue; }
+					// A null check is not a liveness check: VRCPlayerApi is not a UnityEngine.Object, so `== null` is
+					// the plain managed test and says nothing about the il2cpp object behind the handle. Reading any
+					// member off a stale one is an access violation inside the proxy, which no try/catch can stop.
+					if (a == null) { _rNull++; continue; }
+					var swA = System.Diagnostics.Stopwatch.StartNew();
+					// Split the two halves so the next log says WHICH one costs: resolving the handle, or
+					// the VirtualQuery pair behind IsLiveObject.
+					IntPtr aptr = IntPtr.Zero;
+					var swPtr = System.Diagnostics.Stopwatch.StartNew();
+					try { var bo = a as Il2CppInterop.Runtime.InteropTypes.Il2CppObjectBase; if (bo != null) aptr = bo.Pointer; }
+					catch { aptr = IntPtr.Zero; }
+					_tPtr += swPtr.Elapsed.TotalMilliseconds;
+					bool alive;
+					if (aptr == IntPtr.Zero) alive = false;
+					else
+					{
+						float nowA; try { nowA = VaClock.Now; } catch { nowA = 0f; }
+						AliveEntry ae;
+						if (_alive.TryGetValue(aptr, out ae) && ae != null && nowA - ae.At < AliveTtl) alive = ae.Ok;
+						else
+						{
+							var swV = System.Diagnostics.Stopwatch.StartNew();
+							alive = Core.NativeGuard.IsLiveObject(aptr);
+							_tVq += swV.Elapsed.TotalMilliseconds;
+							if (_alive.Count > 256) _alive.Clear();
+							_alive[aptr] = new AliveEntry { Ok = alive, At = nowA };
+						}
+					}
+					_tAlive += swA.Elapsed.TotalMilliseconds;
+					if (!alive) { _rAlive++; continue; }
+					bool loc; try { loc = a.isLocal; } catch { _rNull++; continue; }
+					if (loc) { _rLocal++; continue; }
 					Vector3 fp;
-					try { fp = a.GetPosition(); } catch { continue; }
+					var swP = System.Diagnostics.Stopwatch.StartNew();
+					try { fp = a.GetPosition(); } catch { _tPos += swP.Elapsed.TotalMilliseconds; _rNull++; continue; }
+					_tPos += swP.Elapsed.TotalMilliseconds;
 					float d = Vector3.Distance(camPos, fp);
-					if (maxDist > 0f && d > maxDist) continue;   // 0 = unlimited
+					if (maxDist > 0f && d > maxDist) { _rDist++; continue; }   // 0 = unlimited
+					_rKept++;
 					_order[m] = i; _distBuf[m] = d; m++;
 				}
 				if (m > 1) Array.Sort(_distBuf, _order, 0, m);   // nearest first; _order follows _distBuf
 				int drawCount = Mathf.Min(m, EspCap);
+				_tPre += swPre.Elapsed.TotalMilliseconds;
 
 				for (int k = 0; k < drawCount; k++)
 				{
@@ -125,20 +163,22 @@ namespace VRChatArchiveMod.Modules
 						try { head = api.GetBonePosition(HumanBodyBones.Head); } catch { head = Vector3.zero; }
 						if (head == Vector3.zero) head = feet + Vector3.up * 1.7f;
 
-						Vector3 fs = cam.WorldToScreenPoint(feet);
-						Vector3 hs = cam.WorldToScreenPoint(head);
-						if (fs.z <= 0f && hs.z <= 0f) continue; // fully behind camera
-
-						float feetY = Screen.height - fs.y;
-						float headY = Screen.height - hs.y;
+						float fx, feetY, hx, headY;
+						bool fOk = ProjectGui(feet, out fx, out feetY);
+						bool hOk = ProjectGui(head, out hx, out headY);
+						if (!fOk && !hOk) continue; // fully behind camera
+						if (!fOk) { fx = hx; feetY = headY; }
+						if (!hOk) { hx = fx; headY = feetY; }
 						float top = Mathf.Min(feetY, headY);
 						float h = Mathf.Abs(feetY - headY);
 						if (h < 20f) h = 20f;
 						float w = h * 0.5f;
-						float cx = (fs.x + hs.x) * 0.5f;
+						float cx = (fx + hx) * 0.5f;
 						var box = new Rect(cx - w * 0.5f, top, w, h);
 
+						var swT = System.Diagnostics.Stopwatch.StartNew();
 						Color col = TrustColor(Core.ApiUsers.Get(api));
+						_tTrust += swT.Elapsed.TotalMilliseconds;
 
 						// "Box fits the avatar" (EspMeshBody) REMOVED 2026-08-26. It measured the
 						// avatar's real renderer bounds to reshape the box, but next to the outline
@@ -149,17 +189,23 @@ namespace VRChatArchiveMod.Modules
 						// pill before (DrawMeshCapsule), which is why "Box" produced a 3D-looking
 						// capsule instead of squares — that is what the 3D Capsule option is for.
 						// The two are different shapes now, so both can be on at once.
+						var swB = System.Diagnostics.Stopwatch.StartNew();
 						if (ModConfig.EspBox.Value)
 							DrawBoxOutline(box, col, 2f);
+						_tBox += swB.Elapsed.TotalMilliseconds;
 
 						// Skeleton ("mesh") ESP: bone-to-bone lines that follow the avatar's real
 						// pose, instead of a flat capsule. Humanoid rigs only — GetBonePosition
 						// returns zero on non-humanoid avatars, and those segments are skipped.
 						// UNLIMITED distance like every other type now — the frustum cull already
 						// skips anyone off screen, so a far skeleton only costs when it is in view.
+						var swS = System.Diagnostics.Stopwatch.StartNew();
 						if (ModConfig.EspSkeleton.Value)
 							DrawSkeleton(cam, api, col);
+						_tSkel += swS.Elapsed.TotalMilliseconds;
+						_tPlayers++;
 
+						var swL = System.Diagnostics.Stopwatch.StartNew();
 						if (ModConfig.EspName.Value)
 						{
 							string nm = SafeName(api);
@@ -167,14 +213,6 @@ namespace VRChatArchiveMod.Modules
 							_label.alignment = TextAnchor.LowerCenter;
 							GUI.Label(new Rect(box.x - 40f, box.y - 18f, box.width + 80f, 16f), nm, _label);
 
-							// Anti-Block found this player's avatar force-hidden for us after having seen
-							// it, which is what a block looks like from this side. Drawn on its own line
-							// above the name, in red, so it cannot be mistaken for part of the name.
-							if (AntiBlockModule.HasBlockedYou(nm))
-							{
-								_label.normal.textColor = new Color(1f, 0.29f, 0.29f);
-								GUI.Label(new Rect(box.x - 60f, box.y - 33f, box.width + 120f, 16f), "HAS BLOCKED YOU", _label);
-							}
 						}
 
 						if (ModConfig.EspDistance.Value)
@@ -183,11 +221,32 @@ namespace VRChatArchiveMod.Modules
 							_label.alignment = TextAnchor.UpperCenter;
 							GUI.Label(new Rect(box.x - 40f, box.yMax + 2f, box.width + 80f, 16f), Mathf.RoundToInt(dist) + "m", _label);
 						}
+						_tLabel += swL.Elapsed.TotalMilliseconds;
 					}
 					catch { /* one bad player must not abort the overlay */ }
 				}
 
 				GUI.color = Color.white;
+
+				// One line a second: which phase actually owns the cost.
+				float nowT; try { nowT = VaClock.Now; } catch { nowT = 0f; }
+				if (nowT >= _tNext)
+				{
+					// LEFT OVER FROM THE PERFORMANCE PASS, AND IT DROWNED THE LOG: one warning per second for
+					// the whole session, which is what anyone reading a real problem has to scroll through.
+					// Kept for the next measuring session, behind VA_ESP_PHASES=1.
+					if (_tNext > 0f && _phaseLog)
+					VRChatArchiveModPlugin.Logger.LogWarning("[ESP/phases] par seconde — prepass " + _tPre.ToString("F1")
+						+ " | projection " + _tProj.ToString("F1") + " | trust " + _tTrust.ToString("F1")
+						+ " | box " + _tBox.ToString("F1") + " | squelette " + _tSkel.ToString("F1")
+						+ " | labels " + _tLabel.ToString("F1") + " ms  (" + _tPlayers + " joueur-frames, Count="
+						+ _tCount + ", " + _tThrow + " levees, " + _tFrames + " frames) | alive "
+						+ _tAlive.ToString("F1") + " ms (handle " + _tPtr.ToString("F1") + " / virtualquery "
+						+ _tVq.ToString("F1") + "), pos " + _tPos.ToString("F1") + " ms | rejets: null=" + _rNull
+						+ " mort=" + _rAlive + " local=" + _rLocal + " loin=" + _rDist + " gardes=" + _rKept);
+					_tNext = nowT + 1f;
+					_tPre = _tProj = _tTrust = _tSkel = _tLabel = _tBox = 0.0; _tPlayers = 0; _tThrow = 0; _tFrames = 0; _tAlive = _tPos = _tPtr = _tVq = 0.0; _rNull = _rAlive = _rLocal = _rDist = _rKept = 0;
+				}
 			}
 			catch (Exception e)
 			{
@@ -215,7 +274,7 @@ namespace VRChatArchiveMod.Modules
 				if (u == null) return CVisitor;
 				IntPtr key;
 				try { key = u.Pointer; } catch { return TrustColorUncached(u); }
-				float now = Time.realtimeSinceStartup;
+				float now = VaClock.Now;
 				if (_trust.TryGetValue(key, out var e) && e != null && now - e.At < TrustTtl)
 					return e.Rainbow ? Core.TrustKit.Spectrum() : e.C;
 				bool rainbow = Core.TrustKit.IsRainbow(u);
@@ -299,7 +358,7 @@ namespace VRChatArchiveMod.Modules
 			try
 			{
 				int id = api.playerId;
-				float now = Time.realtimeSinceStartup;
+				float now = VaClock.Now;
 				if (!_mesh.TryGetValue(id, out var mc) || mc == null || now - mc.At > MeshCacheSec)
 				{
 					Renderer[] rs = null;
@@ -500,6 +559,74 @@ namespace VRChatArchiveMod.Modules
 
 		// Distinct bones referenced by Bones[,] — each is fetched and projected ONCE per player.
 		// Doing it per segment meant Hips/Neck were resolved and projected three times each.
+		// PROJECT IN MANAGED MATH, NOT THROUGH THE ENGINE, ONCE PER FRAME.
+		//
+		// Camera.WorldToScreenPoint is a native call. The skeleton paid one per bone -- seventeen per
+		// player per frame -- on top of one il2cpp crossing per GetBonePosition. Measured in production
+		// on 2026-09-18: ESP = 231-330 ms/s with THREE players, the single biggest cost in the mod, and
+		// the arithmetic matches exactly (17 bones x 2 native calls x 3 players x 60 fps).
+		//
+		// The view-projection matrix cannot change during a frame, so it is fetched once and every bone
+		// is projected with plain float maths. Same pixels, zero crossings per bone. This matters MORE
+		// the higher the framerate, which is exactly where the cost was being paid.
+		private static Matrix4x4 _vp;
+		private static int _vpFrame = -1;
+		private static float _scrW, _scrH;
+
+		private static void EnsureProjection(Camera cam)
+		{
+			int f = Time.frameCount;
+			if (_vpFrame == f) return;
+			_vpFrame = f;
+			try { _vp = cam.projectionMatrix * cam.worldToCameraMatrix; } catch { }
+			try { _scrW = Screen.width; _scrH = Screen.height; } catch { }
+		}
+
+		// Screen position with GUI's y axis (top-down), and false when the point is behind the camera.
+		private static bool ProjectGui(Vector3 world, out float x, out float y)
+		{
+			x = 0f; y = 0f;
+			Vector4 c = _vp * new Vector4(world.x, world.y, world.z, 1f);
+			if (c.w <= 0.0001f) return false;
+			float inv = 1f / c.w;
+			x = (c.x * inv * 0.5f + 0.5f) * _scrW;
+			y = _scrH - (c.y * inv * 0.5f + 0.5f) * _scrH;
+			return true;
+		}
+
+		// BONES AT 20 Hz, NOT AT FRAMERATE.
+		//
+		// A skeleton redrawn 200 times a second is not 200 times more readable than one redrawn 20 times
+		// -- a body does not move that fast -- but it costs exactly 10x. The world positions are kept and
+		// refreshed on a timer; the PROJECTION still runs every frame, so the overlay tracks the camera
+		// perfectly while the expensive half is amortised.
+		private const float BoneRefresh = 0.05f;
+		private sealed class BoneCache { public Vector3[] W; public bool[] Ok; public float At; }
+		private static readonly Dictionary<int, BoneCache> _bones = new Dictionary<int, BoneCache>();
+
+		// PHASE TIMING, because guessing cost two rounds already.
+		//
+		// ESP measured 231-330 ms/s and was the mod's biggest cost. The bones looked like the obvious
+		// culprit -- seventeen il2cpp crossings plus seventeen native projections per player per frame --
+		// so they were cached at 20 Hz and the projection moved to managed maths. The next measurement
+		// came back UNCHANGED. The arithmetic was plausible and the conclusion was wrong.
+		//
+		// So every phase is now timed separately and reported once a second. One sample settles it.
+		private static double _tPre, _tProj, _tTrust, _tSkel, _tLabel, _tBox;
+		private static int _tPlayers, _tCount, _tThrow, _tFrames;
+		private static double _tAlive, _tPos, _tPtr, _tVq;
+		// LIVENESS, CACHED. Measured 2026-09-18: NativeGuard.Alive cost 304.7 ms of the ESP's
+		// 307 ms/s -- 3 ms per call, 5 players x 20 frames. Whatever makes it that expensive, a
+		// handle that was valid 200 ms ago has not gone stale in a way that matters here, and
+		// every read after this point is already inside a try/catch. Checked at 5 Hz per player
+		// instead of once per player per frame.
+		private const float AliveTtl = 0.2f;
+		private sealed class AliveEntry { public bool Ok; public float At; }
+		private static readonly Dictionary<IntPtr, AliveEntry> _alive = new Dictionary<IntPtr, AliveEntry>();
+		private static int _rNull, _rAlive, _rLocal, _rDist, _rKept;
+		private static float _tNext;
+		private static readonly bool _phaseLog = System.Environment.GetEnvironmentVariable("VA_ESP_PHASES") == "1";
+
 		private static readonly HumanBodyBones[] BoneList =
 		{
 			HumanBodyBones.Head, HumanBodyBones.Neck, HumanBodyBones.Chest, HumanBodyBones.Spine, HumanBodyBones.Hips,
@@ -536,20 +663,48 @@ namespace VRChatArchiveMod.Modules
 				// ONE Screen.height PER SKELETON. It is a native static getter (il2cpp_runtime_invoke
 				// plus a boxed int) and it was read once per bone and twice per segment — ~49 crossings
 				// per player per frame for a number that cannot change mid-frame.
-				float screenH = Screen.height;
+				float screenH = _scrH;
 				float maxSegSq = (screenH * 0.33f) * (screenH * 0.33f);
 
+				// THE EXPENSIVE HALF, ON A TIMER. GetBonePosition is an il2cpp crossing and there are
+				// seventeen of them; refreshed at 20 Hz a body still reads as moving, while a frame at
+				// 200 fps pays nothing for bones it already has.
+				int pid;
+				try { pid = api.playerId; } catch { return; }
+				float nowB;
+				try { nowB = VaClock.Now; } catch { nowB = 0f; }
+				BoneCache bc;
+				if (!_bones.TryGetValue(pid, out bc) || bc == null)
+				{
+					// Players leave; without this the dictionary would only ever grow across a session.
+					if (_bones.Count > 128) _bones.Clear();
+					bc = new BoneCache { W = new Vector3[BoneList.Length], Ok = new bool[BoneList.Length], At = -1f };
+					_bones[pid] = bc;
+				}
+				if (nowB - bc.At >= BoneRefresh)
+				{
+					bc.At = nowB;
+					for (int i = 0; i < BoneList.Length; i++)
+					{
+						bc.Ok[i] = false;
+						Vector3 w;
+						try { w = api.GetBonePosition(BoneList[i]); } catch { continue; }
+						if (w == Vector3.zero) continue;                 // bone absent on this rig
+						if (centre != Vector3.zero && (w - centre).sqrMagnitude > maxBoneDist * maxBoneDist)
+							continue;                                    // glitched bone flung off the body
+						bc.W[i] = w;
+						bc.Ok[i] = true;
+					}
+				}
+
+				// The cheap half, every frame, so the overlay still tracks the camera exactly.
 				for (int i = 0; i < BoneList.Length; i++)
 				{
 					ProjOk[i] = false;
-					Vector3 w;
-					try { w = api.GetBonePosition(BoneList[i]); } catch { continue; }
-					if (w == Vector3.zero) continue;                 // bone absent on this rig
-					if (centre != Vector3.zero && (w - centre).sqrMagnitude > maxBoneDist * maxBoneDist)
-						continue;                                    // glitched bone flung off the body
-					Vector3 s = cam.WorldToScreenPoint(w);
-					if (s.z <= 0f) continue;                         // behind the camera
-					Proj[i] = new Vector2(s.x, screenH - s.y);
+					if (!bc.Ok[i]) continue;
+					float sx, sy;
+					if (!ProjectGui(bc.W[i], out sx, out sy)) continue;   // behind the camera
+					Proj[i] = new Vector2(sx, sy);
 					ProjOk[i] = true;
 				}
 
@@ -627,7 +782,7 @@ namespace VRChatArchiveMod.Modules
 			try
 			{
 				int id = api.playerId;
-				float now = Time.realtimeSinceStartup;
+				float now = VaClock.Now;
 				if (_names.TryGetValue(id, out var e) && e != null && now - e.At < NameTtl) return e.N;
 				string n;
 				try { n = api.displayName ?? "?"; } catch { n = "?"; }

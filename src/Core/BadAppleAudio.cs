@@ -5,7 +5,7 @@ namespace VRChatArchiveMod.Core
 {
 	// THE SONG, AND THE CLOCK THE PICTURE FOLLOWS.
 	//
-	// The object renderer used to advance on Time.realtimeSinceStartup: press play, start counting.
+	// The object renderer used to advance on VaClock.Now: press play, start counting.
 	// That drifts from the music for a reason built into the show — the networked mode HOLDS frame 0
 	// while it takes ownership of every object it is about to move (MarkModule.NetUpdate resets
 	// _baStart while the queue drains, up to six seconds), and a loaded frame that arrives late slips
@@ -26,9 +26,12 @@ namespace VRChatArchiveMod.Core
 		private const string ResourceName = "badapple.wav";
 
 		private static AudioClip _clip;
+		private static string _clipName = "";     // which clip _clip currently holds
 		private static AudioSource _src;
 		private static GameObject _host;
-		private static bool _loadFailed;
+		// Per clip, so one missing wav does not silence every other clip (and is not retried forever).
+		private static readonly System.Collections.Generic.HashSet<string> _failed =
+			new System.Collections.Generic.HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
 		/// <summary>Seconds into the song, or -1 when it is not playing. This is the clock.</summary>
 		public static float Time
@@ -53,11 +56,16 @@ namespace VRChatArchiveMod.Core
 
 		/// <summary>Starts the song from the beginning. Returns false when there is no audio to play —
 		/// the renderer then falls back to its own wall clock and the show still runs, silently.</summary>
-		public static bool Play(float volume)
+		public static bool Play(float volume) => Play(volume, "badapple");
+
+		/// <summary>Starts the track that belongs to <paramref name="clip"/> from the beginning.
+		/// "badapple" is the embedded song; any other name is <c>clips\&lt;name&gt;.wav</c> next to that
+		/// clip's frames, so a clip brings its own audio without anything shipping in the DLL.</summary>
+		public static bool Play(float volume, string clip)
 		{
 			try
 			{
-				if (!Ensure()) return false;
+				if (!Ensure(clip)) return false;
 				_src.volume = Mathf.Clamp01(volume);
 				_src.time = 0f;
 				_src.Play();
@@ -78,16 +86,21 @@ namespace VRChatArchiveMod.Core
 			catch { }
 		}
 
-		private static bool Ensure()
+		private static bool Ensure(string clip)
 		{
-			if (_loadFailed) return false;
+			string name = string.IsNullOrEmpty(clip) ? "badapple" : clip;
+			if (_failed.Contains(name)) return false;
 			try
 			{
-				if (_clip == null)
+				if (_clip == null || !string.Equals(_clipName, name, StringComparison.OrdinalIgnoreCase))
 				{
+					bool builtIn = string.Equals(name, "badapple", StringComparison.OrdinalIgnoreCase);
 					byte[] wav = null;
-					using (var s = System.Reflection.Assembly.GetExecutingAssembly().GetManifestResourceStream(ResourceName))
+					string where;
+					if (builtIn)
 					{
+						where = ResourceName + " (embedded)";
+						using var s = System.Reflection.Assembly.GetExecutingAssembly().GetManifestResourceStream(ResourceName);
 						if (s != null)
 						{
 							using var ms = new System.IO.MemoryStream();
@@ -95,19 +108,30 @@ namespace VRChatArchiveMod.Core
 							wav = ms.ToArray();
 						}
 					}
+					else
+					{
+						// A clip's own soundtrack, sitting beside its frames on THIS machine.
+						string path = System.IO.Path.Combine(
+							BepInEx.Paths.BepInExRootPath, "VRChatArchiveMod", "clips", name + ".wav");
+						where = path;
+						try { if (System.IO.File.Exists(path)) wav = System.IO.File.ReadAllBytes(path); }
+						catch { }
+					}
 					if (wav == null || wav.Length < 44)
 					{
-						_loadFailed = true;
-						VRChatArchiveModPlugin.Logger.LogWarning("[BadAppleAudio] " + ResourceName + " is missing from the DLL — the show will run silently.");
+						_failed.Add(name);
+						VRChatArchiveModPlugin.Logger.LogWarning($"[BadAppleAudio] no audio for '{name}' ({where}) — the show runs silently. PCM WAV only: this build has no MP3 decoder.");
 						return false;
 					}
-					_clip = WavAudio.Decode(wav, "BadApple");
-					if (_clip == null)
+					var decoded = WavAudio.Decode(wav, name);
+					if (decoded == null)
 					{
-						_loadFailed = true;
-						VRChatArchiveModPlugin.Logger.LogWarning("[BadAppleAudio] " + ResourceName + " did not decode — the show will run silently.");
+						_failed.Add(name);
+						VRChatArchiveModPlugin.Logger.LogWarning($"[BadAppleAudio] '{name}' did not decode ({where}) — must be plain PCM WAV; the show runs silently.");
 						return false;
 					}
+					_clip = decoded; _clipName = name;
+					if (_src != null) _src.clip = _clip;
 				}
 
 				if (_src == null)
@@ -132,7 +156,7 @@ namespace VRChatArchiveMod.Core
 			}
 			catch (Exception e)
 			{
-				_loadFailed = true;
+				_failed.Add(string.IsNullOrEmpty(clip) ? "badapple" : clip);
 				VRChatArchiveModPlugin.Logger.LogWarning("[BadAppleAudio] setup failed: " + e.Message);
 				return false;
 			}

@@ -283,7 +283,7 @@ namespace VRChatArchiveMod.Modules
 			// by the next animation state. Every two seconds the journal is walked and re-imposed.
 			try
 			{
-				float now = Time.realtimeSinceStartup;
+				float now = VaClock.Now;
 				if (now >= _nextReassert)
 				{
 					_nextReassert = now + ReassertSeconds;
@@ -307,7 +307,7 @@ namespace VRChatArchiveMod.Modules
 				// allocates a fresh array each pass — in a busy public instance that is a multi-ms
 				// native stall paid twice a second, forever, even when nothing new has spawned.
 				// Every avatar we care about hangs off a player, so bound the work by player count.
-				var players = VRC.SDKBase.VRCPlayerApi.AllPlayers;
+				var players = VRChatArchiveMod.Core.VaPlayers.All();
 				if (players == null) return;
 
 				for (int i = 0; i < players.Count; i++)
@@ -316,9 +316,12 @@ namespace VRChatArchiveMod.Modules
 					try
 					{
 						var api = players[i];
-						if (api == null) continue;
+						// A null check is not a liveness check: VRCPlayerApi is not a UnityEngine.Object, so `== null` is
+						// the plain managed test and says nothing about the il2cpp object behind the handle. Reading any
+						// member off a stale one is an access violation inside the proxy, which no try/catch can stop.
+						if (api == null || !Core.NativeGuard.Alive(api)) continue;
 						var go = api.gameObject;
-						if (go == null) continue;
+						if (go == null || !Core.NativeGuard.Alive(go)) continue;
 						desc = go.GetComponentInChildren<VRCAvatarDescriptor>(true);
 					}
 					catch { continue; }
@@ -341,18 +344,25 @@ namespace VRChatArchiveMod.Modules
 			}
 		}
 
-		// Avatar instance ids are per-instance; carrying them across worlds would slowly grow the
-		// set and (worse) let a recycled id skip a real scan. The journal is dropped WITHOUT undo:
-		// its targets left with the old world, and prodding a torn-down proxy is how you get an
-		// access violation instead of a restored avatar.
+		// Avatar instance ids are per-instance; carrying them across worlds would slowly grow the set
+		// and (worse) let a recycled id skip a real scan.
+		//
+		// THE JOURNAL IS NOW UNDONE FIRST (2026-09-13). It used to be dropped without undo, on the
+		// reasoning that its targets left with the old world and prodding a torn-down proxy is an
+		// access violation. The first half is not always true — OnSceneLoaded also fires for
+		// additive and UI loads, and the local player's own avatar is scanned by the same pass and
+		// survives every world change — so anything clamped that lived on kept its disabled
+		// renderers, lights and particle systems for the rest of the session with no journal entry
+		// left to release them. The second half is already handled: RestoreAll() proves liveness
+		// with Live() (NativeGuard.Alive) before every undo and simply skips what really is gone, so
+		// calling it here is safe AND is the only thing that unclamps a survivor.
 		public override void OnSceneLoaded(int buildIndex)
 		{
 			_processed.Clear();
 			int n = _journal.Count;
-			_journal.Clear();
-			_journaled.Clear();
+			int undone = RestoreAll(out int irreversible);   // clears _journal / _journaled itself
 			if (n > 0)
-				VRChatArchiveModPlugin.Logger.LogInfo($"[AntiCrash] scene changed — dropped {n} journal entr{(n == 1 ? "y" : "ies")} (targets unloaded with the world).");
+				VRChatArchiveModPlugin.Logger.LogInfo($"[AntiCrash] scene changed — {undone} clamp(s) undone on survivors, {n - undone} entr{(n - undone == 1 ? "y" : "ies")} released with the old world.");
 		}
 
 		// The game is going down (or the plugin is): leave every avatar the way we found it.

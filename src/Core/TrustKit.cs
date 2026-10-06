@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using UnityEngine;
 using VRC.Core;
 
@@ -70,12 +70,75 @@ namespace VRChatArchiveMod.Core
 			return ColorUtility.TryParseHtmlString(HexOf(apiUserObj), out Color c) ? c : Color.white;
 		}
 
+		public static Color ColorOf(VRC.SDKBase.VRCPlayerApi api)
+		{
+			if (api == null) return Color.white;
+			if (IsRainbowFor(api)) return Spectrum();
+			var user = ApiUsers.Get(api);
+			if (user != null) return ColorOf(user);
+			return ColorUtility.TryParseHtmlString(HexVisitor, out Color c) ? c : Color.white;
+		}
+
 		public static Color Spectrum()
 		{
 			float speed = 0.35f;
 			try { speed = ModConfig.RainbowSpeed.Value; } catch { }
-			return Color.HSVToRGB(Mathf.Repeat(Time.realtimeSinceStartup * speed, 1f), 0.85f, 1f);
+			return Color.HSVToRGB(Mathf.Repeat(VaClock.Now * speed, 1f), 0.85f, 1f);
 		}
+
+		// THE ID, WITHOUT APIUser — WHICH IS WHY THE RAINBOW HAD STOPPED.
+		//
+		// IsRainbow needed an APIUser to read an id, and on 1903 ApiUsers.Get() returns null for every
+		// player: VRC.Player's members cannot be placed on this build, as the startup log says outright.
+		// So the verdict was false for everyone and the capsule, the box and the glow all drew a plain
+		// trust colour. Nothing was wrong with the rainbow itself; its INPUT was never arriving.
+		//
+		// The id is available elsewhere and always has been: the roster carries it, resolved through the
+		// SDK (VRCPlayerApi), which works on this build. Same answer, no obfuscated member involved.
+		public static string UidOf(object playerApi)
+		{
+			try
+			{
+				var api = playerApi as VRC.SDKBase.VRCPlayerApi;
+				if (api == null) return null;
+				int pid; try { pid = api.playerId; } catch { return null; }
+				var roster = Modules.VaTagsModule.Roster;
+				if (roster == null) return null;
+				int n; try { n = roster.Count; } catch { return null; }
+				for (int i = 0; i < n; i++)
+				{
+					Modules.VaTagsModule.PlayerEntry e;
+					try { e = roster[i]; } catch { break; }
+					if (e == null || string.IsNullOrEmpty(e.UserId)) continue;
+					// PlayerId, NOT a cast. The roster holds the VRC.Player COMPONENT, not a VRCPlayerApi, so
+					// "e.Player as VRCPlayerApi" was null for every entry and this never matched anyone --
+					// which is exactly why the rainbow worked "one time in two": it silently fell back to the
+					// flickering APIUser path. The entry already carries the actor number.
+					int q = e.PlayerId;
+					if (q == pid) return e.UserId;
+				}
+			}
+			catch { }
+			return null;
+		}
+
+		/// <summary>The rainbow verdict from an id alone — no APIUser, no il2cpp string marshal.</summary>
+		public static bool IsRainbowId(string uid)
+		{
+			try
+			{
+				if (string.IsNullOrEmpty(uid)) return false;
+				try { if (ModConfig.LegendaryRainbow.Value && Modules.VaTagsModule.IsLegendary(uid)) return true; }
+				catch { }
+				string ids = ModConfig.RainbowUserIds.Value ?? "";
+				if (ids.Length == 0) return false;
+				return ids.IndexOf(uid, System.StringComparison.OrdinalIgnoreCase) >= 0;
+			}
+			catch { return false; }
+		}
+
+		/// <summary>Rainbow for a live player: the id comes from the roster, APIUser is not needed.</summary>
+		public static bool IsRainbowFor(object playerApi) => IsRainbowId(UidOf(playerApi));
 
 		public static bool IsRainbow(object apiUserObj)
 		{

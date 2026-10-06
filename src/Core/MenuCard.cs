@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Runtime.InteropServices;
 using Il2CppInterop.Runtime;
@@ -27,17 +27,505 @@ namespace VRChatArchiveMod.Core
 	//   * hover/press through Unity's own transition, plus the game's click sound
 	public static class MenuCard
 	{
-		public static readonly Color Bg = new Color(0.086f, 0.196f, 0.231f, 1f);   // #16323B
-		public static readonly Color On = new Color(0.086f, 0.451f, 0.494f, 1f);   // lit
-		public static readonly Color Glow = new Color(0.647f, 0.353f, 1.000f, 0.85f); // violet bloom
-		// The two states of a toggle tile, told entirely by the colour of its aura.
-		public static readonly Color GlowOn  = new Color(1.000f, 0.416f, 0.835f, 0.90f);  // pink  = ON
-		public static readonly Color GlowOff = new Color(0.290f, 0.659f, 1.000f, 0.55f);  // blue  = OFF
+		public static readonly Color Bg = new Color(0.38f, 0.39f, 0.42f, 1.0f);     // VRTool solid opaque gray
+		public static readonly Color On = new Color(0.26f, 0.28f, 0.32f, 1.0f);     // active/lit state - solid darker gray
+		public static readonly Color BorderOff = new Color(0.48f, 0.50f, 0.54f, 1.0f); // clean solid border
+		public static readonly Color BorderOn  = new Color(0.75f, 0.78f, 0.85f, 1.0f); // bright solid border when active
+		public static readonly Color Glow = new Color(0.4f, 0.4f, 0.45f, 0.25f);
+		public static readonly Color GlowOn  = new Color(0.6f, 0.65f, 0.8f, 0.45f);
+		public static readonly Color GlowOff = new Color(0.2f, 0.2f, 0.25f, 0.2f);
+		public static readonly Color IconDimmed = new Color(0.50f, 0.52f, 0.56f, 0.75f); // Dimmed gray for inactive logo or active X
+
+		private static Sprite _crossSprite;
+
+		public static Sprite CrossSprite()
+		{
+			if (_crossSprite != null) return _crossSprite;
+			try
+			{
+				const int N = 64;
+				const float thick = 6.0f;
+				const float p1 = 14f, p2 = 50f;
+				var tex = new Texture2D(N, N, TextureFormat.RGBA32, false) { hideFlags = HideFlags.HideAndDontSave };
+				tex.wrapMode = TextureWrapMode.Clamp;
+				tex.filterMode = FilterMode.Bilinear;
+
+				var px = new Color[N * N];
+				for (int y = 0; y < N; y++)
+				{
+					for (int x = 0; x < N; x++)
+					{
+						float d1 = DistSegment(x, y, p1, p1, p2, p2);
+						float d2 = DistSegment(x, y, p1, p2, p2, p1);
+						float d = Mathf.Min(d1, d2);
+						float alpha = Mathf.Clamp01((thick - d) / 1.5f + 0.5f);
+						px[y * N + x] = new Color(1f, 1f, 1f, alpha);
+					}
+				}
+				tex.SetPixels(px);
+				tex.Apply(false, false);
+
+				_crossSprite = Sprite.Create(tex, new Rect(0f, 0f, N, N), new Vector2(0.5f, 0.5f));
+				if (_crossSprite != null) _crossSprite.hideFlags = HideFlags.HideAndDontSave;
+			}
+			catch (Exception e) { VRChatArchiveModPlugin.Logger.LogWarning($"[MenuCard] cross sprite failed: {e.Message}"); }
+			return _crossSprite;
+		}
+
+		private static Sprite _checkSprite;
+		public static Sprite CheckSprite()
+		{
+			if (_checkSprite != null) return _checkSprite;
+			try
+			{
+				const int N = 64;
+				const float thick = 5.5f;
+				const float p1x = 14f, p1y = 30f;
+				const float p2x = 26f, p2y = 16f;
+				const float p3x = 50f, p3y = 48f;
+				var tex = new Texture2D(N, N, TextureFormat.RGBA32, false) { hideFlags = HideFlags.HideAndDontSave };
+				tex.wrapMode = TextureWrapMode.Clamp;
+				tex.filterMode = FilterMode.Bilinear;
+
+				var px = new Color[N * N];
+				for (int y = 0; y < N; y++)
+				{
+					for (int x = 0; x < N; x++)
+					{
+						float d1 = DistSegment(x, y, p1x, p1y, p2x, p2y);
+						float d2 = DistSegment(x, y, p2x, p2y, p3x, p3y);
+						float d = Mathf.Min(d1, d2);
+						float alpha = Mathf.Clamp01((thick - d) / 1.5f + 0.5f);
+						px[y * N + x] = new Color(1f, 1f, 1f, alpha);
+					}
+				}
+				tex.SetPixels(px);
+				tex.Apply(false, false);
+
+				_checkSprite = Sprite.Create(tex, new Rect(0f, 0f, N, N), new Vector2(0.5f, 0.5f));
+				if (_checkSprite != null) _checkSprite.hideFlags = HideFlags.HideAndDontSave;
+			}
+			catch (Exception e) { VRChatArchiveModPlugin.Logger.LogWarning($"[MenuCard] check sprite failed: {e.Message}"); }
+			return _checkSprite;
+		}
+
+		private static readonly byte[] BrickBytes = new byte[921] {
+			0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52,
+			0x00, 0x00, 0x00, 0x20, 0x00, 0x00, 0x00, 0x20, 0x08, 0x06, 0x00, 0x00, 0x00, 0x73, 0x7A, 0x7A,
+			0xF4, 0x00, 0x00, 0x03, 0x60, 0x49, 0x44, 0x41, 0x54, 0x78, 0x01, 0xED, 0xC1, 0xCB, 0x6B, 0x5C,
+			0x55, 0x1C, 0xC0, 0xF1, 0xEF, 0xEF, 0xDC, 0x33, 0xF7, 0xE4, 0x3E, 0xE6, 0xE6, 0xE6, 0x61, 0x68,
+			0x6C, 0x4A, 0x15, 0x8A, 0xBA, 0x74, 0xE1, 0x1F, 0xD0, 0xA5, 0xCB, 0xFE, 0x01, 0x59, 0x97, 0x6E,
+			0x24, 0x6E, 0xA4, 0x04, 0x5B, 0x0C, 0xD8, 0xA2, 0x90, 0x8A, 0xB8, 0xEB, 0x46, 0x14, 0x6C, 0xF7,
+			0x75, 0x21, 0xB8, 0x8C, 0x3B, 0x97, 0x75, 0xA7, 0xA0, 0x8B, 0x30, 0x79, 0x74, 0x12, 0xCC, 0x63,
+			0x32, 0x93, 0xCC, 0xDC, 0x73, 0xEF, 0x3D, 0x26, 0xD8, 0xE0, 0x65, 0x9C, 0x34, 0xCF, 0x22, 0x48,
+			0x3F, 0x1F, 0x5E, 0xF9, 0xAF, 0x09, 0x17, 0x68, 0xAD, 0xD9, 0x7C, 0x27, 0xB7, 0x76, 0x06, 0x91,
+			0xDF, 0x44, 0xA9, 0x87, 0x93, 0x93, 0x93, 0x5D, 0x8E, 0x21, 0x5C, 0x80, 0xE5, 0x46, 0xE3, 0x0D,
+			0xA5, 0xD4, 0x27, 0x45, 0x51, 0x4C, 0x03, 0x9A, 0xBF, 0x2D, 0xF9, 0xC6, 0xDC, 0xAD, 0xF9, 0xFE,
+			0xA3, 0x91, 0x91, 0x91, 0x9C, 0x23, 0x08, 0xE7, 0xB0, 0xB4, 0xB8, 0x78, 0x09, 0xB8, 0x8D, 0xC8,
+			0x2D, 0x60, 0x88, 0xC1, 0x7E, 0xC5, 0xB9, 0xD9, 0xA9, 0xAB, 0x57, 0x9F, 0x30, 0x80, 0x70, 0x06,
+			0x8D, 0x46, 0x23, 0x15, 0xF8, 0x10, 0xE7, 0x66, 0x80, 0x94, 0x3E, 0xCA, 0xF3, 0x10, 0xA0, 0x28,
+			0x0A, 0x2A, 0x7E, 0x46, 0x64, 0x76, 0xEA, 0xCA, 0x95, 0x05, 0x2A, 0x84, 0x53, 0x58, 0x5D, 0x5D,
+			0x1D, 0x72, 0x65, 0x79, 0xAB, 0x2C, 0x8A, 0x8F, 0x81, 0x71, 0xFA, 0xC4, 0x49, 0x42, 0x1C, 0xC7,
+			0x78, 0x9E, 0xC7, 0x81, 0xB2, 0x2C, 0xD9, 0xED, 0x74, 0xD8, 0xDE, 0xDA, 0xE2, 0x90, 0x88, 0xFC,
+			0x28, 0x4A, 0xCD, 0xBE, 0x7E, 0xF9, 0xF2, 0x53, 0xF6, 0x09, 0x27, 0xB0, 0xB9, 0xB9, 0xA9, 0x6D,
+			0x96, 0x4D, 0x67, 0xBD, 0xDE, 0xA7, 0xC0, 0x14, 0x03, 0xF8, 0xC6, 0xF0, 0xDA, 0xC4, 0x04, 0x83,
+			0xFC, 0xB9, 0xBE, 0x4E, 0xB7, 0xDB, 0xA5, 0xCA, 0xF3, 0xBC, 0x47, 0x65, 0x59, 0xDE, 0x15, 0x8E,
+			0xB1, 0xB4, 0xB8, 0x78, 0x03, 0x91, 0x79, 0xE0, 0x1A, 0xC7, 0x48, 0x47, 0x47, 0x09, 0xC3, 0x10,
+			0x11, 0xE1, 0xD0, 0x6E, 0xA7, 0xC3, 0xE6, 0xC6, 0x06, 0xFD, 0x94, 0x52, 0xD4, 0x93, 0xE4, 0x3B,
+			0xCD, 0x11, 0x96, 0x1A, 0x8D, 0xEB, 0xE2, 0xDC, 0xBC, 0x83, 0xF7, 0xE8, 0x13, 0x84, 0x21, 0x51,
+			0x1C, 0x53, 0xAB, 0xD5, 0x38, 0x90, 0x5B, 0x4B, 0xBB, 0xDD, 0x66, 0x6B, 0x63, 0x83, 0xAD, 0x8D,
+			0x0D, 0x7C, 0xDF, 0xE7, 0x80, 0xB5, 0x16, 0xE7, 0x1C, 0x55, 0x22, 0x42, 0x14, 0xC7, 0xD4, 0x93,
+			0x04, 0xA5, 0x54, 0xA9, 0xE9, 0xB3, 0xB2, 0xBC, 0xFC, 0x6E, 0x59, 0x14, 0x5F, 0xE2, 0xDC, 0x75,
+			0xC7, 0xBF, 0x19, 0x63, 0x18, 0x1D, 0x1B, 0xA3, 0xCA, 0x37, 0x86, 0x51, 0x63, 0x58, 0xCB, 0x73,
+			0x6C, 0x96, 0x91, 0x65, 0x19, 0x83, 0x84, 0x51, 0x44, 0x32, 0x3C, 0x8C, 0xE7, 0x79, 0x1C, 0xD2,
+			0x3C, 0xB7, 0xD6, 0x6C, 0x5E, 0xB3, 0x59, 0x36, 0x5F, 0x16, 0xC5, 0x0D, 0x5E, 0xC0, 0x5A, 0x4B,
+			0x96, 0x65, 0xF8, 0xBE, 0x4F, 0x55, 0xB7, 0xDB, 0x25, 0xB7, 0x96, 0x41, 0x86, 0x82, 0x80, 0xE1,
+			0x34, 0x45, 0x6B, 0x4D, 0x3F, 0xBD, 0xB4, 0xB8, 0x78, 0xC9, 0xD3, 0xFA, 0xB3, 0xAC, 0xD7, 0x9B,
+			0x06, 0x34, 0x15, 0xBE, 0x31, 0x44, 0x51, 0x84, 0xA7, 0x35, 0x07, 0x72, 0x6B, 0x69, 0xB7, 0xDB,
+			0xAC, 0x37, 0x9B, 0xF8, 0xBE, 0x8F, 0xAE, 0xD5, 0x38, 0x90, 0x5B, 0x4B, 0x96, 0x65, 0xF4, 0x33,
+			0xC6, 0x30, 0x9C, 0xA6, 0xD4, 0x7C, 0x9F, 0xA3, 0xE8, 0x24, 0x4D, 0xBF, 0xD9, 0x69, 0xB5, 0xDE,
+			0xA7, 0x8F, 0x31, 0x86, 0xF1, 0x89, 0x09, 0xAA, 0x8C, 0x31, 0x44, 0x71, 0xCC, 0xEA, 0xCA, 0x0A,
+			0x59, 0x96, 0x91, 0x65, 0x19, 0x83, 0xD4, 0x7C, 0x9F, 0xE1, 0x34, 0xC5, 0x18, 0xC3, 0x71, 0x74,
+			0x3D, 0x49, 0x24, 0x0C, 0x43, 0x5A, 0xAD, 0x16, 0xBB, 0x9D, 0x0E, 0x87, 0x8A, 0xA2, 0xA0, 0x2C,
+			0x4B, 0x94, 0x52, 0x54, 0x59, 0x6B, 0x71, 0x65, 0xC9, 0x20, 0x5A, 0x6B, 0x92, 0x34, 0x25, 0x08,
+			0x02, 0x4E, 0x4A, 0xB3, 0xCF, 0xD3, 0x9A, 0x91, 0xD1, 0x51, 0xE2, 0x38, 0xA6, 0xD5, 0x6A, 0xD1,
+			0xDD, 0xDB, 0x23, 0xCF, 0x73, 0x9A, 0xAB, 0xAB, 0x04, 0x61, 0x88, 0x52, 0x8A, 0x03, 0x45, 0x51,
+			0xB0, 0xB7, 0xBB, 0x8B, 0x73, 0x8E, 0x2A, 0x4F, 0x6B, 0x92, 0x24, 0x21, 0x8C, 0x22, 0x4E, 0x4B,
+			0x53, 0x51, 0xF3, 0x7D, 0xC6, 0xC6, 0xC7, 0xE9, 0xF5, 0x7A, 0xEC, 0x6C, 0x6F, 0xD3, 0xEB, 0xF5,
+			0xE8, 0xB4, 0xDB, 0x1C, 0xC5, 0xF3, 0x3C, 0xE2, 0x7A, 0x9D, 0x28, 0x8E, 0x11, 0x11, 0xCE, 0x42,
+			0x33, 0x80, 0x31, 0x06, 0x33, 0x31, 0xC1, 0xDE, 0xDE, 0x1E, 0x3B, 0xDB, 0xDB, 0x58, 0x6B, 0xA9,
+			0x52, 0x4A, 0x11, 0xC5, 0x31, 0x71, 0xBD, 0x8E, 0x52, 0x8A, 0x33, 0xFA, 0x01, 0xB8, 0xA7, 0x79,
+			0x81, 0x20, 0x08, 0x08, 0x82, 0x80, 0xDD, 0x4E, 0x87, 0xF6, 0xCE, 0x0E, 0x79, 0x9E, 0x13, 0xC5,
+			0x31, 0xF5, 0x24, 0x41, 0x29, 0xC5, 0x19, 0xFD, 0x04, 0xCC, 0x89, 0xC8, 0x02, 0xFB, 0x34, 0x27,
+			0x10, 0x46, 0x11, 0x61, 0x14, 0x71, 0x4E, 0xBF, 0x00, 0x73, 0x22, 0xF2, 0x84, 0x0A, 0xCD, 0xCB,
+			0xF7, 0x07, 0x70, 0x4F, 0x44, 0xBE, 0x65, 0x00, 0xCD, 0xCB, 0xF3, 0x0C, 0xB8, 0x0F, 0x3C, 0x14,
+			0x91, 0x9C, 0x23, 0x68, 0xE0, 0x01, 0xF0, 0x26, 0xF0, 0x16, 0x17, 0x63, 0x0B, 0xF8, 0x02, 0x78,
+			0x20, 0x22, 0x5D, 0x8E, 0x21, 0x3C, 0xE7, 0x9C, 0xBB, 0x09, 0xDC, 0x07, 0xC6, 0x39, 0x9B, 0x2E,
+			0xF0, 0x15, 0xF0, 0xB9, 0x88, 0x6C, 0x71, 0x42, 0x42, 0x85, 0x73, 0x6E, 0x08, 0x98, 0x01, 0xEE,
+			0x00, 0x31, 0x27, 0x93, 0x03, 0x5F, 0x03, 0x73, 0x22, 0xF2, 0x8C, 0x53, 0x12, 0x06, 0x70, 0xCE,
+			0x0D, 0x03, 0xB7, 0x81, 0x8F, 0x00, 0xCD, 0xD1, 0x1E, 0x03, 0x73, 0x22, 0xF2, 0x3B, 0x67, 0x24,
+			0xBC, 0x80, 0x73, 0x6E, 0x0A, 0xB8, 0x03, 0xDC, 0x04, 0x84, 0x7F, 0x7C, 0x0F, 0xCC, 0x89, 0xC8,
+			0x53, 0xCE, 0x49, 0x38, 0x01, 0xE7, 0xDC, 0xDB, 0xC0, 0x07, 0x80, 0x01, 0x1E, 0x8B, 0xC8, 0x02,
+			0xAF, 0xFC, 0x5F, 0xFC, 0x05, 0x83, 0x32, 0x32, 0xB2, 0xB9, 0xD7, 0x41, 0xD4, 0x00, 0x00, 0x00,
+			0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82
+		};
+
+		private static Sprite _brickSprite;
+		public static Sprite BrickSprite()
+		{
+			if (_brickSprite != null) return _brickSprite;
+			try
+			{
+				byte[] data = null;
+				string[] tryPaths = {
+					"Brick-Emoji.png",
+					@"C:\Users\bmish\OneDrive\المستندات\IDE\IDE\VRChatArchiveMod\VRChatArchiveMod\Brick-Emoji.png",
+					"UserData/Brick-Emoji.png"
+				};
+				foreach (var p in tryPaths)
+				{
+					try { if (System.IO.File.Exists(p)) { data = System.IO.File.ReadAllBytes(p); break; } } catch { }
+				}
+				if (data == null || data.Length == 0) data = BrickBytes;
+
+				var tex = new Texture2D(2, 2);
+				ImageConversion.LoadImage(tex, new Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppStructArray<byte>(data));
+				_brickSprite = Sprite.Create(tex, new Rect(0f, 0f, tex.width, tex.height), new Vector2(0.5f, 0.5f));
+				if (_brickSprite != null) _brickSprite.hideFlags = HideFlags.HideAndDontSave;
+			}
+			catch (Exception e) { VRChatArchiveModPlugin.Logger.LogWarning($"[MenuCard] brick sprite failed: {e.Message}"); }
+			return _brickSprite;
+		}
+
+		private static float DistSegment(float px, float py, float x1, float y1, float x2, float y2)
+		{
+			float dx = x2 - x1, dy = y2 - y1;
+			float l2 = dx * dx + dy * dy;
+			if (l2 == 0f) return Mathf.Sqrt((px - x1) * (px - x1) + (py - y1) * (py - y1));
+			float t = Mathf.Clamp01(((px - x1) * dx + (py - y1) * dy) / l2);
+			float projX = x1 + t * dx, projY = y1 + t * dy;
+			return Mathf.Sqrt((px - projX) * (px - projX) + (py - projY) * (py - projY));
+		}
+
+		private static TMPro.TMP_FontAsset _font;
+		public static TMPro.TMP_FontAsset StealFont()
+		{
+			if (_font != null) return _font;
+			try
+			{
+				Transform root = Core.QuickMenu.Root() ?? Core.QuickMenu.Main();
+				var t = root != null ? root.GetComponentInChildren<TMPro.TMP_Text>(true) : null;
+				if (t != null) _font = t.font;
+			}
+			catch { }
+			return _font;
+		}
+
+		private static Sprite _resetSprite;
+		public static Sprite ResetSprite()
+		{
+			if (_resetSprite != null) return _resetSprite;
+			try
+			{
+				var all = Resources.FindObjectsOfTypeAll(Il2CppInterop.Runtime.Il2CppType.From(typeof(Sprite)));
+				if (all != null)
+				{
+					for (int i = 0; i < all.Length; i++)
+					{
+						var sp = all[i]?.TryCast<Sprite>();
+						if (sp == null) continue;
+						string n = sp.name ?? "";
+						if (string.Equals(n, "ic_reset", StringComparison.OrdinalIgnoreCase) ||
+							string.Equals(n, "Home_Reset", StringComparison.OrdinalIgnoreCase) ||
+							string.Equals(n, "ReloadIcon", StringComparison.OrdinalIgnoreCase) ||
+							string.Equals(n, "Mirror_Reset_icon", StringComparison.OrdinalIgnoreCase))
+						{
+							_resetSprite = sp;
+							return _resetSprite;
+						}
+					}
+				}
+			}
+			catch { }
+			return CrossSprite();
+		}
+
+		private static string FormatStepper(string title, float value, string format)
+		{
+			return $"<color=#FFFFFF><b>{title}: {value.ToString(format)}</b></color>";
+		}
+
+		public static void SetupStepper(Transform card, string title, Func<float> getValue,
+			Action onDec, Action onInc, Action onReset, string format = "0.#")
+		{
+			try
+			{
+				card.gameObject.SetActive(true);
+				StripRoot(card, keepStyle: false);
+
+				var vlg = card.GetComponent<VerticalLayoutGroup>();
+				if (vlg != null) UnityEngine.Object.DestroyImmediate(vlg);
+				var hlg = card.GetComponent<HorizontalLayoutGroup>();
+				if (hlg != null) UnityEngine.Object.DestroyImmediate(hlg);
+				var rootBtn = card.GetComponent<Button>();
+				if (rootBtn != null) UnityEngine.Object.DestroyImmediate(rootBtn);
+
+				var cg = card.GetComponent<CanvasGroup>();
+				if (cg != null) { cg.alpha = 1f; cg.interactable = true; cg.blocksRaycasts = true; }
+
+				var bgImg = card.Find("Background")?.GetComponent<Image>();
+				if (bgImg != null) bgImg.color = Bg;
+				SetRim(card, BorderOff);
+
+				var donorTmp = card.GetComponentInChildren<TMPro.TextMeshProUGUI>(true);
+				var f = donorTmp != null ? donorTmp.font : StealFont();
+
+				var hostT = card.Find("VA_StepperHost");
+				if (hostT != null) UnityEngine.Object.DestroyImmediate(hostT.gameObject);
+
+				var hostGo = new GameObject("VA_StepperHost", Il2CppInterop.Runtime.Il2CppType.Of<RectTransform>());
+				var host = hostGo.GetComponent<RectTransform>();
+				host.SetParent(card, false);
+				host.anchorMin = Vector2.zero;
+				host.anchorMax = Vector2.one;
+				host.offsetMin = Vector2.zero;
+				host.offsetMax = Vector2.zero;
+				var hLe = hostGo.AddComponent<UnityEngine.UI.LayoutElement>();
+				hLe.ignoreLayout = true;
+
+				var rimSp = RimSprite();
+
+				// Minus button (Left)
+				var btnMinusGo = new GameObject("Btn_Minus", Il2CppInterop.Runtime.Il2CppType.Of<RectTransform>());
+				var btnMinusRt = btnMinusGo.GetComponent<RectTransform>();
+				btnMinusRt.SetParent(host, false);
+				btnMinusRt.anchorMin = new Vector2(0.04f, 0.16f);
+				btnMinusRt.anchorMax = new Vector2(0.28f, 0.84f);
+				btnMinusRt.offsetMin = Vector2.zero;
+				btnMinusRt.offsetMax = Vector2.zero;
+
+				var mImg = btnMinusGo.AddComponent<Image>();
+				mImg.color = new Color(0.24f, 0.26f, 0.31f, 0.95f);
+				if (rimSp != null) { mImg.sprite = rimSp; mImg.type = Image.Type.Sliced; }
+				var mBtn = btnMinusGo.AddComponent<Button>();
+				mBtn.targetGraphic = mImg;
+				mBtn.transition = Selectable.Transition.ColorTint;
+				mBtn.colors = Tint(new Color(0.28f, 0.31f, 0.38f, 1f));
+				if (onDec != null)
+				{
+					UiClick.AddClick(mBtn, () =>
+					{
+						onDec();
+						if (getValue != null) UpdateStepperText(card, title, getValue(), format);
+					});
+				}
+				UiClick.AddClick(mBtn, PlayClick);
+
+				TMPro.TMP_Text mTmp = null;
+				if (donorTmp != null)
+				{
+					var cloneTxt = UnityEngine.Object.Instantiate(donorTmp.gameObject, btnMinusRt);
+					cloneTxt.name = "Text";
+					var crt = cloneTxt.GetComponent<RectTransform>();
+					crt.anchorMin = Vector2.zero; crt.anchorMax = Vector2.one;
+					crt.offsetMin = Vector2.zero; crt.offsetMax = Vector2.zero;
+					mTmp = cloneTxt.GetComponent<TMPro.TMP_Text>();
+				}
+				else
+				{
+					var mTxtGo = new GameObject("Text", Il2CppInterop.Runtime.Il2CppType.Of<RectTransform>());
+					mTxtGo.transform.SetParent(btnMinusRt, false);
+					var crt = mTxtGo.GetComponent<RectTransform>();
+					crt.anchorMin = Vector2.zero; crt.anchorMax = Vector2.one;
+					crt.offsetMin = Vector2.zero; crt.offsetMax = Vector2.zero;
+					mTmp = mTxtGo.AddComponent<TMPro.TextMeshProUGUI>();
+					if (f != null) mTmp.font = f;
+				}
+				mTmp.richText = true;
+				mTmp.text = "<color=#FFFFFF><b>-</b></color>";
+				mTmp.fontSize = 44f;
+				mTmp.fontSizeMax = 48f;
+				mTmp.fontSizeMin = 24f;
+				mTmp.enableAutoSizing = true;
+				mTmp.fontStyle = TMPro.FontStyles.Bold;
+				mTmp.alignment = TMPro.TextAlignmentOptions.Center;
+
+				// Center Button (Reset + Title & Value)
+				var btnCenterGo = new GameObject("Btn_Center", Il2CppInterop.Runtime.Il2CppType.Of<RectTransform>());
+				var btnCenterRt = btnCenterGo.GetComponent<RectTransform>();
+				btnCenterRt.SetParent(host, false);
+				btnCenterRt.anchorMin = new Vector2(0.31f, 0.12f);
+				btnCenterRt.anchorMax = new Vector2(0.69f, 0.88f);
+				btnCenterRt.offsetMin = Vector2.zero;
+				btnCenterRt.offsetMax = Vector2.zero;
+
+				var cImg = btnCenterGo.AddComponent<Image>();
+				cImg.color = new Color(0.18f, 0.19f, 0.23f, 1.0f);
+				if (rimSp != null) { cImg.sprite = rimSp; cImg.type = Image.Type.Sliced; }
+				var cBtn = btnCenterGo.AddComponent<Button>();
+				cBtn.targetGraphic = cImg;
+				cBtn.transition = Selectable.Transition.ColorTint;
+				cBtn.colors = Tint(new Color(0.24f, 0.26f, 0.31f, 1.0f));
+				if (onReset != null)
+				{
+					UiClick.AddClick(cBtn, () =>
+					{
+						onReset();
+						if (getValue != null) UpdateStepperText(card, title, getValue(), format);
+					});
+				}
+				UiClick.AddClick(cBtn, PlayClick);
+
+				var riGo = new GameObject("Icon_Reset", Il2CppInterop.Runtime.Il2CppType.Of<RectTransform>());
+				var riRt = riGo.GetComponent<RectTransform>();
+				riRt.SetParent(btnCenterRt, false);
+				riRt.anchorMin = new Vector2(0.5f, 0.68f);
+				riRt.anchorMax = new Vector2(0.5f, 0.68f);
+				riRt.pivot = new Vector2(0.5f, 0.5f);
+				riRt.sizeDelta = new Vector2(38f, 38f);
+				riRt.anchoredPosition = Vector2.zero;
+				var riImg = riGo.AddComponent<Image>();
+				var rSp = ResetSprite();
+				if (rSp != null) riImg.sprite = rSp;
+				riImg.color = Color.white;
+				riImg.raycastTarget = false;
+				riImg.preserveAspect = true;
+
+				TMPro.TMP_Text cTmp = null;
+				if (donorTmp != null)
+				{
+					var cloneTxt = UnityEngine.Object.Instantiate(donorTmp.gameObject, btnCenterRt);
+					cloneTxt.name = "Text";
+					var crt = cloneTxt.GetComponent<RectTransform>();
+					crt.anchorMin = new Vector2(0.02f, 0.08f);
+					crt.anchorMax = new Vector2(0.98f, 0.44f);
+					crt.pivot = new Vector2(0.5f, 0.2f);
+					crt.offsetMin = Vector2.zero;
+					crt.offsetMax = Vector2.zero;
+					cTmp = cloneTxt.GetComponent<TMPro.TMP_Text>();
+				}
+				else
+				{
+					var cTxtGo = new GameObject("Text", Il2CppInterop.Runtime.Il2CppType.Of<RectTransform>());
+					cTxtGo.transform.SetParent(btnCenterRt, false);
+					var crt = cTxtGo.GetComponent<RectTransform>();
+					crt.anchorMin = new Vector2(0.02f, 0.08f);
+					crt.anchorMax = new Vector2(0.98f, 0.44f);
+					crt.pivot = new Vector2(0.5f, 0.2f);
+					crt.offsetMin = Vector2.zero;
+					crt.offsetMax = Vector2.zero;
+					cTmp = cTxtGo.AddComponent<TMPro.TextMeshProUGUI>();
+					if (f != null) cTmp.font = f;
+				}
+				float curVal = getValue != null ? getValue() : 0f;
+				cTmp.richText = true;
+				cTmp.text = FormatStepper(title, curVal, format);
+				cTmp.fontSize = 18f;
+				cTmp.fontSizeMax = 20f;
+				cTmp.fontSizeMin = 12f;
+				cTmp.enableAutoSizing = true;
+				cTmp.fontStyle = TMPro.FontStyles.Bold;
+				cTmp.alignment = TMPro.TextAlignmentOptions.Center;
+				cTmp.enableWordWrapping = false;
+
+				// Plus button (Right)
+				var btnPlusGo = new GameObject("Btn_Plus", Il2CppInterop.Runtime.Il2CppType.Of<RectTransform>());
+				var btnPlusRt = btnPlusGo.GetComponent<RectTransform>();
+				btnPlusRt.SetParent(host, false);
+				btnPlusRt.anchorMin = new Vector2(0.72f, 0.16f);
+				btnPlusRt.anchorMax = new Vector2(0.96f, 0.84f);
+				btnPlusRt.offsetMin = Vector2.zero;
+				btnPlusRt.offsetMax = Vector2.zero;
+
+				var pImg = btnPlusGo.AddComponent<Image>();
+				pImg.color = new Color(0.24f, 0.26f, 0.31f, 0.95f);
+				if (rimSp != null) { pImg.sprite = rimSp; pImg.type = Image.Type.Sliced; }
+				var pBtn = btnPlusGo.AddComponent<Button>();
+				pBtn.targetGraphic = pImg;
+				pBtn.transition = Selectable.Transition.ColorTint;
+				pBtn.colors = Tint(new Color(0.28f, 0.31f, 0.38f, 1f));
+				if (onInc != null)
+				{
+					UiClick.AddClick(pBtn, () =>
+					{
+						onInc();
+						if (getValue != null) UpdateStepperText(card, title, getValue(), format);
+					});
+				}
+				UiClick.AddClick(pBtn, PlayClick);
+
+				TMPro.TMP_Text pTmp = null;
+				if (donorTmp != null)
+				{
+					var cloneTxt = UnityEngine.Object.Instantiate(donorTmp.gameObject, btnPlusRt);
+					cloneTxt.name = "Text";
+					var crt = cloneTxt.GetComponent<RectTransform>();
+					crt.anchorMin = Vector2.zero; crt.anchorMax = Vector2.one;
+					crt.offsetMin = Vector2.zero; crt.offsetMax = Vector2.zero;
+					pTmp = cloneTxt.GetComponent<TMPro.TMP_Text>();
+				}
+				else
+				{
+					var pTxtGo = new GameObject("Text", Il2CppInterop.Runtime.Il2CppType.Of<RectTransform>());
+					pTxtGo.transform.SetParent(btnPlusRt, false);
+					var crt = pTxtGo.GetComponent<RectTransform>();
+					crt.anchorMin = Vector2.zero; crt.anchorMax = Vector2.one;
+					crt.offsetMin = Vector2.zero; crt.offsetMax = Vector2.zero;
+					pTmp = pTxtGo.AddComponent<TMPro.TextMeshProUGUI>();
+					if (f != null) pTmp.font = f;
+				}
+				pTmp.richText = true;
+				pTmp.text = "<color=#FFFFFF><b>+</b></color>";
+				pTmp.fontSize = 44f;
+				pTmp.fontSizeMax = 48f;
+				pTmp.fontSizeMin = 24f;
+				pTmp.enableAutoSizing = true;
+				pTmp.fontStyle = TMPro.FontStyles.Bold;
+				pTmp.alignment = TMPro.TextAlignmentOptions.Center;
+
+				// Now that we cloned the TMP texts, destroy the donor children on this stepper card
+				var icons = card.Find("Icons");
+				if (icons != null) UnityEngine.Object.DestroyImmediate(icons.gameObject);
+				var textParent = card.Find("TextLayoutParent");
+				if (textParent != null) UnityEngine.Object.DestroyImmediate(textParent.gameObject);
+				var textH4 = card.Find("Text_H4");
+				if (textH4 != null) UnityEngine.Object.DestroyImmediate(textH4.gameObject);
+				StripBadges(card);
+			}
+			catch (Exception e)
+			{
+				VRChatArchiveModPlugin.Logger.LogWarning($"[MenuCard] SetupStepper '{title}' failed: {e.Message}");
+			}
+		}
+
+		public static void UpdateStepperText(Transform card, string title, float value, string format = "0.#")
+		{
+			try
+			{
+				var tmp = card.Find("VA_StepperHost/Btn_Center/Text")?.GetComponent<TMPro.TMP_Text>();
+				if (tmp != null)
+				{
+					tmp.richText = true;
+					tmp.text = FormatStepper(title, value, format);
+				}
+			}
+			catch { }
+		}
 
 		private static readonly HashSet<string> Keep = new HashSet<string>(StringComparer.Ordinal)
 		{
 			"RectTransform", "CanvasRenderer", "CanvasGroup", "LayoutElement",
 			"VerticalLayoutGroup", "HorizontalLayoutGroup", "GridLayoutGroup",
+			// A FITTER IS LAYOUT, NOT ACTION — and leaving it out of this list wrecked a whole menu.
+			//
+			// Every other layout driver was kept and this one was not, which held only as long as the
+			// clones were fixed-size cards. The avatar sidebar's category row sizes itself through a
+			// ContentSizeFitter (menu capture: "Cell_MM_AvatarListSelector [... ContentSizeFitter,
+			// VerticalLayoutGroup ...] {336x54}"); destroying it left the clone with no driven size, the
+			// parent layout group inherited a sizeless child, and the ENTIRE sidebar collapsed to a strip
+			// of icons with our row floating loose over it. A fitter computes a size and never carries
+			// the donor's behaviour, so there was never a reason to strip it.
+			"ContentSizeFitter", "AspectRatioFitter",
 			"Image", "ImageEx", "RawImage", "RawImageEx", "UIInvisibleGraphic", "Button",
 		};
 
@@ -62,7 +550,7 @@ namespace VRChatArchiveMod.Core
 		// hovered or selected when we cloned it hands over that state's colour, which is exactly how
 		// six identical tiles came out in three different colours.
 		public static void Setup(Transform card, Transform donor, string label, Action onClick,
-			bool lit = false, bool keepStyle = false)
+			bool lit = false, bool keepStyle = false, bool hasState = false)
 		{
 			try { card.gameObject.SetActive(true); } catch { }
 
@@ -104,12 +592,80 @@ namespace VRChatArchiveMod.Core
 				btn.colors = keepStyle ? Tint(Color.white) : Tint(lit ? On : Bg);
 
 				try { btn.onClick.RemoveAllListeners(); } catch { }
+				UiClick.Clear(btn);
+
+				// Ensure any leftover Button components in children (from donor) are purged so clicks only register on root
+				var childBtns = card.GetComponentsInChildren<Button>(true);
+				if (childBtns != null)
+				{
+					foreach (var cb in childBtns)
+					{
+						if (cb != null && cb != btn)
+						{
+							UiClick.Clear(cb);
+							try { UnityEngine.Object.DestroyImmediate(cb); } catch { }
+						}
+					}
+				}
+
 				if (onClick != null) UiClick.AddClick(btn, onClick);
 				UiClick.AddClick(btn, PlayClick);
 			}
 			catch (Exception e) { VRChatArchiveModPlugin.Logger.LogWarning($"[MenuCard] '{label}' click failed: {e.Message}"); }
 
 			try { CopySprite(donor, card, "Background"); CopySprite(donor, card, "Icons/Icon"); } catch { }
+
+			// Dual-Icon configuration for VRTool toggle cards
+			try
+			{
+				var icons = card.Find("Icons");
+				if (icons != null)
+				{
+					var statusT = icons.Find("Icon_Status");
+					if (hasState)
+					{
+						if (statusT == null)
+						{
+							var go = new GameObject("Icon_Status", Il2CppInterop.Runtime.Il2CppType.Of<RectTransform>());
+							var rt = go.GetComponent<RectTransform>();
+							rt.SetParent(icons, false);
+							var img = go.AddComponent<Image>();
+							img.sprite = CrossSprite();
+							img.raycastTarget = false;
+							img.preserveAspect = true;
+							statusT = go.transform;
+						}
+						statusT.gameObject.SetActive(true);
+						var simg = statusT.GetComponent<Image>();
+						if (simg != null)
+						{
+							// When active: X is gray. When inactive: X is bright white. NO checkmark!
+							simg.sprite = CrossSprite();
+							simg.color = lit ? IconDimmed : Color.white;
+						}
+
+						var iconT = icons.Find("Icon");
+						var im = iconT != null ? iconT.GetComponent<Image>() : null;
+						if (im != null)
+						{
+							// When active: Logo is bright white. When inactive: Logo is gray.
+							im.color = lit ? Color.white : IconDimmed;
+						}
+
+						var secT = icons.Find("Icon_Secondary");
+						var secIm = secT != null ? secT.GetComponent<Image>() : null;
+						if (secIm != null)
+						{
+							secIm.color = lit ? Color.white : IconDimmed;
+						}
+					}
+					else if (statusT != null)
+					{
+						statusT.gameObject.SetActive(false);
+					}
+				}
+			}
+			catch { }
 
 			// OPAQUE BASE. A clone can come back with a transparent Background (or none at all, leaving
 			// only the root Image which Setup made 0,0,0,0) -- the tile was see-through while VRChat's
@@ -121,14 +677,13 @@ namespace VRChatArchiveMod.Core
 				var baseBg = card.Find("Background")?.GetComponent<Image>();
 				if (baseBg != null)
 				{
-					var c = baseBg.color;
-					if (c.r + c.g + c.b < 0.05f) c = new Color(0.20f, 0.10f, 0.32f, 1f);   // colourless copy -> a card-like violet
-					baseBg.color = new Color(c.r, c.g, c.b, 1f);
+					// VRTool-style: semi-transparent gray background
+					baseBg.color = Bg;
 				}
 				else
 				{
 					var root = card.GetComponent<Image>();
-					if (root != null) { var c = root.color; if (c.a < 0.9f || c.r + c.g + c.b < 0.05f) root.color = new Color(0.20f, 0.10f, 0.32f, 1f); }
+					if (root != null) root.color = Bg;
 				}
 			}
 			catch { }
@@ -137,7 +692,8 @@ namespace VRChatArchiveMod.Core
 			// pink/blue a moment later by RefreshToggles; one that is a plain action keeps the
 			// neutral colour, because blue would claim it is "off" when it has no off.
 			SetAura(card, Glow);
-			if (keepStyle) { /* the game owns Background */ }
+			if (hasState) SetLit(card, lit, keepStyle);
+			else if (keepStyle) { /* the game owns Background */ }
 			else SetLit(card, lit, keepStyle);
 
 			// Label last. Only forced white when WE own the colours — under keepStyle the game's own
@@ -253,16 +809,92 @@ namespace VRChatArchiveMod.Core
 				if (label != null && label.GetInstanceID() == cardRt.GetInstanceID()) label = null;
 
 				// The card's own rect is still zero on the frame it is built, which silently skipped
-				// this whole pass. The grid that owns the card knows the cell size before any layout
-				// runs, so ask it first.
+				// this whole pass. Read preferred dimensions from LayoutElement or GridLayoutGroup first.
 				float w = cardRt.rect.width, h = cardRt.rect.height;
 				try
 				{
-					var grid = cardRt.parent != null ? cardRt.parent.GetComponent<UnityEngine.UI.GridLayoutGroup>() : null;
-					if (grid != null && grid.cellSize.y > 1f) { w = grid.cellSize.x; h = grid.cellSize.y; }
+					var le = cardRt.GetComponent<UnityEngine.UI.LayoutElement>();
+					if (le != null && le.preferredHeight > 1f) { w = le.preferredWidth; h = le.preferredHeight; }
+					else
+					{
+						var grid = cardRt.parent != null ? cardRt.parent.GetComponent<UnityEngine.UI.GridLayoutGroup>() : null;
+						if (grid != null && grid.cellSize.y > 1f) { w = grid.cellSize.x; h = grid.cellSize.y; }
+					}
 				}
 				catch { }
 				if (h <= 1f || w <= 1f) return;
+
+				var statusT = icons.Find("Icon_Status");
+				bool hasDual = statusT != null && statusT.gameObject.activeSelf;
+
+				if (hasDual)
+				{
+					Ignore(icons);
+					icons.anchorMin = new Vector2(0f, 1f);
+					icons.anchorMax = new Vector2(1f, 1f);
+					icons.pivot = new Vector2(0.5f, 1f);
+					icons.sizeDelta = new Vector2(0f, h * 0.58f);
+					icons.anchoredPosition = new Vector2(0f, -8f);
+
+					// Position Icon_Status on Left (Large X)
+					var srt = statusT.TryCast<RectTransform>();
+					if (srt != null)
+					{
+						srt.anchorMin = new Vector2(w > 350f ? 0.22f : 0.28f, 0.5f);
+						srt.anchorMax = new Vector2(w > 350f ? 0.22f : 0.28f, 0.5f);
+						srt.pivot = new Vector2(0.5f, 0.5f);
+						srt.sizeDelta = new Vector2(48f, 48f);
+						srt.anchoredPosition = Vector2.zero;
+					}
+
+					// Position Icon on Right (Large Feature Icon)
+					var dIcon = icons.Find("Icon")?.TryCast<RectTransform>();
+					if (dIcon != null)
+					{
+						dIcon.anchorMin = new Vector2(w > 350f ? 0.50f : 0.72f, 0.5f);
+						dIcon.anchorMax = new Vector2(w > 350f ? 0.50f : 0.72f, 0.5f);
+						dIcon.pivot = new Vector2(0.5f, 0.5f);
+						dIcon.sizeDelta = new Vector2(w > 350f ? 54f : 50f, w > 350f ? 54f : 50f);
+						dIcon.anchoredPosition = Vector2.zero;
+						var im = dIcon.GetComponent<Image>();
+						if (im != null) im.preserveAspect = true;
+					}
+
+					var secT = icons.Find("Icon_Secondary")?.TryCast<RectTransform>();
+					if (secT != null && secT.gameObject.activeSelf)
+					{
+						secT.anchorMin = new Vector2(w > 350f ? 0.78f : 0.82f, 0.5f);
+						secT.anchorMax = new Vector2(w > 350f ? 0.78f : 0.82f, 0.5f);
+						secT.pivot = new Vector2(0.5f, 0.5f);
+						secT.sizeDelta = new Vector2(46f, 46f);
+						secT.anchoredPosition = Vector2.zero;
+						var im2 = secT.GetComponent<Image>();
+						if (im2 != null) im2.preserveAspect = true;
+					}
+
+					if (label != null)
+					{
+						Ignore(label);
+						label.anchorMin = new Vector2(0f, 0f);
+						label.anchorMax = new Vector2(1f, 0f);
+						label.pivot = new Vector2(0.5f, 0f);
+						label.sizeDelta = new Vector2(-8f, 44f);
+						label.anchoredPosition = new Vector2(0f, 10f);
+
+						var tmp = label.GetComponentInChildren<TMPro.TMP_Text>(true);
+						if (tmp != null)
+						{
+							tmp.alignment = TMPro.TextAlignmentOptions.Center;
+							tmp.fontSizeMax = 20f;
+							tmp.fontSizeMin = 13f;
+							tmp.fontStyle = TMPro.FontStyles.Bold;
+							tmp.enableAutoSizing = true;
+							tmp.enableWordWrapping = false;
+							tmp.overflowMode = TMPro.TextOverflowModes.Ellipsis;
+						}
+					}
+					return;
+				}
 
 				float side = Mathf.Min(h * 0.44f, w * 0.40f);
 				float gap = h * 0.05f;
@@ -350,6 +982,7 @@ namespace VRChatArchiveMod.Core
 			try
 			{
 				if (card == null) return;
+				if (card.Find("VA_StepperHost") != null) return;
 				var tmp = card.GetComponentInChildren<TMPro.TMP_Text>(true);
 				// Same rule as Setup — recomputing the holder naively here would re-arm the
 				// card-as-its-own-label bug on every page rebuild.
@@ -517,7 +1150,50 @@ namespace VRChatArchiveMod.Core
 		{
 			try
 			{
-				SetAura(card, lit ? GlowOn : GlowOff);   // always on; only the colour says which
+				var statusT = card.Find("Icons/Icon_Status");
+				bool hasDual = statusT != null && statusT.gameObject.activeSelf;
+
+				if (hasDual)
+				{
+					var simg = statusT.GetComponent<Image>();
+					if (simg != null)
+					{
+						// When active: X is gray. When inactive: X is bright white. NO checkmark!
+						simg.sprite = CrossSprite();
+						simg.color = lit ? IconDimmed : Color.white;
+					}
+
+					var iconT = card.Find("Icons/Icon");
+					var img = iconT != null ? iconT.GetComponent<Image>() : null;
+					if (img != null)
+					{
+						// When active: Logo is bright white. When inactive: Logo is gray.
+						img.color = lit ? Color.white : IconDimmed;
+					}
+
+					var secT = card.Find("Icons/Icon_Secondary");
+					var secImg = secT != null ? secT.GetComponent<Image>() : null;
+					if (secImg != null)
+					{
+						secImg.color = lit ? Color.white : IconDimmed;
+					}
+
+					var bg = card.Find("Background")?.GetComponent<Image>();
+					if (bg != null) bg.color = lit ? On : Bg;
+
+					SetRim(card, lit ? BorderOn : BorderOff);
+
+					var glow = card.Find(GlowName);
+					if (glow != null) glow.gameObject.SetActive(lit);
+
+					var tmp = card.GetComponentInChildren<TMPro.TMP_Text>(true);
+					if (tmp != null) tmp.color = Color.white;
+					return;
+				}
+
+				SetRim(card, BorderOff);
+				var glowOld = card.Find(GlowName);
+				if (glowOld != null) glowOld.gameObject.SetActive(false);
 
 				// Under keepStyle the game (or MenuThemeModule) owns the Background colour and Setup
 				// gave the Button a neutral WHITE tint for hover/press; overwriting that ColorBlock
@@ -527,10 +1203,10 @@ namespace VRChatArchiveMod.Core
 
 				var btn = card.GetComponent<Button>();
 				if (btn != null) btn.colors = Tint(lit ? On : Bg);
-				var bg = card.Find("Background")?.GetComponent<Image>();
-				if (bg != null) bg.color = lit ? On : Bg;
-				var tmp = card.GetComponentInChildren<TMPro.TMP_Text>(true);
-				if (tmp != null) tmp.color = Color.white;
+				var bgOld = card.Find("Background")?.GetComponent<Image>();
+				if (bgOld != null) bgOld.color = lit ? On : Bg;
+				var tmpOld = card.GetComponentInChildren<TMPro.TMP_Text>(true);
+				if (tmpOld != null) tmpOld.color = Color.white;
 			}
 			catch { }
 		}
@@ -643,7 +1319,18 @@ namespace VRChatArchiveMod.Core
 				if (sp == null) return;
 
 				img.sprite = sp;
-				img.color = Color.white;
+				var statusT = card.Find("Icons/Icon_Status");
+				bool hasDual = statusT != null && statusT.gameObject.activeSelf;
+				if (hasDual)
+				{
+					var simg = statusT.GetComponent<Image>();
+					bool isLit = simg != null && simg.color != Color.white;
+					img.color = isLit ? Color.white : IconDimmed;
+				}
+				else
+				{
+					img.color = Color.white;
+				}
 				img.type = Image.Type.Simple;
 				img.preserveAspect = true;
 				if (!iconT.gameObject.activeSelf) iconT.gameObject.SetActive(true);
@@ -688,12 +1375,55 @@ namespace VRChatArchiveMod.Core
 					break;
 				}
 				img.sprite = sp;
+				var statusT = card.Find("Icons/Icon_Status");
+				bool hasDual = statusT != null && statusT.gameObject.activeSelf;
+				if (hasDual)
+				{
+					var simg = statusT.GetComponent<Image>();
+					bool isLit = simg != null && simg.color != Color.white;
+					img.color = isLit ? Color.white : IconDimmed;
+				}
+				else
+				{
+					img.color = IconTint;
+				}
 				img.type = Image.Type.Simple;
 				img.preserveAspect = true;
-				img.color = IconTint;
 				if (!iconT.gameObject.activeSelf) iconT.gameObject.SetActive(true);
 			}
 			catch (Exception e) { VRChatArchiveModPlugin.Logger.LogWarning($"[MenuCard] SetIcon(sprite) failed: {e.Message}"); }
+		}
+
+		public static void SetSecondaryIcon(Transform card, Sprite sp)
+		{
+			try
+			{
+				if (card == null || sp == null) return;
+				var icons = card.Find("Icons");
+				if (icons == null) return;
+				var secT = icons.Find("Icon_Secondary");
+				if (secT == null)
+				{
+					var go = new GameObject("Icon_Secondary", Il2CppInterop.Runtime.Il2CppType.Of<RectTransform>());
+					secT = go.transform;
+					secT.SetParent(icons, false);
+					var img = go.AddComponent<Image>();
+					img.raycastTarget = false;
+					img.preserveAspect = true;
+				}
+				var sImg = secT.GetComponent<Image>();
+				if (sImg != null)
+				{
+					sImg.sprite = sp;
+					sImg.type = Image.Type.Simple;
+					sImg.preserveAspect = true;
+					sImg.color = IconDimmed;
+				}
+				secT.gameObject.SetActive(true);
+				var tmp = card.GetComponentInChildren<TMPro.TMP_Text>(true);
+				LayoutCard(card, LabelRect(card, tmp));
+			}
+			catch (Exception e) { VRChatArchiveModPlugin.Logger.LogWarning($"[MenuCard] SetSecondaryIcon failed: {e.Message}"); }
 		}
 
 		// ICON COLOUR. The Launchpad icons the tiles are cloned from are tinted teal by VRChat's

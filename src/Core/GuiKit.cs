@@ -43,19 +43,30 @@ namespace VRChatArchiveMod.Core
 		private static GUIStyle _boxLabel, _slider;
 		// Public because the overlay draws its own headers and labels and should look like the rest
 		// of the kit rather than carry a second, slightly-different copy of the same style.
-		public static GUIStyle BoxLabel => _boxLabel ??= new GUIStyle(GUI.skin.label)
+		// Built from GuiCompat.BaseStyle(), not from GUI.skin.label: reading the skin is a fatal
+		// access violation on this build (see GuiCompat.BaseStyle). Written as statements rather
+		// than an object initialiser so a dead setter cannot abort the whole construction.
+		public static GUIStyle BoxLabel => _boxLabel ??= MakeBoxLabel();
+		private static GUIStyle SliderLabel => _slider ??= MakeSliderLabel();
+
+		private static GUIStyle MakeBoxLabel()
 		{
-			alignment = TextAnchor.MiddleCenter,
-			fontStyle = FontStyle.Bold,
-			richText = true,
-			fontSize = 12
-		};
-		private static GUIStyle SliderLabel => _slider ??= new GUIStyle(GUI.skin.label)
+			GUIStyle s = GuiCompat.BaseStyle() ?? new GUIStyle();
+			try { s.alignment = TextAnchor.MiddleCenter; } catch { }
+			try { s.fontStyle = FontStyle.Bold; } catch { }
+			try { s.richText = true; } catch { }
+			try { s.fontSize = 12; } catch { }
+			return s;
+		}
+
+		private static GUIStyle MakeSliderLabel()
 		{
-			richText = true,
-			fontStyle = FontStyle.Bold,
-			fontSize = 11
-		};
+			GUIStyle s = GuiCompat.BaseStyle() ?? new GUIStyle();
+			try { s.richText = true; } catch { }
+			try { s.fontStyle = FontStyle.Bold; } catch { }
+			try { s.fontSize = 11; } catch { }
+			return s;
+		}
 
 		// --- primitives ---
 
@@ -273,7 +284,7 @@ namespace VRChatArchiveMod.Core
 		public static void Brackets(Rect r, float offset, float length, float thick)
 		{
 			float xMin = r.x - offset, xMax = r.xMax + offset, yMin = r.y - offset, yMax = r.yMax + offset;
-			float a = Mathf.PingPong(Time.time * 2f, 0.4f) + 0.6f;
+			float a = Mathf.PingPong(VaClock.Now * 2f, 0.4f) + 0.6f;
 			for (int i = 1; i <= 10; i++)
 			{
 				GUI.color = new Color(Accent.r, Accent.g, Accent.b, 0.04f / i * a);

@@ -60,3 +60,14 @@ DEPLOY.bat
 # it compiles without the media in ressources/.
 # ---------------------------------------------------------------------------
 *.local.cs
+
+# ---------------------------------------------------------------------------
+# Native (C++) engine build output — cpp/native. Only source is tracked.
+# ---------------------------------------------------------------------------
+x64/
+*.tlog
+*.lastbuildstate
+*.ipch
+*.ilk
+*.exp
+*.lib

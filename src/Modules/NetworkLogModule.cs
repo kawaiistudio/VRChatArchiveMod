@@ -71,18 +71,43 @@ namespace VRChatArchiveMod.Modules
 		public static string HookInfo = "not attached";
 
 		private static StreamWriter _sink;
+		// Last asserted state of NetworkLogToFile, so the sink can be opened/closed on the edge
+		// instead of only once at startup. Primed in OnInitialize to match OpenSinkIfWanted().
+		private static bool _sinkWanted;
 
 		public override void OnInitialize()
 		{
 			InstallHook();
 			OpenSinkIfWanted();
+			// Record what was just asserted so the runtime edge test in OnUpdate does not immediately
+			// re-open (or close) a sink that is already in the right state.
+			try { _sinkWanted = ModConfig.NetworkLogToFile.Value || DiagnosticsModule.Debug; } catch { }
 		}
 
 		public override void OnUpdate()
 		{
 			try
 			{
-				float now = Time.realtimeSinceStartup;
+				// THE FILE SWITCH ACTS AT RUNTIME (2026-09-13). OpenSinkIfWanted() was only ever called
+				// from OnInitialize, and WriteSink only tests `_sink == null`: turning NetworkLogToFile
+				// ON did nothing until the game was restarted, and turning it OFF kept the file open
+				// and kept writing to it. Both edges are honoured here, once, on the second tick below.
+				bool wantFile = false;
+				try { wantFile = ModConfig.NetworkLogToFile.Value || DiagnosticsModule.Debug; } catch { }
+				if (wantFile != _sinkWanted)
+				{
+					_sinkWanted = wantFile;
+					if (wantFile)
+					{
+						OpenSinkIfWanted();
+					}
+					else
+					{
+						lock (Gate) { try { _sink?.Flush(); _sink?.Dispose(); } catch { } _sink = null; }
+					}
+				}
+
+				float now = VaClock.Now;
 				if (now - _rateAt >= 1f)
 				{
 					_rateAt = now;
@@ -134,9 +159,19 @@ namespace VRChatArchiveMod.Modules
 				var post = new HarmonyMethod(typeof(NetworkLogModule)
 					.GetMethod(nameof(OnEventPostfix), BindingFlags.Static | BindingFlags.NonPublic));
 				VRChatArchiveModPlugin.HarmonyInstance.Patch(target, postfix: post);
+				// The PREFIX only brackets WATCHED codes (entry stamp + payload capture before VRChat's
+				// handler); it never returns false, so nothing is ever dropped by this module.
+				try
+				{
+					var pre = new HarmonyMethod(typeof(NetworkLogModule)
+						.GetMethod(nameof(OnEventPrefix), BindingFlags.Static | BindingFlags.NonPublic));
+					VRChatArchiveModPlugin.HarmonyInstance.Patch(target, prefix: pre);
+					_prefixArmed = true;
+				}
+				catch (Exception e) { VRChatArchiveModPlugin.Logger.LogWarning("[NetworkLog] timing prefix not installed (handler duration unavailable): " + e.Message); }
 
 				_hooked = true;
-				HookInfo = "postfix on VRCNetworkingClient.OnEvent";
+				HookInfo = "postfix on VRCNetworkingClient.OnEvent" + (_prefixArmed ? " (+ timing prefix)" : "");
 				VRChatArchiveModPlugin.Logger.LogInfo("[NetworkLog] armed — listening on VRCNetworkingClient.OnEvent (receive only).");
 			}
 			catch (Exception e)
@@ -152,8 +187,22 @@ namespace VRChatArchiveMod.Modules
 		{
 			try
 			{
-				if (!ModConfig.NetworkLogEnabled.Value) return;
 				if (__0 == null) return;
+
+				// NOTHING WANTED, NOTHING READ (2026-09-13). This runs for EVERY inbound Photon event
+				// — hundreds a second. The enabled test used to sit ~25 lines below, AFTER two
+				// reflection member reads and a lock, so a logger that was switched OFF still paid
+				// that cost on the whole receive path. Watched codes (event 33, for the block
+				// observer) are captured even with logging off, so the fast-out has to consider both;
+				// when neither wants anything, there is genuinely nothing to do.
+				bool logOn = false;
+				try { logOn = ModConfig.NetworkLogEnabled.Value; } catch { }
+				if (!logOn)
+				{
+					bool anyWatched;
+					lock (Gate) anyWatched = _watchCodes.Count > 0;
+					if (!anyWatched) return;
+				}
 
 				// Snapshot NOW: Photon reuses the EventData instance, so keeping the object or its
 				// payload past this method would log whatever the NEXT event overwrites it with.
@@ -161,6 +210,31 @@ namespace VRChatArchiveMod.Modules
 				int sender = -1;
 				try { code = (byte)GetMember(__0, "Code"); } catch { }
 				try { sender = (int)GetMember(__0, "Sender"); } catch { }
+
+				// WATCHED CODES (event 33 = moderation / instance control) are captured WITH their
+				// decoded payload, even when logging is off, because the block observer asked for them
+				// specifically. Rare by nature, so decoding them here costs nothing in steady state.
+				bool watched = false;
+				lock (Gate) watched = _watchCodes.Count > 0 && _watchCodes.Contains(code);
+				if (watched)
+				{
+					if (_prefixArmed && _inWatched == code)
+					{
+						// Captured in the prefix; this is the EXIT stamp of VRChat's handler.
+						double ms = (System.Diagnostics.Stopwatch.GetTimestamp() - _enterTicks) * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+						var lc = _lastCap; if (lc != null) lc.HandlerMs = ms;
+						_inWatched = 0;
+						try { WatchedExit?.Invoke(code, _seq); } catch { }
+					}
+					else
+					{
+						// The prefix did not bracket this one (re-entrant dispatch, or it bailed): capture here and say so.
+						Capture(code, sender, __0);
+						if (_prefixArmed) { try { VRChatArchiveModPlugin.Logger.LogInfo("[NetworkLog] watched event " + code + " reached the postfix without a prefix entry (re-entrant dispatch?) — captured late, no handler timing for it."); } catch { } }
+					}
+				}
+
+				if (!ModConfig.NetworkLogEnabled.Value) return;
 
 				// Shape is sampled only the first few times a code is ever seen: reading the payload
 				// on every event would put reflection on the receive path of a hundreds-per-second
@@ -182,6 +256,28 @@ namespace VRChatArchiveMod.Modules
 				Push(code, sender);
 			}
 			catch { /* a logger must never break the networking it observes */ }
+		}
+
+		// PREFIX (observer): for WATCHED codes only, stamp the entry and capture the payload before
+		// VRChat's handler can consume it. Always lets the original run (void prefix).
+		private static void OnEventPrefix(object __0)
+		{
+			try
+			{
+				if (__0 == null) return;
+				int nWatched; lock (Gate) nWatched = _watchCodes.Count;
+				if (nWatched == 0) return;
+				byte code = 0; int sender = -1;
+				try { code = (byte)GetMember(__0, "Code"); } catch { return; }
+				bool watched; lock (Gate) watched = _watchCodes.Contains(code);
+				if (!watched) return;
+				try { sender = (int)GetMember(__0, "Sender"); } catch { }
+				_enterTicks = System.Diagnostics.Stopwatch.GetTimestamp();
+				_inWatched = code;
+				try { WatchedEnter?.Invoke(code, _seq + 1); } catch { }
+				Capture(code, sender, __0);
+			}
+			catch { }
 		}
 
 		// Code and Sender may be exposed as either a property or a field depending on how the game
@@ -229,7 +325,7 @@ namespace VRChatArchiveMod.Modules
 		{
 			string clock = DateTime.Now.ToString("HH:mm:ss");
 			float t = 0f;
-			try { t = Time.realtimeSinceStartup; } catch { }
+			try { t = VaClock.Now; } catch { }
 			lock (Gate)
 			{
 				CodeCounts.TryGetValue(code, out int c);
@@ -381,6 +477,160 @@ namespace VRChatArchiveMod.Modules
 		// Describes what an event CARRIES, read from the snapshot inside the postfix and never
 		// retained. Read-only: it looks at the payload, it does not decode, replay or forward it.
 		private static PropertyInfo _pCustom, _pParams, _pParamCount;
+		// ---------------------------------------------------------------- payload capture (watched codes)
+		//
+		// EVENT 33 = MODERATION / INSTANCE CONTROL (per the community event-code list; unverifiable
+		// statically because this build ships no event-code enum, so it is captured empirically). The
+		// block observer registers code 33 here; every 33 that arrives is decoded to a string and kept
+		// in a small ring the observer reads. READ-ONLY: the event is only inspected, never altered or
+		// dropped — this postfix runs AFTER VRChat has already handled it.
+		public sealed class Cap
+		{
+			public float Time; public string Clock; public byte Code; public int Sender; public string Payload;
+			public int Seq;                 // 1-based capture number
+			public long Ticks;              // Stopwatch.GetTimestamp() at arrival (prefix = before VRChat's handler ran)
+			public int Frame;               // Unity frame of arrival (-1 off the main thread)
+			public double HandlerMs = -1;   // how long VRChat's OnEvent took for this event (postfix - prefix); -1 = unknown
+		}
+		private static readonly List<Cap> Caps = new List<Cap>(64);
+		private static readonly HashSet<byte> _watchCodes = new HashSet<byte>();
+		private const int MaxCaps = 64;
+
+		// Watched-code handler bracketing (3.9.77). The prefix stamps the entry and captures the payload
+		// BEFORE VRChat's own handler runs; the postfix stamps the exit. Between the two, InsideWatchedCode
+		// is the code being handled, so another observer can tell "done synchronously inside OnEvent(33)"
+		// from "done frames later". Both callbacks are observers registered by Event33TraceModule.
+		public static Action<byte, int> WatchedEnter, WatchedExit;
+		private static byte _inWatched; private static long _enterTicks; private static int _seq; private static bool _prefixArmed; private static Cap _lastCap;
+		public static byte InsideWatchedCode => _inWatched;
+		public static int LastSeq => _seq;
+
+		/// <summary>Start decoding+keeping the payload of this event code (e.g. 33). Idempotent.</summary>
+		public static void WatchCode(byte code) { lock (Gate) _watchCodes.Add(code); }
+		/// <summary>Stop capturing and forget what was captured.</summary>
+		public static void UnwatchCodes() { lock (Gate) { _watchCodes.Clear(); Caps.Clear(); } }
+		/// <summary>Captured watched-code events at or after <paramref name="from"/> (realtimeSinceStartup).</summary>
+		public static List<Cap> CapturesSince(float from)
+		{
+			lock (Gate) { var o = new List<Cap>(); for (int i = 0; i < Caps.Count; i++) if (Caps[i].Time >= from) o.Add(Caps[i]); return o; }
+		}
+
+		private static System.Reflection.PropertyInfo _pCustomCap;
+		private static void Capture(byte code, int sender, object ev)
+		{
+			string payload;
+			try { payload = DecodeCapture(ev); }
+			catch (Exception e) { payload = "decode unavailable (" + e.GetType().Name + ")"; }
+			int frame = -1; try { frame = Time.frameCount; } catch { }
+			long ticks = (_inWatched == code && _enterTicks != 0) ? _enterTicks : System.Diagnostics.Stopwatch.GetTimestamp();
+			var c = new Cap { Time = VaClock.Now, Clock = DateTime.Now.ToString("HH:mm:ss.fff"), Code = code, Sender = sender, Payload = payload, Ticks = ticks, Frame = frame };
+			lock (Gate) { c.Seq = ++_seq; Caps.Add(c); if (Caps.Count > MaxCaps) Caps.RemoveAt(0); }
+			_lastCap = c;
+			try { VRChatArchiveModPlugin.Logger.LogInfo("[NetworkLog] captured event " + code + " (watched) from actor " + sender + ": " + payload); } catch { }
+
+			// THE BLOCK LISTS COME FROM HERE, AND FROM NOWHERE ELSE.
+			//
+			// Event 33 subtype 21 is the server stating, on entering an instance, who has blocked whom.
+			// This capture already decodes it safely -- it has been printing correct payloads all session
+			// without a single incident, and it does NOT deep-enumerate il2cpp collections, which this mod
+			// documents as able to crash.
+			//
+			// The alternative was the BlockDebug observer, and that cost the owner FOUR crashes in one
+			// afternoon (0xc0000005 in coreclr, fault offset 0x0) because its per-frame WatchName snapshot
+			// walks a player class whose members cannot be placed on 1903. Feeding the marker from the
+			// logger instead means the feature needs no debug switch, no hooks on VRChat methods, and no
+			// off-main-thread object reads.
+			if (code == 33)
+			{
+				try { Core.Event33Moderation.Consume(payload); } catch { }
+			}
+		}
+
+		// The custom data of a watched event, decoded WITHOUT deep il2cpp enumeration (which this mod
+		// documents as able to crash). A byte[] is hex-dumped and its printable ASCII runs extracted —
+		// which is where a usr_/wrld_ id would show if the moderation packet carries one; anything else
+		// is reported by type and Count only.
+		private static string DecodeCapture(object ev)
+		{
+			var sb = new StringBuilder();
+			try
+			{
+				_pCustomCap ??= ev.GetType().GetProperty("CustomData");
+				object data = _pCustomCap?.GetValue(ev);
+				if (data == null) { sb.Append("CustomData=null"); }
+				else
+				{
+					int len = ByteLength(data);
+					if (len >= 0)
+					{
+						sb.Append("bytes[").Append(len).Append("] ");
+						HexAscii(data, len, sb);
+					}
+					else
+					{
+						sb.Append("type=").Append(Il2CppTypeName(data));
+						// The dictionary is NOT enumerated. Reading it.Value / TryCast builds a managed
+						// wrapper by calling il2cpp_object_get_class on each value, and that is an
+						// UNCATCHABLE access violation when a value pointer is not what the object pool
+						// expects — it crashed VRChat on the very first event 33 (3.9.73). Only the count
+						// is taken, by managed reflection, which constructs no wrapper.
+						try { var cp = data.GetType().GetProperty("Count"); if (cp?.GetValue(data) is int n) sb.Append(" count=").Append(n); } catch { }
+						// 3.9.77: guarded RAW read of the dictionary's entries (Core/Event33Payload). No wrapper
+						// is built for any key or value, so the 3.9.73 fault cannot recur on this path.
+						try
+						{
+							bool decode = false;
+							try { decode = ModConfig.BlockDebugDecodeEvent33 != null && ModConfig.BlockDebugDecodeEvent33.Value; } catch { }
+							var ob = data as Il2CppInterop.Runtime.InteropTypes.Il2CppObjectBase;
+							if (decode && ob != null) sb.Append(' ').Append(Core.Event33Payload.Describe(ob.Pointer));
+						}
+						catch (Exception e) { sb.Append(" decode unavailable (").Append(e.GetType().Name).Append(')'); }
+					}
+				}
+			}
+			catch (Exception e) { sb.Append("CustomData unavailable (").Append(e.GetType().Name).Append(')'); }
+			try
+			{
+				_pParams ??= ev.GetType().GetProperty("Parameters");
+				object pars = _pParams?.GetValue(ev);
+				if (pars != null)
+				{
+					_pParamCount ??= pars.GetType().GetProperty("Count");
+					if (_pParamCount?.GetValue(pars) is int pn && pn > 0) sb.Append(" | params(").Append(pn).Append(')');
+				}
+			}
+			catch { }
+			return sb.ToString();
+		}
+
+		// Hex + printable-ASCII of the first bytes of an il2cpp byte[], plus any ASCII run >=4 chars
+		// (this is what surfaces a usr_/wrld_ id inside a serialized moderation blob). Bounded read.
+		private static void HexAscii(object data, int len, StringBuilder sb)
+		{
+			try
+			{
+				var arr = (data as Il2CppInterop.Runtime.InteropTypes.Il2CppObjectBase)?
+					.TryCast<Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppStructArray<byte>>();
+				if (arr == null) { sb.Append("(not readable as byte[])"); return; }
+				int n = Math.Min(len, 96);
+				var hex = new StringBuilder(n * 3);
+				var run = new StringBuilder();
+				var runs = new List<string>();
+				for (int i = 0; i < n; i++)
+				{
+					byte b = arr[i];
+					hex.Append(b.ToString("X2")).Append(' ');
+					if (b >= 0x20 && b < 0x7F) { run.Append((char)b); }
+					else { if (run.Length >= 4) runs.Add(run.ToString()); run.Clear(); }
+				}
+				if (run.Length >= 4) runs.Add(run.ToString());
+				sb.Append("hex=").Append(hex.ToString().TrimEnd());
+				if (len > n) sb.Append(" …(+").Append(len - n).Append(" more)");
+				if (runs.Count > 0) sb.Append(" | ascii: ").Append(string.Join(" · ", runs.ToArray()));
+			}
+			catch (Exception e) { sb.Append("(hex unavailable: ").Append(e.GetType().Name).Append(')'); }
+		}
+
 		private static string DescribePayload(object ev)
 		{
 			try

@@ -41,7 +41,7 @@ namespace VRChatArchiveMod.Core
 			// menu being torn down and rebuilt.
 			if (c.T != null) return c.T;
 
-			float now = Time.realtimeSinceStartup;
+			float now = VaClock.Now;
 			if (now < c.NextScan) return null;
 			c.NextScan = now + 2f;
 

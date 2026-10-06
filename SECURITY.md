@@ -76,7 +76,7 @@ something they do not control. Concretely:
 
 ### What these protections are not
 
-`PhotonGuardModule`, `AntiCrashModule`, `AntiBlockModule` and `NsfwFilterModule` are best-effort
+`PhotonGuardModule`, `AntiCrashModule`, `TrueViewModule` and `NsfwFilterModule` are best-effort
 mitigations written against attacks that were actually observed, not a security boundary. This is a
 game mod, not a security product: it runs in-process with your full user privileges, it deliberately
 patches parts of the game at runtime, and it loads a third-party

@@ -131,7 +131,7 @@ namespace VRChatArchiveMod.Modules
 				}
 				if (!Armed || !Active) return;
 
-				float now = Time.realtimeSinceStartup;
+				float now = VaClock.Now;
 				if (now < _nextPoll) return;
 				// Four times a second: fast enough that a message is picked up while its bubble is
 				// still on screen, cheap enough to be one component lookup and one string read.
@@ -246,7 +246,7 @@ namespace VRChatArchiveMod.Modules
 					if (cont != null && NativeGuard.Alive(cont))
 					{
 						Component c = null;
-						try { c = cont.transform.GetComponentInChildren(_bubbleIl2, true); } catch { }
+						try { c = cont.transform.GetComponentInChildrenSafe(_bubbleIl2, true); } catch { }
 						if (c != null && NativeGuard.Alive(c))
 						{
 							_bubble = c;
@@ -267,7 +267,7 @@ namespace VRChatArchiveMod.Modules
 				// EVERY poll for as long as the target has no bubble yet (which is most of the time:
 				// bubbles are made on demand). The cache above covers the found case; this covers the
 				// not-found one, at once per second.
-				float nowR = Time.realtimeSinceStartup;
+				float nowR = VaClock.Now;
 				if (nowR < _nextSearch) return null;
 				_nextSearch = nowR + 3f;   // the container path above is the normal one; this is the net
 

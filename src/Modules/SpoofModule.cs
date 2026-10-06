@@ -74,7 +74,7 @@ namespace VRChatArchiveMod.Modules
 		{
 			try
 			{
-				float now = Time.realtimeSinceStartup;
+				float now = VaClock.Now;
 				if (now < _nextCheck) return;
 				// TEN TIMES A SECOND, not twice. A read of displayName is one il2cpp field access —
 				// far cheaper than the NativeGuard syscalls that made ObjectGravity expensive — so
@@ -97,6 +97,44 @@ namespace VRChatArchiveMod.Modules
 				}
 				if (!Armed) return;
 
+				// FEATURE NOT IN USE: NOTHING TO DO, SO DO NOTHING (2026-09-13).
+				//
+				// Everything below — LocalApi(), NativeGuard.Alive() (a VirtualQuery syscall), the
+				// pointer read, ReadName() — ran ten times a second for every user whether or not a
+				// custom name was set: 68 ms/s in the profiler for a feature most sessions never
+				// touch. With no name wanted AND nothing applied there is nothing to write and
+				// nothing to restore, so the native work is skipped outright.
+				string wantedEarly = "";
+				try { wantedEarly = (ModConfig.UdonNameSpoof.Value ?? "").Trim(); } catch { }
+				if (wantedEarly.Contains("\n") || wantedEarly.Contains("\r"))
+				{
+					var lines = wantedEarly.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
+					wantedEarly = lines.Length > 0 ? lines[0].Trim() : "";
+				}
+				if (wantedEarly.Length > 32)
+				{
+					wantedEarly = wantedEarly.Substring(0, 32).Trim();
+					try { ModConfig.UdonNameSpoof.Value = wantedEarly; } catch { }
+				}
+
+				// If no custom username is wanted: restore real name immediately if needed and go idle
+				if (wantedEarly.Length == 0)
+				{
+					if (Applied.Length > 0 && RealName.Length > 0)
+					{
+						var localApi = PlayerRef.LocalApi();
+						if (localApi != null && NativeGuard.Alive(localApi))
+						{
+							try { localApi.displayName = RealName; } catch { }
+							VRChatArchiveModPlugin.Logger.LogInfo("[Spoof] restored to " + RealName);
+						}
+					}
+					Applied = "";
+					_lastLogged = "";
+					Status = "custom username: off";
+					return;
+				}
+
 				var api = PlayerRef.LocalApi();
 				if (api == null || !NativeGuard.Alive(api)) return;
 
@@ -116,10 +154,9 @@ namespace VRChatArchiveMod.Modules
 				}
 
 				string current;
-				if (!ReadName(ptr, out current)) return;
+				if (!ReadName(ptr, out current, now)) return;
 
-				string wanted = "";
-				try { wanted = (ModConfig.UdonNameSpoof.Value ?? "").Trim(); } catch { }
+				string wanted = wantedEarly;
 
 				// Learn the real name only from a value we did not write, or the restore is a no-op.
 				if (RealName.Length == 0 && current.Length > 0
@@ -129,21 +166,7 @@ namespace VRChatArchiveMod.Modules
 					VRChatArchiveModPlugin.Logger.LogInfo("[Spoof] real display name noted: " + RealName);
 				}
 
-				if (wanted.Length == 0)
-				{
-					if (Applied.Length > 0 && RealName.Length > 0
-						&& string.Equals(current, Applied, StringComparison.Ordinal))
-					{
-						try { api.displayName = RealName; } catch { }
-						VRChatArchiveModPlugin.Logger.LogInfo("[Spoof] restored to " + RealName);
-					}
-					Applied = ""; _lastLogged = "";
-					Status = "custom username: off";
-					return;
-				}
-
-				// STILL OURS: count it and leave. This is the branch that used to be completely
-				// silent, which is why "is it holding?" had no answer.
+				// STILL OURS: count it and leave.
 				if (string.Equals(current, wanted, StringComparison.Ordinal))
 				{
 					Applied = wanted;
@@ -163,7 +186,7 @@ namespace VRChatArchiveMod.Modules
 				// READ IT BACK. The whole point: this line is the difference between believing and
 				// knowing, and it costs one interop read twice a second.
 				string after;
-				if (!ReadName(ptr, out after)) after = "<unreadable>";
+				if (!ReadName(ptr, out after, now)) after = "<unreadable>";
 				bool ok = string.Equals(after, wanted, StringComparison.Ordinal);
 				Applied = ok ? wanted : "";
 				Status = ok ? ("custom username: " + wanted) : "custom username: the write did not stick";
@@ -248,7 +271,9 @@ namespace VRChatArchiveMod.Modules
 			catch { /* a root we could not take is a name that may drift back, never a crash */ }
 		}
 
-		private static bool ReadName(IntPtr apiPtr, out string name)
+		private static float _nextRejectLog;
+
+		private static bool ReadName(IntPtr apiPtr, out string name, float now = 0f)
 		{
 			name = "";
 			if (!_nameFieldTried)
@@ -266,15 +291,16 @@ namespace VRChatArchiveMod.Modules
 			bool ok = Il2CppStr.TryFieldPtr(apiPtr, _nameField, out strPtr)
 				&& Il2CppStr.TryRead(strPtr, out name);
 
-			// Say it out loud when a read is refused — checked on EVERY pass, including the refused
-			// ones, which is the only way this line can ever print. A silent guard that fires
-			// constantly looks exactly like a feature that quietly stopped working.
+			// Throttle reject warning to avoid console spamming and CPU spikes
 			if (Il2CppStr.Rejected != _lastRejected)
 			{
 				_lastRejected = Il2CppStr.Rejected;
-				VRChatArchiveModPlugin.Logger.LogWarning(
-					"[Spoof] refused an unsafe displayName read (" + _lastRejected + " so far). This is the "
-					+ "guard doing its job — that read used to end the process.");
+				if (now >= _nextRejectLog)
+				{
+					_nextRejectLog = now + 5f;
+					VRChatArchiveModPlugin.Logger.LogWarning(
+						"[Spoof] unsafe string read rejected (" + _lastRejected + " total across mod). Guard active.");
+				}
 			}
 			return ok;
 		}

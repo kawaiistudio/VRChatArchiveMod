@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using UnityEngine;
 using UnityEngine.UI;
@@ -83,12 +83,30 @@ namespace VRChatArchiveMod.Modules
 		public static void Invalidate() { _dirty = true; }
 
 		private float _nextScan;
+
+		// ---- the incremental re-assert ------------------------------------------------------
+		// Putting our colours back over EVERY themed text and card, ~3 times a second, is O(n)
+		// il2cpp property crossings on a main menu holding thousands of texts. Measured on build
+		// 1903: MenuTheme = 425 ms/s of a 519 ms/s mod, the game at 8 fps with the menu open --
+		// this module alone was the "lag de fou", not the features it themes.
+		//
+		// Nothing on screen needs that rate. VRChat's StyleEngine repaints a page when it SHOWS
+		// it, which always follows a press, so the full sweep runs around a press (and just after
+		// a rescan, when the target lists are new) and a bounded slice the rest of the time. A
+		// colour VRChat undoes on its own is still corrected, just a second later instead of in
+		// 350 ms -- which nobody can see, because nothing is undoing them while nothing is clicked.
+		private const int IdleSlice = 192;      // items per canvas per tick when idle
+		private const float BusyWindow = 1.25f; // seconds after a press that still sweep in full
+		private readonly int[] _txtCursor = new int[2];
+		private readonly int[] _imgCursor = new int[2];
+		private float _lastScanAt = -99f;
 		private bool _scanFlip;   // alternates the two canvases so one frame never pays for both
 
 		private readonly List<(Graphic G, Color C)> _painted = new List<(Graphic, Color)>();
 		private readonly List<(TMPro.TMP_Text T, Color C)> _texts = new List<(TMPro.TMP_Text, Color)>();
 		private readonly HashSet<int> _seen = new HashSet<int>();
 		private float _next;
+		private float _nextBootstrap;
 
 		public override void OnUpdate()
 		{
@@ -100,7 +118,7 @@ namespace VRChatArchiveMod.Modules
 					return;
 				}
 
-				float now = Time.realtimeSinceStartup;
+				float now = VaClock.Now;
 				if (now < _next) return;
 				_next = now + 0.35f;
 
@@ -119,6 +137,14 @@ namespace VRChatArchiveMod.Modules
 
 		public override void OnSceneLoaded(int buildIndex)
 		{
+			// RESTORE BEFORE FORGETTING (2026-09-13). _texts is the undo ledger: it holds each text's
+			// ORIGINAL colour. Clearing it without restoring left every still-live label painted in
+			// the theme colour with nothing able to undo it — and worse, the next Scan() then recorded
+			// that themed colour AS the original (`if (_seen.Add(id)) _texts.Add((t, t.color));`), so
+			// a later OFF "restored" the theme instead of VRChat's own palette, permanently. The menu
+			// canvas often survives a world change, which is exactly when this bites. RestoreAll()
+			// proves liveness before each write, so it is safe when the canvas really did go.
+			RestoreAll();
 			// Those Graphics belong to a canvas that may have been rebuilt; forget them rather than
 			// hold references we can no longer restore correctly.
 			// Both slots: `_live`/`_targets` only reach the canvas scanned last, and the other
@@ -174,9 +200,27 @@ namespace VRChatArchiveMod.Modules
 
 		private void Repaint()
 		{
-			float now = Time.realtimeSinceStartup;
-			if (_dirty || now >= _nextScan || (_targetsBy[0].Count == 0 && _targetsBy[1].Count == 0))
+			float now = VaClock.Now;
+
+			// THE "NOTHING FOUND YET, KEEP LOOKING" CLAUSE ALMOST KILLED THE FRAME RATE.
+			//
+			// It used to read `_targetsBy[0].Count == 0 && _targetsBy[1].Count == 0`, meant as a
+			// bootstrap: rescan every tick until the first scan finds something. But `_targets` holds
+			// only the IMAGE/card targets -- themed TEXT goes into `_live` -- so on a canvas that has
+			// text and no themed backgrounds (or on the tick right after scanning the wrist menu,
+			// which yields none), BOTH image lists read 0 while `_live` was full. The clause then
+			// forced a complete GetComponentsInChildren sweep of Canvas_MainMenu THREE TIMES A SECOND.
+			// Measured: MenuTheme=700 ms/s, the whole frame, with the menu open.
+			//
+			// Two fixes: the emptiness test now counts text as well, so a themed-text canvas is not
+			// "empty"; and the bootstrap rescan is rate-limited to the scan cadence's own floor rather
+			// than firing every tick, so even a genuinely bare menu cannot spin here.
+			bool nothingThemed = _targetsBy[0].Count == 0 && _targetsBy[1].Count == 0
+				&& _liveBy[0].Count == 0 && _liveBy[1].Count == 0;
+			bool bootstrap = nothingThemed && now >= _nextBootstrap;
+			if (_dirty || now >= _nextScan || bootstrap)
 			{
+				if (bootstrap) _nextBootstrap = now + 1f;
 				// ONE CANVAS PER SCAN, AND LESS OFTEN.
 				//
 				// The spike hunter caught this module producing 143 ms frames. Both canvases were
@@ -191,6 +235,7 @@ namespace VRChatArchiveMod.Modules
 				// change between one three-second window and the next anyway.
 				_dirty = false;
 				_nextScan = now + 5f;
+				_lastScanAt = now;
 				_scanFlip = !_scanFlip;
 				_slot = _scanFlip ? 0 : 1;
 				// Only this canvas's own findings are replaced; the other canvas keeps its colours.
@@ -212,20 +257,29 @@ namespace VRChatArchiveMod.Modules
 			// current one, so it re-asserted the same texts twice (and walked past the end of the
 			// shorter list, swallowed by the catch) while the other canvas's text silently went
 			// back to stock between its scans.
+			// Full sweep only when the menu can actually have been restyled; a slice otherwise.
+			bool full = (now - Core.UiClick.LastPressAt) < BusyWindow || (now - _lastScanAt) < BusyWindow;
+
+			// Hoisted: TextCol() parses a hex string, and it was being called once PER TEXT.
+			var want = TextCol();
 			for (int canvas = 0; canvas < 2; canvas++)
 			{
 				var live = _liveBy[canvas];
-				for (int i = 0; i < live.Count; i++)
+				int n = live.Count;
+				if (n == 0) { _txtCursor[canvas] = 0; continue; }
+				int take = full || n <= IdleSlice ? n : IdleSlice;
+				int start = full ? 0 : _txtCursor[canvas] % n;
+				for (int k = 0; k < take; k++)
 				{
 					try
 					{
-						var t = live[i];
+						var t = live[(start + k) % n];
 						if (t == null) continue;
-						var tc = TextCol();
-						if (t.color != tc) t.color = tc;
+						if (t.color != want) t.color = want;
 					}
 					catch { }
 				}
+				_txtCursor[canvas] = (start + take) % n;
 			}
 
 			// The cheap pass: no searching, just putting the colours back where VRChat may have
@@ -234,9 +288,13 @@ namespace VRChatArchiveMod.Modules
 			for (int canvas = 0; canvas < 2; canvas++)
 			{
 				var targets = _targetsBy[canvas];
-				for (int i = 0; i < targets.Count; i++)
+				int n = targets.Count;
+				if (n == 0) { _imgCursor[canvas] = 0; continue; }
+				int take = full || n <= IdleSlice ? n : IdleSlice;
+				int start = full ? 0 : _imgCursor[canvas] % n;
+				for (int k = 0; k < take; k++)
 				{
-					var t = targets[i];
+					var t = targets[(start + k) % n];
 					try
 					{
 						if (t.Img == null) continue;
@@ -260,6 +318,7 @@ namespace VRChatArchiveMod.Modules
 					}
 					catch { }
 				}
+				_imgCursor[canvas] = (start + take) % n;
 			}
 		}
 
@@ -328,15 +387,20 @@ namespace VRChatArchiveMod.Modules
 							// times a second from outside fights all three. Chat became untypeable
 							// the day this module started covering the main menu, which is where
 							// VRChat's text inputs live.
-							if (IsEditable(t)) continue;
+							// ONCE PER TEXT, NOT ONCE PER SCAN. IsEditable walks four ancestors calling
+							// GetComponent twice at each -- eight interop calls per text, every scan, for
+							// an answer that cannot change: a label does not become an input field. A text
+							// already in _seen passed both filters when it was first met.
+							int id = t.GetInstanceID();
+							bool known = _seen.Contains(id);
+							if (!known && IsEditable(t)) continue;
 
 							// NEVER the Archive buttons' labels. ArchiveFavButtonModule owns those
 							// (white text on flat violet); painting them violet here is exactly why
 							// "Remove from Archive" came out violet-on-dark instead of clean white.
-							if (IsOurButton(t.transform)) continue;
+							if (!known && IsOurButton(t.transform)) continue;
 
-							int id = t.GetInstanceID();
-							if (_seen.Add(id)) _texts.Add((t, t.color));   // remember how to undo it
+							if (!known) { _seen.Add(id); _texts.Add((t, t.color)); }   // how to undo it
 							t.color = TextCol();
 							Diagnose(t);
 							_live.Add(t);
@@ -455,6 +519,12 @@ namespace VRChatArchiveMod.Modules
 				{
 					var ex = existing.GetComponent<UnityEngine.UI.Image>();
 					if (ex != null) ex.color = rim;
+					// RE-ADOPT IT (2026-09-13). This path re-uses a rim found in the scene but used to
+					// return without registering it, so any rim that outlived a _glows reset — a scene
+					// load, a rebuild — was ours to see and nobody's to destroy: RestoreAll() walks
+					// _glows alone, so those rims stayed on the menu with the theme switched off.
+					// Guarded against double-add for the common case where it is already tracked.
+					try { var g = existing.gameObject; if (g != null && !_glows.Contains(g)) _glows.Add(g); } catch { }
 					return;
 				}
 
@@ -487,7 +557,9 @@ namespace VRChatArchiveMod.Modules
 			try
 			{
 				var g = card.parent;
-				return g != null && (g.name ?? "") == "Buttons_Archive";
+				if (g == null) return false;
+				string n = g.name ?? "";
+				return n == "Buttons_Archive" || n == "Buttons_ArchivesTools" || n == "Buttons_ArchiveTools";
 			}
 			catch { return false; }
 		}

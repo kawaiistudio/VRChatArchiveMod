@@ -34,12 +34,28 @@ namespace VRChatArchiveMod.Modules
 		// The impulse, in metres/second of upward velocity, read live from config so the slider takes
 		// effect without a restart. A normal VRChat jump is ~3; the default here is a strong-but-sane
 		// hop, clamped so a stray value cannot fling you out of the world.
-		private static float ConfiguredForce
+		public static float ConfiguredForce
 		{
 			get
 			{
-				try { return Mathf.Clamp(ModConfig.ForceJumpForce.Value, 1f, 50f); }
+				try
+				{
+					float val = ModConfig.JumpImpulse != null && ModConfig.JumpImpulse.Value > 0f
+						? ModConfig.JumpImpulse.Value
+						: (ModConfig.ForceJumpForce != null ? ModConfig.ForceJumpForce.Value : 8f);
+					return Mathf.Clamp(val, 1f, 50f);
+				}
 				catch { return 8f; }
+			}
+			set
+			{
+				try
+				{
+					float clamped = Mathf.Clamp(value, 1f, 50f);
+					if (ModConfig.JumpImpulse != null) ModConfig.JumpImpulse.Value = clamped;
+					if (ModConfig.ForceJumpForce != null) ModConfig.ForceJumpForce.Value = clamped;
+				}
+				catch { }
 			}
 		}
 
@@ -54,7 +70,8 @@ namespace VRChatArchiveMod.Modules
 				// forbid jumping is overridden on the next frame — this is what lets you jump where the
 				// world blocks it. VRChat still only jumps you when grounded, so this is a jump, not a
 				// flight. One il2cpp setter per frame, negligible.
-				if (Active)
+				bool shouldHold = Active || (ModConfig.JumpMod != null && ModConfig.JumpMod.Value);
+				if (shouldHold)
 				{
 					var api = PlayerRef.LocalApi();
 					if (api != null)
@@ -77,21 +94,23 @@ namespace VRChatArchiveMod.Modules
 
 				if (!Active)
 				{
-					// Capture the world's own jump ONCE, before we start overwriting it — reading it
-					// afterwards would only ever read our own value back.
 					try { _origJump = api.GetJumpImpulse(); _captured = true; }
 					catch { _captured = false; }
 					try { api.SetJumpImpulse(ConfiguredForce); } catch { }
 					Active = true;
+					if (ModConfig.JumpMod != null) ModConfig.JumpMod.Value = true;
 					Status = "on — you can jump at " + ConfiguredForce.ToString("0.#")
 						+ " m/s, even where the world blocks it";
+					Toast.Show($"Force Jump: ON ({ConfiguredForce:0.#} m/s)");
 					VRChatArchiveModPlugin.Logger.LogInfo($"[ForceJump] ON — impulse {ConfiguredForce:0.#}.");
 				}
 				else
 				{
 					Active = false;
+					if (ModConfig.JumpMod != null) ModConfig.JumpMod.Value = false;
 					if (_captured) { try { api.SetJumpImpulse(_origJump); } catch { } }
 					Status = "off — the world's own jump restored";
+					Toast.Show("Force Jump: OFF");
 					VRChatArchiveModPlugin.Logger.LogInfo("[ForceJump] OFF.");
 				}
 			}
@@ -119,6 +138,18 @@ namespace VRChatArchiveMod.Modules
 				return true;
 			}
 			catch (Exception e) { Status = "failed: " + e.Message; return false; }
+		}
+
+		public static void Deactivate()
+		{
+			if (!Active) return;
+			Active = false;
+			try
+			{
+				var api = PlayerRef.LocalApi();
+				if (api != null && _captured) api.SetJumpImpulse(_origJump);
+			}
+			catch { }
 		}
 
 		public override void OnSceneLoaded(int buildIndex)

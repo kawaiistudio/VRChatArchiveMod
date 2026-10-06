@@ -1,0 +1,50 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- Rebuild of VRChatStructFix from the ilspycmd decompilation of the shipped DLL
+       (the original sources were lost with an old session scratchpad, 2026-09-16).
+       Only the struct field offsets in the three handlers were changed, to match the
+       Il2CppClass / MethodInfo layout of VRChat build 1903, then again on 2026-10-04 for
+       build 25686233 (Unity 6): MethodInfo.flags is the u16 at 0x4C, not 0x4E -- see the
+       comment in the source and docs/UNITY6-PORT.md.
+       Point GameDir at a modded VRChat folder: -p:GameDir="<folder>" or VRCHAT_GAME_DIR. -->
+
+  <PropertyGroup>
+    <TargetFramework>net6.0</TargetFramework>
+    <AssemblyName>VRChatStructFix</AssemblyName>
+    <RootNamespace>VRChatStructFix</RootNamespace>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <LangVersion>latest</LangVersion>
+    <Nullable>disable</Nullable>
+    <!-- The decompiler emits constructs the compiler grumbles about; none affect behaviour. -->
+    <NoWarn>CS0108;CS0114;CS0169;CS0649;CS8509;CS0162;CS0219;CS1591;CS8632</NoWarn>
+    <DebugType>none</DebugType>
+    <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
+    <GenerateTargetFrameworkAttribute>false</GenerateTargetFrameworkAttribute>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+    <GameDir Condition="'$(GameDir)' == ''">$(VRCHAT_GAME_DIR)</GameDir>
+  </PropertyGroup>
+
+  <Target Name="CheckBepInEx" BeforeTargets="BeforeBuild">
+    <Error Condition="!Exists('$(GameDir)\BepInEx\core')"
+           Text="BepInEx core not found under '$(GameDir)'. Build with -p:GameDir=&quot;&lt;your modded VRChat folder&gt;&quot;." />
+  </Target>
+
+  <ItemGroup>
+    <Compile Include="VRChatStructFix.decompiled.cs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Reference Include="BepInEx.Core"><HintPath>$(GameDir)\BepInEx\core\BepInEx.Core.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="BepInEx.Preloader.Core"><HintPath>$(GameDir)\BepInEx\core\BepInEx.Preloader.Core.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="BepInEx.Unity.IL2CPP"><HintPath>$(GameDir)\BepInEx\core\BepInEx.Unity.IL2CPP.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="BepInEx.Unity.Common"><HintPath>$(GameDir)\BepInEx\core\BepInEx.Unity.Common.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="Il2CppInterop.Runtime"><HintPath>$(GameDir)\BepInEx\core\Il2CppInterop.Runtime.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="Il2CppInterop.Common"><HintPath>$(GameDir)\BepInEx\core\Il2CppInterop.Common.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="Mono.Cecil"><HintPath>$(GameDir)\BepInEx\core\Mono.Cecil.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="MonoMod.Utils"><HintPath>$(GameDir)\BepInEx\core\MonoMod.Utils.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="0Harmony"><HintPath>$(GameDir)\BepInEx\core\0Harmony.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="SemanticVersioning"><HintPath>$(GameDir)\BepInEx\core\SemanticVersioning.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="AsmResolver.DotNet"><HintPath>$(GameDir)\BepInEx\core\AsmResolver.DotNet.dll</HintPath><Private>false</Private></Reference>
+  </ItemGroup>
+
+</Project>

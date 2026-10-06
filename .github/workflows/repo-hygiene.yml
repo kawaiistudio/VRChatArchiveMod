@@ -139,6 +139,16 @@ jobs:
       #     in src/Core/VrcPlusItems.cs, is a TYPE NAME and not key material. Real
       #     base64 that long carries digits, so requiring one costs this check
       #     nothing and stops it firing on every interop name the source names.
+      #   * The credential pattern skips the il2cpp export maps under
+      #     tools/pack-port/: an entry such as il2cpp_method_get_token mapped to an 11-char export name
+      #     is a standard il2cpp API name paired with its obfuscated export on one
+      #     VRChat build, not a token. The exemption is limited to that exact shape.
+      #   * Two more exemptions for the base64 check, both scoped tightly: a quoted
+      #     literal ending in Unique" is another Il2CppInterop-mangled TYPE NAME
+      #     (src/Modules/VoiceMimicModule.cs names one that happens to carry a digit),
+      #     and src/Modules/ActionMenuModule.cs embeds a 128x128 PNG icon as a base64
+      #     literal split over nine lines (it starts with iVBORw0KGgo, the PNG
+      #     signature). An icon is not key material.
       #   * The mailbox pattern only matches consumer mail providers, so a
       #     project contact address stays allowed.
       #   * The VRChat id pattern skips the all-zeros placeholder, which is real
@@ -173,10 +183,11 @@ jobs:
           scan "personal mailbox on a consumer provider" \
                '[A-Za-z0-9._%+-]+@(gmail|outlook|hotmail|yahoo|proton(mail)?|live|icloud|aol|gmx|yandex)\.' -HnIiE
           scan "credential assigned to a string literal" \
-               '(api[_-]?key|apikey|secret|password|passwd|token|bearer)"?[[:space:]]*[=:][[:space:]]*"[^"]{8,}' -HnIiE
+               '(api[_-]?key|apikey|secret|password|passwd|token|bearer)"?[[:space:]]*[=:][[:space:]]*"[^"]{8,}' -HnIiE \
+               '^tools/pack-port/[^:]*\.json:[0-9]+: *"il2cpp_[a-z_]+": *"[A-Za-z0-9_]+",?$'
           scan "base64-looking blob of 40+ chars" \
                '"[A-Za-z0-9+]{40,}={0,2}"' -HnIoE \
-               ':"[A-Za-z]+"$'
+               ':"[A-Za-z]+"$|Unique"$|^src/Modules/ActionMenuModule\.cs:[0-9]+:'
           scan "hex blob of 32+ chars (key or hash material)" \
                '"[0-9a-fA-F]{32,}"' -HnIoE
           scan "a real VRChat user/avatar/world/file/group id" \

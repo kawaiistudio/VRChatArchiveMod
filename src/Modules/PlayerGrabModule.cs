@@ -13,10 +13,23 @@ namespace VRChatArchiveMod.Modules
 	// VRChat lets no client move another player's avatar, so this is COOPERATIVE: the player being
 	// held moves THEMSELVES (their own client, VRChat's own SetVelocity) to follow the grabber's hand.
 	// Nothing is streamed: the held client reads the grabber's hand BONE locally — VRChat already
-	// syncs everyone's avatar bones. Only a handful of events travel, through the Archive's relay
-	// (/api/grab/send + long-poll /api/grab/poll): grab, hold (1 s heartbeat), release, ack/nack,
-	// escaped. Mutual consent: it only works between two people who BOTH run the mod with this
-	// toggle ON; a grab sent to anyone else simply gets no answer (and the grabber is told so).
+	// syncs everyone's avatar bones.
+	//
+	// STARTING A GRAB NEEDS NO NETWORK EITHER (2026-09-23). It used to: a request through the
+	// Archive relay (/api/grab/send + long-poll /api/grab/poll), answered with ack/nack. In the
+	// owner's logs that handshake never once completed — every line was a failure, in three
+	// different ways: 502 from the edge, 401 "login required", 426 "client_outdated". A grab that
+	// needs a server, a session and a version check before anyone has moved is three things that
+	// can be down first.
+	//
+	// So detection moved to where SDraw's ml_alg puts it: "to successfully grab your limbs remote
+	// player should place his hand near your avatar bone and hold fist gesture". The grabber sends
+	// NOTHING. Your client watches the hands and gestures VRChat is already syncing to you, and
+	// moves you — the only client allowed to move you anyway. The relay stays for the mod's other
+	// events and as a second way in, but nothing waits on it.
+	//
+	// Consent is stronger than the handshake was, not weaker: your client follows someone only
+	// while YOUR toggle is on, so nothing can move you while it is off.
 	//
 	// Mechanics follow the well-known world-script approach (Reimajo's Player Lift Up) reimplemented
 	// on the mod side: velocity-follow toward startPos + (handNow - handStart); throw = the held
@@ -113,7 +126,7 @@ namespace VRChatArchiveMod.Modules
 				// finishing, this picks it up on the next frame instead of leaving it there.
 				if (!_outbox.IsEmpty) PumpOutbox();
 				if (!Active) return;
-				float now = Time.realtimeSinceStartup;
+				float now = VaClock.Now;
 
 				// ---- grabber: inputs
 				if (Input.GetKey(KeyCode.RightShift) && Input.GetKeyDown(KeyCode.U)) GrabOrReleaseAimed();
@@ -135,7 +148,11 @@ namespace VRChatArchiveMod.Modules
 
 				// ---- held side
 				if (!string.IsNullOrEmpty(_heldByUid)) HeldUpdate(now);
-				else if (now < _inertiaUntil) InertiaUpdate(now);
+				else
+				{
+					LocalDetect(now);
+					if (string.IsNullOrEmpty(_heldByUid) && now < _inertiaUntil) InertiaUpdate(now);
+				}
 			}
 			catch (Exception e) { Status = "failed: " + e.Message; }
 		}
@@ -188,7 +205,7 @@ namespace VRChatArchiveMod.Modules
 
 		private static void BeginGrab(VaTagsModule.PlayerEntry target, string hand)
 		{
-			_pendingUid = target.UserId; _pendingName = target.Name; _pendingAt = Time.realtimeSinceStartup;
+			_pendingUid = target.UserId; _pendingName = target.Name; _pendingAt = VaClock.Now;
 			VRChatArchiveModPlugin.Logger.LogInfo($"[PlayerGrab] asking {target.Name} ({target.UserId}) hand={hand}");
 			_holdingHand = hand;
 			Status = "asking " + target.Name + "…";
@@ -201,6 +218,111 @@ namespace VRChatArchiveMod.Modules
 			Send(_holdingUid, "release", _holdingHand);
 			Status = "released " + _holdingName;
 			_holdingUid = _holdingName = null; StateText = "";
+		}
+
+		// ---------------------------------------------------------------- local detection
+		//
+		// NO RELAY. The handshake this module was built on — /api/grab/send plus a long poll —
+		// never completed once in the owner's logs: every single line was a failure, and in three
+		// different ways (502 from the edge, 401 "login required", 426 "client_outdated"). A grab
+		// that needs a server round-trip, an auth session and a version check to start is three
+		// things that can be down before anyone has moved a hand.
+		//
+		// SDraw's ml_alg needs none of it, because of where the work happens: "to successfully grab
+		// your limbs remote player should place his hand near your avatar bone and hold fist
+		// gesture". The GRABBER sends nothing. The victim's own client watches the hands it is
+		// already receiving — VRChat syncs every avatar's bones and gesture to everyone — and moves
+		// the victim, who is the only client allowed to move them anyway.
+		//
+		// Consent still holds and is stronger than the handshake was: your client only follows
+		// anyone if YOUR toggle is on. Nothing can move you while it is off, with or without a mod
+		// on the other side.
+		private static float _nextDetect;
+		private static bool _saidNoGesture;
+		private static bool _heldLocal;
+		private const float DetectHz = 10f;
+
+		private static void LocalDetect(float now)
+		{
+			if (now < _nextDetect) return;
+			_nextDetect = now + 1f / DetectHz;
+
+			var me = PlayerRef.LocalApi();
+			if (me == null) return;
+
+			// Reach scales with your own size, as in the reference: a grab distance that is right
+			// for a human avatar is nothing at all on a giant and grabs from across the room on a
+			// small one.
+			float reach = 0.28f;
+			try
+			{
+				Vector3 head = me.GetBonePosition(HumanBodyBones.Head);
+				Vector3 foot = me.GetPosition();
+				float h = head.y - foot.y;
+				if (h > 0.2f && h < 20f) reach = Mathf.Clamp(0.28f * (h / 1.6f), 0.12f, 1.2f);
+			}
+			catch { }
+
+			foreach (var entry in VaTagsModule.Roster)
+			{
+				if (entry == null || entry.IsLocal) continue;
+				var api = ApiOf(entry);
+				if (api == null) continue;
+
+				for (int k = 0; k < 2; k++)
+				{
+					string hand = k == 0 ? "R" : "L";
+					Vector3 hp;
+					try { hp = api.GetBonePosition(BoneFor(hand)); } catch { continue; }
+					if (hp == Vector3.zero) continue;
+
+					// Near one of my bones?
+					bool near = false;
+					for (int b = 0; b < ReachBones.Length && !near; b++)
+					{
+						Vector3 mine;
+						try { mine = me.GetBonePosition(ReachBones[b]); } catch { continue; }
+						if (mine == Vector3.zero) continue;
+						if ((mine - hp).sqrMagnitude <= reach * reach) near = true;
+					}
+					if (!near) continue;
+
+					// ...and holding a fist. Proximity alone would mean anyone brushing past you
+					// takes you with them; the gesture is what makes it deliberate.
+					int g = GestureOf(api, hand);
+					if (g < 0)
+					{
+						if (!_saidNoGesture)
+						{
+							_saidNoGesture = true;
+							VRChatArchiveModPlugin.Logger.LogInfo(
+								"[PlayerGrab] cannot read remote hand gestures on this build — "
+								+ "local grab needs the fist, so it stays off. Proximity alone is not used on purpose.");
+						}
+						continue;
+					}
+					if (g != 1) continue;                  // 1 = fist, VRChat's own gesture numbering
+
+					BeginHeld(entry, api, hand, "local");
+					return;
+				}
+			}
+		}
+
+		// A remote player's hand gesture, read off their avatar's animator: VRChat syncs
+		// GestureLeft / GestureRight to everyone, which is what makes this work with no networking
+		// of our own. -1 when it cannot be read at all.
+		private static int GestureOf(VRC.SDKBase.VRCPlayerApi api, string hand)
+		{
+			try
+			{
+				GameObject go = api.gameObject;
+				if (go == null) return -1;
+				var anim = go.GetComponentInChildren<Animator>(true);
+				if (anim == null) return -1;
+				return anim.GetInteger(hand == "L" ? "GestureLeft" : "GestureRight");
+			}
+			catch { return -1; }
 		}
 
 		// ---------------------------------------------------------------- held side
@@ -216,21 +338,50 @@ namespace VRChatArchiveMod.Modules
 			Vector3 h;
 			try { h = api.GetBonePosition(BoneFor(hand)); } catch { h = Vector3.zero; }
 			if (h == Vector3.zero) { try { h = api.GetPosition(); } catch { Send(fromUid, "nack", ""); return; } }
-			_holderApi = api; _heldByUid = fromUid; _heldByName = entry.Name; _heldHand = hand;
+			BeginHeld(entry, api, hand, "relay");
+			Send(fromUid, "ack", hand);
+		}
+
+		// The one place the held state is armed, so the relay path and the local one cannot drift.
+		private static void BeginHeld(VaTagsModule.PlayerEntry entry, VRC.SDKBase.VRCPlayerApi api,
+			string hand, string how)
+		{
+			var me = PlayerRef.LocalApi();
+			if (me == null) return;
+
+			Vector3 h;
+			try { h = api.GetBonePosition(BoneFor(hand)); } catch { h = Vector3.zero; }
+			if (h == Vector3.zero) { try { h = api.GetPosition(); } catch { return; } }
+
+			_heldLocal = how == "local";
+			_holderApi = api; _heldByUid = entry.UserId; _heldByName = entry.Name; _heldHand = hand;
 			_startHand = h; try { _startMe = me.GetPosition(); } catch { _startMe = Vector3.zero; }
-			_p1 = _p2 = _startMe; _dt1 = Mathf.Max(0.001f, Time.deltaTime);
-			_lastHoldAt = Time.realtimeSinceStartup; _handMissingSince = 0f;
+			_p1 = _p2 = _startMe; _dt1 = Mathf.Max(0.001f, VaClock.Delta);
+			_lastHoldAt = VaClock.Now; _handMissingSince = 0f;
 			_inertiaUntil = 0f;
 			StateText = "held by " + entry.Name;
 			Status = entry.Name + " grabbed you" + (AllowEscape ? " — move (WASD / stick) to break free" : "");
 			try { me.PlayHapticEventInHand(VRC.SDKBase.VRC_Pickup.PickupHand.Right, 0.3f, 0.8f, 40f); } catch { }
-			Send(fromUid, "ack", hand);
+			VRChatArchiveModPlugin.Logger.LogInfo("[PlayerGrab] held by " + entry.Name + " (" + how + ", " + hand + " hand).");
 		}
 
 		private static void HeldUpdate(float now)
 		{
 			var me = PlayerRef.LocalApi();
 			if (me == null || _holderApi == null) { ReleaseSelf(false); return; }
+
+			// A LOCAL hold has no heartbeat to keep it alive — there is no relay saying "still
+			// holding". The fist IS the heartbeat: while it stays closed the hold is renewed, and
+			// opening it releases you, which is also how you get thrown (ReleaseSelf(true) carries
+			// your last two frames of velocity). Without this the hold would expire on the 3.5 s
+			// timeout below no matter what the grabber did.
+			if (_heldLocal)
+			{
+				int g = GestureOf(_holderApi, _heldHand);
+				if (g == 1) _lastHoldAt = now;
+				else if (g >= 0) { Status = _heldByName + " let go"; ReleaseSelf(true); return; }
+			}
+
 			if (now - _lastHoldAt > 3.5f) { Status = "dropped — lost contact with " + _heldByName; ReleaseSelf(true); return; }
 			if (AllowEscape && WantsToEscape()) { Send(_heldByUid, "escaped", ""); Status = "you broke free"; ReleaseSelf(false); return; }
 
@@ -244,7 +395,7 @@ namespace VRChatArchiveMod.Modules
 			}
 			_handMissingSince = 0f;
 
-			float dt = Mathf.Max(0.001f, Time.deltaTime);
+			float dt = Mathf.Max(0.001f, VaClock.Delta);
 			Vector3 target = _startMe + (hand - _startHand);
 			Vector3 pos; try { pos = me.GetPosition(); } catch { return; }
 			Vector3 v = (target - pos) / dt * Follow;
@@ -265,7 +416,7 @@ namespace VRChatArchiveMod.Modules
 			try { me.SetVelocity(throwVel); } catch { }
 			if (throwVel != Vector3.zero && Inertia > 0f)
 			{
-				_inertiaVel = throwVel; _inertiaTotal = Inertia; _inertiaUntil = Time.realtimeSinceStartup + Inertia;
+				_inertiaVel = throwVel; _inertiaTotal = Inertia; _inertiaUntil = VaClock.Now + Inertia;
 			}
 			Status = who + " threw you (" + throwVel.magnitude.ToString("0.#") + " m/s)";
 		}
@@ -429,6 +580,7 @@ namespace VRChatArchiveMod.Modules
 			Task.Run(async () =>
 			{
 				int backoff = 0;
+				bool loggedFail = false;
 				while (true)
 				{
 					string me = VaTagsModule.LocalUserId();
@@ -438,11 +590,24 @@ namespace VRChatArchiveMod.Modules
 						var (ok, raw, code) = await VaAuth.PostAsync("/api/grab/poll", "{\"me\":\"" + me + "\",\"wait\":4}");
 						if (!ok)
 						{
-							if (backoff == 0) VRChatArchiveModPlugin.Logger.LogWarning($"[PlayerGrab] poll FAIL {code}: {(raw ?? "").Substring(0, Math.Min(160, (raw ?? "").Length))}");
+							if (!loggedFail)
+							{
+								VRChatArchiveModPlugin.Logger.LogWarning($"[PlayerGrab] poll FAIL {code}: {(raw ?? "").Substring(0, Math.Min(160, (raw ?? "").Length))}");
+								loggedFail = true;
+							}
 							if (code == 401) Main.Enqueue(() => Status = "login required — connect your VRChat Archive account (your tag ▸ Connect)");
-							backoff = Math.Min(backoff + 1, 5);
-							await Task.Delay(code == 401 ? 60000 : 1000 * backoff);   // not logged in: ask again in a minute, not five times a second
+
+							// Progressive backoff: 5s -> 10s -> 20s -> max 30s
+							backoff = Math.Min(30, backoff == 0 ? 5 : backoff * 2);
+							int delaySec = code == 426 ? 300 : (code == 401 ? 60 : backoff);
+							await Task.Delay(delaySec * 1000);
 							continue;
+						}
+
+						if (loggedFail)
+						{
+							VRChatArchiveModPlugin.Logger.LogInfo("[PlayerGrab] poll connection restored.");
+							loggedFail = false;
 						}
 						backoff = 0;
 						using var doc = JsonDocument.Parse(raw);
@@ -458,7 +623,10 @@ namespace VRChatArchiveMod.Modules
 								Main.Enqueue(() => HandleEvent(from, kind, hand ?? "", data ?? ""));
 							}
 					}
-					catch { await Task.Delay(1500); }
+					catch
+					{
+						await Task.Delay(5000);
+					}
 				}
 			});
 		}
@@ -468,13 +636,13 @@ namespace VRChatArchiveMod.Modules
 			switch (kind)
 			{
 				case "grab": OnGrabRequest(from, hand); break;
-				case "hold": if (from == _heldByUid) _lastHoldAt = Time.realtimeSinceStartup; break;
+				case "hold": if (from == _heldByUid) _lastHoldAt = VaClock.Now; break;
 				case "release": if (from == _heldByUid) OnReleased(); break;
 				case "ack":
 					if (from == _pendingUid)
 					{
 						_holdingUid = _pendingUid; _holdingName = _pendingName; _pendingUid = _pendingName = null;
-						_nextHold = Time.realtimeSinceStartup + 1f;
+						_nextHold = VaClock.Now + 1f;
 						StateText = "holding " + _holdingName; Status = "holding " + _holdingName + " — open your hand to throw";
 						try { PlayerRef.LocalApi()?.PlayHapticEventInHand(_holdingHand == "L" ? VRC.SDKBase.VRC_Pickup.PickupHand.Left : VRC.SDKBase.VRC_Pickup.PickupHand.Right, 0.3f, 1f, 40f); } catch { }
 					}

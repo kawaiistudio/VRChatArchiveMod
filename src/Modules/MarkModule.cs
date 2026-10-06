@@ -32,6 +32,8 @@ namespace VRChatArchiveMod.Modules
 		/// <summary>True while the art plays OR while the network renderer is still putting objects back (the client shows STOP from it).</summary>
 		public static bool ArtPlaying => _baPlaying || _restoring;
 		public static string Mode { get; private set; } = "local";
+		/// <summary>Which clip the object player is on: "badapple" (built in) or a local clip name.</summary>
+		public static string CurrentClip { get; private set; } = "badapple";
 		public static string Status = "";
 		/// <summary>Telemetry of the network renderer, refreshed once a second; empty when vrchat mode is not playing.</summary>
 		public static string NetInfo { get; private set; } = "";
@@ -85,7 +87,7 @@ namespace VRChatArchiveMod.Modules
 		private static bool _baPlaying; private static float _baStart; private static int _baLastIdx = -1;
 		private static byte[][] _baFrames; private static int _baW, _baH, _baInterval; private static bool _baSquareCells;
 		private static Vector3 _baRight;
-		private static byte[][] _hdFrames; private static int _hdW, _hdH, _hdInterval; private static bool _hdTried;
+		// (the old single-clip _hd* cache is gone: clips are cached per name in _clipCache)
 		private static byte[][] _txtFrames; private static int _txtW, _txtH, _txtInterval;
 		private static int _baDown = 1, _baCW, _baCH;
 		private static float[] _baCells; private static bool[] _want; private static int[] _cellObj, _objCell; private static bool[] _parked;
@@ -141,9 +143,20 @@ namespace VRChatArchiveMod.Modules
 					if (Input.GetKeyDown(KeyCode.T)) TeleportObjectsToMark();
 				}
 				DrainOwnership();
+				// THE MUSIC SWITCH IS LIVE (2026-09-13). BadAppleMusic was read once, in
+				// StartShowAudio, and never again: switching it off mid-show left the soundtrack
+				// playing until the show itself ended, and switching it on mid-show did nothing.
+				// Asserted here on the edge, which is the only place that runs for the whole show.
+				if (_baPlaying)
+				{
+					bool wantMusic = false;
+					try { wantMusic = ModConfig.BadAppleMusic.Value; } catch { }
+					if (!wantMusic && Core.BadAppleAudio.Playing) { try { Core.BadAppleAudio.Stop(); } catch { } }
+					else if (wantMusic && !Core.BadAppleAudio.Playing) StartShowAudio();
+				}
 				if (_baPlaying) { if (_netMode) NetUpdate(); else BadAppleUpdate(); }
 				else if (_restoring) RestoreUpdate();
-				else { SampleBaseline(); ShapeKeepAlive(Time.realtimeSinceStartup); }
+				else { SampleBaseline(); ShapeKeepAlive(VaClock.Now); }
 			}
 			catch (Exception e) { Status = "failed: " + e.Message; }
 		}
@@ -320,7 +333,11 @@ namespace VRChatArchiveMod.Modules
 		// ---------------------------------------------------------------- Bad Apple
 
 		/// <summary>Start (mode = local | vrchat; anything else is local) or, if playing or still putting objects back, stop.</summary>
-		public static void ToggleBadApple(string mode)
+		public static void ToggleBadApple(string mode) => ToggleBadApple(mode, CurrentClip);
+
+		/// <summary>Start (mode = local | vrchat) or stop. clip = "badapple" for the built-in bake, or
+		/// the name of a local file in ClipsDir.</summary>
+		public static void ToggleBadApple(string mode, string clip)
 		{
 			if (_restoring)
 			{
@@ -337,13 +354,20 @@ namespace VRChatArchiveMod.Modules
 			}
 			if (!HasMark) { Status = "put a mark first (RightShift+K)"; return; }
 			Mode = string.Equals(mode, "vrchat", StringComparison.OrdinalIgnoreCase) ? "vrchat" : "local";
-			if (!LoadFrames()) return;
+			CurrentClip = string.IsNullOrEmpty(clip) ? "badapple" : clip;
+			if (!LoadFrames(CurrentClip)) return;
 			if (Mode == "vrchat") StartNet(); else StartLocal();
 		}
 
-		private static bool LoadFrames()
+		private static bool LoadFrames(string clip)
 		{
-			if (TryGetHdFrames(out _baFrames, out _baW, out _baH, out _baInterval)) { _baSquareCells = true; return true; }
+			if (TryLoadClip(clip, out _baFrames, out _baW, out _baH, out _baInterval)) { _baSquareCells = true; return true; }
+			// The low-res chatbox bake is a fallback for BAD APPLE only — a missing local clip is just missing.
+			if (!string.IsNullOrEmpty(clip) && !string.Equals(clip, "badapple", StringComparison.OrdinalIgnoreCase))
+			{
+				Status = "clip '" + clip + "' not found in " + ClipsDir;
+				return false;
+			}
 			if (_txtFrames == null && BadAppleModule.TryGetFrames(out string[] text, out _txtW, out _txtH, out _txtInterval))
 			{
 				_txtFrames = new byte[text.Length][];
@@ -370,7 +394,7 @@ namespace VRChatArchiveMod.Modules
 			ChooseResolution(_art.Count);
 			_autoCell = MedianSize(null) * 1.05f;
 			_netMode = false; _restoring = false; NetInfo = "";
-			_baPlaying = true; _baStart = Time.realtimeSinceStartup; _baLastIdx = -1;
+			_baPlaying = true; _baStart = VaClock.Now; _baLastIdx = -1;
 			// LOCAL has no ownership hand-over to wait for: the objects are already parked and the
 			// first frame draws on the next tick, so the song starts here.
 			StartShowAudio();
@@ -385,7 +409,7 @@ namespace VRChatArchiveMod.Modules
 		{
 			if (!_baPlaying && !_restoring) return;
 			if (_netMode) LearnBudget();
-			_lastShowEnd = Time.realtimeSinceStartup;   // local moves count on the wire too when we own the objects
+			_lastShowEnd = VaClock.Now;   // local moves count on the wire too when we own the objects
 			_baPlaying = false; _restoring = false; _netMode = false; _restoreIdx = 0; NetInfo = "";
 			Core.BadAppleAudio.Stop();
 			if (restore) RestoreArt();
@@ -393,7 +417,7 @@ namespace VRChatArchiveMod.Modules
 
 		// THE SONG IS THE CLOCK, when there is one.
 		//
-		// Both modes used to count from Time.realtimeSinceStartup, and both drift from the music for
+		// Both modes used to count from VaClock.Now, and both drift from the music for
 		// reasons built into the show: the networked mode holds frame 0 for as long as it takes to
 		// own every object it will move (up to six seconds), and any hitch while objects load costs
 		// frames nobody gets back. Reading the AudioSource's position instead makes the picture
@@ -403,7 +427,7 @@ namespace VRChatArchiveMod.Modules
 		private static float ShowSeconds()
 		{
 			float t = Core.BadAppleAudio.Time;
-			return t >= 0f ? t : Time.realtimeSinceStartup - _baStart;
+			return t >= 0f ? t : VaClock.Now - _baStart;
 		}
 
 		/// <summary>Starts the soundtrack and re-bases the fallback clock on the same instant, so the
@@ -413,8 +437,8 @@ namespace VRChatArchiveMod.Modules
 			try
 			{
 				if (!ModConfig.BadAppleMusic.Value) return;
-				_baStart = Time.realtimeSinceStartup;
-				Core.BadAppleAudio.Play(Mathf.Clamp01(ModConfig.BadAppleMusicVolume.Value));
+				_baStart = VaClock.Now;
+				Core.BadAppleAudio.Play(Mathf.Clamp01(ModConfig.BadAppleMusicVolume.Value), CurrentClip);
 			}
 			catch { }
 		}
@@ -520,7 +544,7 @@ namespace VRChatArchiveMod.Modules
 			for (int o = 0; o < n; o++) { _curPos[o] = _art[o].Pos; _inBox[o] = InPictureBox(_art[o].Pos); if (_inBox[o]) inBox++; }
 			_wrong.Clear(); _empty.Clear(); _rotW = 0; _rotE = 0;
 			_credit = 0f; _movesThisSec = 0; _movesLastSec = 0;
-			float now = Time.realtimeSinceStartup;
+			float now = VaClock.Now;
 			_nextNetSecond = now + 1f; _nextNetLog = now + 5f; _nextReassert = now + 3f; _reassertCursor = -1;
 			_netHoldUntil = now + 6f;
 			_peakWindow = 0; _calmSeconds = 0; _hotSeconds = 0;
@@ -686,7 +710,7 @@ namespace VRChatArchiveMod.Modules
 		{
 			int n = _art.Count;
 			if (_baFrames == null || _baFrames.Length == 0 || n == 0) { StopBadApple(restore: true); return; }
-			float now = Time.realtimeSinceStartup;
+			float now = VaClock.Now;
 			ReassertOwnership(now);
 
 			// HAND-OVERS FIRST. A pixel moved before we own the object is snapped back by its current owner's
@@ -707,7 +731,7 @@ namespace VRChatArchiveMod.Modules
 			// together they let one frame fire 60+ moves, and the wire saw spikes of 500-700 ev/s while
 			// the per-second average read fine. A tenth of a second of credit and 12 moves a frame keep
 			// the send rate flat, which is what the receivers' queues care about.
-			_credit = Mathf.Min(_credit + _netBudget * Time.deltaTime, _netBudget * 0.1f);
+			_credit = Mathf.Min(_credit + _netBudget * VaClock.Delta, _netBudget * 0.1f);
 			BuildDiff();
 			ServeMoves();
 			int backlog = Backlog();
@@ -950,7 +974,7 @@ namespace VRChatArchiveMod.Modules
 		private static void LearnBudget()
 		{
 			_learnedBudget = Mathf.Max(100f, _hotSeconds > 2 ? Mathf.Min(_netBudget, 120f) : Mathf.Min(_netBudget, 260f));
-			_lastShowEnd = Time.realtimeSinceStartup;
+			_lastShowEnd = VaClock.Now;
 			VRChatArchiveModPlugin.Logger.LogInfo($"[Mark] net: show ended, budget {_netBudget:0}, {_hotSeconds} hot second(s) -> next show starts at {_learnedBudget:0} moves/s.");
 			_hotSeconds = 0; _calmSeconds = 0;
 		}
@@ -970,7 +994,7 @@ namespace VRChatArchiveMod.Modules
 
 		private static void RestoreUpdate()
 		{
-			_credit = Mathf.Min(_credit + _netBudget * Time.deltaTime, _netBudget * 0.25f);
+			_credit = Mathf.Min(_credit + _netBudget * VaClock.Delta, _netBudget * 0.25f);
 			int served = 0;
 			while (_restoreIdx < _art.Count && served < NetFrameCap)
 			{
@@ -992,7 +1016,7 @@ namespace VRChatArchiveMod.Modules
 		private static float _lastShowEnd;
 		private static void SampleBaseline()
 		{
-			float now = Time.realtimeSinceStartup;
+			float now = VaClock.Now;
 			if (now < _nextBaselineAt) return;
 			_nextBaselineAt = now + 1f;
 			if (now - _lastShowEnd < 3f) return;
@@ -1001,28 +1025,84 @@ namespace VRChatArchiveMod.Modules
 
 		// ---------------------------------------------------------------- frames
 
-		private static bool TryGetHdFrames(out byte[][] frames, out int w, out int h, out int intervalMs)
+		// CLIPS. "" / "badapple" is the HD bake embedded in the DLL. ANY OTHER NAME is a LOCAL file
+		// dropped in <BepInEx>\VRChatArchiveMod\clips\<name>.frames.gz (or .frames) on this machine.
+		// Nothing but Bad Apple ever ships inside the mod, so adding a clip is a file copy — no
+		// rebuild, and the public DLL neither grows nor carries anyone else's material.
+		private sealed class Clip { public byte[][] Frames; public int W, H, Interval; }
+		private static readonly Dictionary<string, Clip> _clipCache =
+			new Dictionary<string, Clip>(StringComparer.OrdinalIgnoreCase);
+
+		internal static string ClipsDir
 		{
-			frames = _hdFrames; w = _hdW; h = _hdH; intervalMs = _hdInterval;
-			if (_hdTried) return frames != null && frames.Length > 0;
-			_hdTried = true;
+			get
+			{
+				try { return System.IO.Path.Combine(BepInEx.Paths.BepInExRootPath, "VRChatArchiveMod", "clips"); }
+				catch { return "clips"; }
+			}
+		}
+
+		/// <summary>Names of the local clips sitting beside the built-in Bad Apple.</summary>
+		public static List<string> ListClips()
+		{
+			var names = new List<string>();
 			try
 			{
-				using var raw = typeof(MarkModule).Assembly.GetManifestResourceStream("badapple_hd.frames.gz");
-				if (raw == null) return false;
-				using var gz = new System.IO.Compression.GZipStream(raw, System.IO.Compression.CompressionMode.Decompress);
-				using var reader = new System.IO.StreamReader(gz, System.Text.Encoding.ASCII);
-				string[] header = (reader.ReadLine() ?? "").Split(' ');
-				_hdW = int.Parse(header[0]); _hdH = int.Parse(header[1]); _hdInterval = int.Parse(header[2]);
-				var list = new List<byte[]>(7000);
-				string line;
-				while ((line = reader.ReadLine()) != null) if (line.Length == _hdW * _hdH) list.Add(ToLevels(line));
-				_hdFrames = list.ToArray();
-				frames = _hdFrames; w = _hdW; h = _hdH; intervalMs = _hdInterval;
-				VRChatArchiveModPlugin.Logger.LogInfo($"[Mark] HD Bad Apple frames: {_hdFrames.Length} x {_hdW}x{_hdH} @ {_hdInterval} ms.");
-				return _hdFrames.Length > 0;
+				if (!System.IO.Directory.Exists(ClipsDir)) return names;
+				foreach (var p in System.IO.Directory.GetFiles(ClipsDir))
+				{
+					string n = System.IO.Path.GetFileName(p);
+					if (n.EndsWith(".frames.gz", StringComparison.OrdinalIgnoreCase)) names.Add(n.Substring(0, n.Length - 10));
+					else if (n.EndsWith(".frames", StringComparison.OrdinalIgnoreCase)) names.Add(n.Substring(0, n.Length - 7));
+				}
 			}
-			catch (Exception e) { VRChatArchiveModPlugin.Logger.LogWarning("[Mark] HD frames unavailable: " + e.Message); return false; }
+			catch { }
+			return names;
+		}
+
+		private static bool TryLoadClip(string clip, out byte[][] frames, out int w, out int h, out int intervalMs)
+		{
+			frames = null; w = 0; h = 0; intervalMs = 33;
+			string key = string.IsNullOrEmpty(clip) ? "badapple" : clip;
+			if (_clipCache.TryGetValue(key, out var hit))
+			{
+				frames = hit.Frames; w = hit.W; h = hit.H; intervalMs = hit.Interval;
+				return frames != null && frames.Length > 0;
+			}
+			var got = new Clip();
+			_clipCache[key] = got;   // cache the failure too, so a missing clip is not re-read every toggle
+			try
+			{
+				System.IO.Stream raw = null;
+				bool gzipped = true;
+				if (string.Equals(key, "badapple", StringComparison.OrdinalIgnoreCase))
+					raw = typeof(MarkModule).Assembly.GetManifestResourceStream("badapple_hd.frames.gz");
+				else
+				{
+					string gzPath = System.IO.Path.Combine(ClipsDir, key + ".frames.gz");
+					string plain = System.IO.Path.Combine(ClipsDir, key + ".frames");
+					if (System.IO.File.Exists(gzPath)) raw = System.IO.File.OpenRead(gzPath);
+					else if (System.IO.File.Exists(plain)) { raw = System.IO.File.OpenRead(plain); gzipped = false; }
+				}
+				if (raw == null) return false;
+				using (raw)
+				using (var src = gzipped
+					? (System.IO.Stream)new System.IO.Compression.GZipStream(raw, System.IO.Compression.CompressionMode.Decompress)
+					: raw)
+				using (var reader = new System.IO.StreamReader(src, System.Text.Encoding.ASCII))
+				{
+					string[] header = (reader.ReadLine() ?? "").Split(' ');
+					got.W = int.Parse(header[0]); got.H = int.Parse(header[1]); got.Interval = int.Parse(header[2]);
+					var list = new List<byte[]>(7000);
+					string line;
+					while ((line = reader.ReadLine()) != null) if (line.Length == got.W * got.H) list.Add(ToLevels(line));
+					got.Frames = list.ToArray();
+				}
+				frames = got.Frames; w = got.W; h = got.H; intervalMs = got.Interval;
+				VRChatArchiveModPlugin.Logger.LogInfo($"[Mark] clip '{key}': {got.Frames.Length} frames {got.W}x{got.H} @ {got.Interval} ms.");
+				return got.Frames.Length > 0;
+			}
+			catch (Exception e) { VRChatArchiveModPlugin.Logger.LogWarning($"[Mark] clip '{key}' unavailable: " + e.Message); return false; }
 		}
 
 		private static byte[] ToLevels(string digits)
@@ -1116,7 +1196,7 @@ namespace VRChatArchiveMod.Modules
 		private static void DrainOwnership()
 		{
 			if (_ownQ.Count == 0) return;
-			float now = Time.realtimeSinceStartup;
+			float now = VaClock.Now;
 			if (now < _nextOwnDrain) return;
 			_nextOwnDrain = now + 0.1f;
 			for (int i = 0; i < 20 && _ownQ.Count > 0; i++)

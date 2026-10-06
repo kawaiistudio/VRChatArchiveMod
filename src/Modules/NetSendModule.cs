@@ -1,8 +1,9 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Reflection;
 using System.Text;
 using HarmonyLib;
+using Il2CppInterop.Runtime.InteropTypes.Arrays;
 using UnityEngine;
 using VRChatArchiveMod.Core;
 
@@ -55,9 +56,19 @@ namespace VRChatArchiveMod.Modules
 
 		public override void OnUpdate()
 		{
+			// Arm on the RISING EDGE of the switch, so one flip is one round of dumping and leaving it
+			// on does not re-arm forever.
 			try
 			{
-				float now = Time.realtimeSinceStartup;
+				bool want = ModConfig.DumpOutbound.Value;
+				if (want && !_dumpArmed) ArmDump();
+				_dumpArmed = want;
+			}
+			catch { }
+
+			try
+			{
+				float now = VaClock.Now;
 				if (!_hooked && _attempts < 40 && now >= _nextTry) { _nextTry = now + 3f; _attempts++; InstallHook(); }
 				if (now < _nextRoll) return;
 				_nextRoll = now + 1f;
@@ -166,11 +177,82 @@ namespace VRChatArchiveMod.Modules
 			}
 		}
 
-		// One increment. Nothing else may run here: this is on the send path of every event.
-		private static void RaisePostfix(byte __0)
+		// ---------------------------------------------------------------- outbound packet dump
+		//
+		// READ-ONLY, CAPPED, AND OFF UNLESS ARMED. Counting told us the RATES per code; it could
+		// never tell us what a packet CONTAINS, and every question about rewriting the pose stream
+		// starts there: which code carries the body, and whether a rotation is in it at all.
+		//
+		// Arm it from the config (Network/DumpOutbound), rotate on the spot, and read the log. The
+		// budget stops it by itself, so a forgotten toggle cannot bleed the send path.
+		private static readonly int[] _dumpLeftPerCode = new int[256];
+		private static int _dumpLeft;
+		private const int DumpPerCode = 4;
+		private const int DumpTotal = 40;
+		private static bool _dumpArmed;
+
+		/// <summary>Arm one round of dumping. Idempotent while a round is still running.</summary>
+		public static void ArmDump()
+		{
+			if (_dumpLeft > 0) return;
+			for (int i = 0; i < 256; i++) _dumpLeftPerCode[i] = DumpPerCode;
+			_dumpLeft = DumpTotal;
+			VRChatArchiveModPlugin.Logger.LogInfo("[NetSend] dump armed — next " + DumpTotal
+				+ " outbound event(s), at most " + DumpPerCode + " per code. MOVE AND ROTATE NOW.");
+		}
+
+		// Two increments and one compare. Nothing else may run here: this is on the send path of
+		// every event, 150+ times a second in a busy instance.
+		private static void RaisePostfix(byte __0, Il2CppSystem.Object __1)
 		{
 			_codeNow[__0]++;
 			_totalNow++;
+			if (_dumpLeft > 0 && _dumpLeftPerCode[__0] > 0) Dump(__0, __1);
+		}
+
+		// Out of line on purpose: the hot path above must stay branch-and-return.
+		private static void Dump(byte code, Il2CppSystem.Object payload)
+		{
+			_dumpLeft--;
+			_dumpLeftPerCode[code]--;
+			try
+			{
+				if (payload == null)
+				{
+					VRChatArchiveModPlugin.Logger.LogInfo("[NetSend] e" + code + ": payload null");
+					return;
+				}
+
+				// Name FIRST, and only from a live object. Reading an il2cpp class name is metadata
+				// only; casting a rotten proxy is what faults, so nothing is cast before this passes.
+				if (!Core.NativeGuard.Alive(payload))
+				{
+					VRChatArchiveModPlugin.Logger.LogInfo("[NetSend] e" + code + ": payload not alive");
+					return;
+				}
+				string tn = Core.MenuCard.Il2CppNameOf(payload) ?? "?";
+
+				// A FlatBuffer pose packet arrives as a byte array. Anything else is named and left
+				// alone — guessing at the shape of a type we have not identified is how a send-path
+				// hook kills the game.
+				var bytes = payload.TryCast<Il2CppStructArray<byte>>();
+				if (bytes == null)
+				{
+					VRChatArchiveModPlugin.Logger.LogInfo("[NetSend] e" + code + ": " + tn + " (not a byte array)");
+					return;
+				}
+
+				int n = bytes.Length;
+				int show = n < 64 ? n : 64;
+				var sb = new StringBuilder(show * 3 + 64);
+				for (int i = 0; i < show; i++) sb.Append(bytes[i].ToString("x2"));
+				VRChatArchiveModPlugin.Logger.LogInfo("[NetSend] e" + code + ": " + tn + " " + n
+					+ " byte(s) " + sb + (n > show ? "…" : ""));
+			}
+			catch (Exception e)
+			{
+				VRChatArchiveModPlugin.Logger.LogWarning("[NetSend] dump of e" + code + " threw: " + e.Message);
+			}
 		}
 
 		private static int _fullScans;

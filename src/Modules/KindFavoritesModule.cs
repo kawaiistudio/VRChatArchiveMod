@@ -75,14 +75,14 @@ namespace VRChatArchiveMod.Modules
 			public int Count { get { lock (_gate) return _items.Count; } }
 
 			// The menu calls this while drawing the section, so a section nobody looks at does no work.
-			public void Touch() { _wanted = Time.realtimeSinceStartup + 5f; }
+			public void Touch() { _wanted = VaClock.Now + 5f; }
 
 			public void Tick()
 			{
 				try
 				{
 					if (!VaAuth.InsideClient) { Status = "needs the desktop client"; return; }
-					float now = Time.realtimeSinceStartup;
+					float now = VaClock.Now;
 
 					DrainThumbs(2);
 					if (now > _wanted) return;      // not being looked at

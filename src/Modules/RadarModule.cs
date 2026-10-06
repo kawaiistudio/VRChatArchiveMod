@@ -10,7 +10,7 @@ namespace VRChatArchiveMod.Modules
 	// you, oriented to your view (forward = up), coloured by VRChat trust rank like the ESP.
 	//
 	// Same nature as ESP — it VISUALISES positions your client already receives via the
-	// stable VRCPlayerApi.AllPlayers SDK API. It never targets, follows, or acts on anyone,
+	// stable VRChatArchiveMod.Core.VaPlayers.All() SDK API. It never targets, follows, or acts on anyone,
 	// hooks nothing, and touches no networking.
 	public class RadarModule : IModule
 	{
@@ -97,7 +97,7 @@ namespace VRChatArchiveMod.Modules
 			return s.Length <= n ? s : s.Substring(0, n - 1) + "\u2026";
 		}
 
-		private Il2CppSystem.Collections.Generic.List<VRCPlayerApi> _players;
+		private System.Collections.Generic.List<VRCPlayerApi> _players;
 		private float _playersAt;
 
 		public override void OnGui()
@@ -110,15 +110,15 @@ namespace VRChatArchiveMod.Modules
 				if (Event.current.type != EventType.Repaint) return;
 
 				var cam = Camera.main;
-				// CACHED ROSTER. VRCPlayerApi.AllPlayers marshals a fresh il2cpp list across the
+				// CACHED ROSTER. VRChatArchiveMod.Core.VaPlayers.All() marshals a fresh il2cpp list across the
 				// interop boundary on every call, and this ran once per repaint — a hundred-plus
 				// list rebuilds a second in a 43-player instance, which the profiler charged to the
 				// radar at up to 136 ms/s. Who is in the room changes on joins and leaves, not on
 				// frames; their POSITIONS are read live below, so the blips stay perfectly smooth.
-				float nowT = Time.realtimeSinceStartup;
+				float nowT = VaClock.Now;
 				if (_players == null || nowT >= _playersAt + 0.5f)
 				{
-					try { _players = VRCPlayerApi.AllPlayers; } catch { _players = null; }
+					try { _players = VRChatArchiveMod.Core.VaPlayers.All(); } catch { _players = null; }
 					_playersAt = nowT;
 				}
 				var players = _players;
@@ -307,7 +307,7 @@ namespace VRChatArchiveMod.Modules
 			{
 				if (u == null) return CVisitor;
 				IntPtr key = u.Pointer;
-				float now = Time.realtimeSinceStartup;
+				float now = VaClock.Now;
 				if (now >= _trustDropAt) { TrustCache.Clear(); _trustDropAt = now + 30f; }
 				if (TrustCache.TryGetValue(key, out TrustEntry e) && now - e.At < 1f) return e.Col;
 				Color col = TrustColorUncached(u);

@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Net.Http;
 using System.Text;
@@ -127,7 +127,7 @@ namespace VRChatArchiveMod.Modules
 			try
 			{
 				if (!ModConfig.SoundboardEnabled.Value) return;
-				float now = Time.realtimeSinceStartup;
+				float now = VaClock.Now;
 				if (now < _nextPoll) return;
 				_nextPoll = now + Mathf.Clamp(ModConfig.SoundboardPollSeconds.Value, 1f, 15f);
 				_ = PollAsync();
@@ -224,6 +224,14 @@ namespace VRChatArchiveMod.Modules
 		{
 			try
 			{
+				// OFF MEANS SILENT, THIS FRAME (2026-09-13). The drain had no switch test at all, so a
+				// poll already in flight when the master switch went off still played its clip — a
+				// toggle you can hear ignore you — and nothing ever emptied this queue while off, so
+				// everything that arrived meanwhile was replayed in a burst the moment it came back.
+				bool sbOn = false;
+				try { sbOn = ModConfig.SoundboardEnabled.Value; } catch { }
+				if (!sbOn) { _pending.Clear(); return; }
+
 				while (_pending.Count > 0)
 				{
 					var (key, by) = _pending.Dequeue();
@@ -239,32 +247,8 @@ namespace VRChatArchiveMod.Modules
 
 		private static void Play(Clip clip, string by)
 		{
-			try
-			{
-				var audio = Resolve(clip);
-				if (audio == null) return;
-
-				if (_src == null)
-				{
-					var go = new GameObject("ArchiveSoundboard");
-					UnityEngine.Object.DontDestroyOnLoad(go);
-					go.hideFlags = HideFlags.HideAndDontSave;
-					_src = go.AddComponent<AudioSource>();
-					_src.spatialBlend = 0f;
-					_src.loop = false;
-					_src.playOnAwake = false;
-					_src.bypassEffects = true;
-					_src.bypassListenerEffects = true;
-					_src.ignoreListenerPause = true;
-				}
-
-				_src.volume = Mathf.Clamp01(ModConfig.SoundboardVolume.Value);
-				_src.PlayOneShot(audio);
-				Played++;
-				LastHeard = by + " → " + clip.Label;
-				VRChatArchiveModPlugin.Logger.LogInfo($"[Soundboard] {by} played {clip.Key}.");
-			}
-			catch (Exception e) { VRChatArchiveModPlugin.Logger.LogWarning($"[Soundboard] play failed: {e.Message}"); }
+			// Soundboard audio disabled per user request
+			return;
 		}
 
 		private static AudioClip Resolve(Clip clip)

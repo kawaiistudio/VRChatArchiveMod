@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.Text;
@@ -353,29 +353,87 @@ namespace VRChatArchiveMod.Modules
 		// learned that the hard way). Network state exists when the object carries a VRCObjectSync or
 		// a pickup, OR when the UdonBehaviour itself synchronises (Manual / Continuous SyncMethod).
 		// Anything unclear is "no", and "no" means we never call SetOwner on it.
-		public static bool CanOwn(Entry e)
+		public static bool CanOwnObject(GameObject go)
 		{
 			try
 			{
-				if (e == null || e.B == null) return false;
-				if (HasSync(e.B)) return true;
-				var go = e.B.gameObject;
 				if (go == null) return false;
-				var comps = go.GetComponents<Component>();
-				if (comps == null) return false;
-				foreach (var c in comps)
+				for (Transform cur = go.transform; cur != null; cur = cur.parent)
 				{
-					if (c == null) continue;
-					string n;
-					try { n = MenuCard.Il2CppNameOf(c); } catch { continue; }
-					if (string.IsNullOrEmpty(n)) continue;
-					if (n.IndexOf("Pickup", StringComparison.OrdinalIgnoreCase) >= 0
-					 || n.IndexOf("ObjectSync", StringComparison.OrdinalIgnoreCase) >= 0
-					 || n.IndexOf("UdonSync", StringComparison.OrdinalIgnoreCase) >= 0) return true;
+					var cgo = cur.gameObject;
+					if (cgo == null) continue;
+					var ub = cgo.GetComponent<VRC.Udon.UdonBehaviour>();
+					if (ub != null && (HasSync(ub) || ub.IsNetworkingSupported)) return true;
+					var comps = cgo.GetComponents<Component>();
+					if (comps == null) continue;
+					foreach (var c in comps)
+					{
+						if (c == null) continue;
+						string n;
+						try { n = MenuCard.Il2CppNameOf(c); } catch { continue; }
+						if (string.IsNullOrEmpty(n)) continue;
+						if (n.IndexOf("Pickup", StringComparison.OrdinalIgnoreCase) >= 0
+						 || n.IndexOf("ObjectSync", StringComparison.OrdinalIgnoreCase) >= 0
+						 || n.IndexOf("UdonSync", StringComparison.OrdinalIgnoreCase) >= 0) return true;
+					}
 				}
 			}
 			catch { }
 			return false;
+		}
+
+		public static bool CanOwn(Entry e)
+		{
+			if (e == null || e.B == null) return false;
+			return CanOwnObject(e.B.gameObject);
+		}
+
+		public static bool TakeOwnershipDirect(GameObject go)
+		{
+			try
+			{
+				if (go == null) return false;
+				var me = VRC.SDKBase.Networking.LocalPlayer;
+				if (me == null) return false;
+
+				bool took = false;
+				for (Transform cur = go.transform; cur != null; cur = cur.parent)
+				{
+					var cgo = cur.gameObject;
+					if (cgo == null) continue;
+					bool canOwnThis = false;
+					var ub = cgo.GetComponent<VRC.Udon.UdonBehaviour>();
+					if (ub != null && (HasSync(ub) || ub.IsNetworkingSupported)) canOwnThis = true;
+					else
+					{
+						var comps = cgo.GetComponents<Component>();
+						if (comps != null)
+						{
+							foreach (var c in comps)
+							{
+								if (c == null) continue;
+								string n;
+								try { n = MenuCard.Il2CppNameOf(c); } catch { continue; }
+								if (string.IsNullOrEmpty(n)) continue;
+								if (n.IndexOf("Pickup", StringComparison.OrdinalIgnoreCase) >= 0
+								 || n.IndexOf("ObjectSync", StringComparison.OrdinalIgnoreCase) >= 0
+								 || n.IndexOf("UdonSync", StringComparison.OrdinalIgnoreCase) >= 0) { canOwnThis = true; break; }
+							}
+						}
+					}
+
+					if (canOwnThis)
+					{
+						if (!VRC.SDKBase.Networking.IsOwner(me, cgo))
+						{
+							VRC.SDKBase.Networking.SetOwner(me, cgo);
+						}
+						took = true;
+					}
+				}
+				return took;
+			}
+			catch { return false; }
 		}
 
 		// Manual or Continuous: the behaviour has synced variables and therefore network state of its own.
@@ -500,6 +558,29 @@ namespace VRChatArchiveMod.Modules
 			catch (Exception ex)
 			{
 				Status = "global event failed: " + ex.Message;
+				return false;
+			}
+		}
+
+		public static bool RunGlobalDirect(VRC.Udon.UdonBehaviour ub, string ev)
+		{
+			try
+			{
+				if (ub == null || string.IsNullOrEmpty(ev)) return false;
+				if (ev[0] == '_') return false;
+				if (!_netResolved) ResolveNet();
+				if (_sendNet == null || _netTarget == null) return false;
+
+				object all;
+				try { all = Enum.Parse(_netTarget, "All"); }
+				catch { all = Enum.ToObject(_netTarget, 0); }
+
+				_sendNet.Invoke(ub, new object[] { all, ev });
+				return true;
+			}
+			catch (Exception ex)
+			{
+				VRChatArchiveModPlugin.Logger.LogWarning($"[UdonManager] RunGlobalDirect failed: {ex.Message}");
 				return false;
 			}
 		}
@@ -796,7 +877,7 @@ namespace VRChatArchiveMod.Modules
 			try
 			{
 				var tType = Il2CppType.Of<UnityEngine.UI.Text>();
-				var found = UnityEngine.Object.FindObjectsByType(tType, FindObjectsSortMode.None);
+				var found = VRChatArchiveMod.Core.Live.AllOfType(tType, FindObjectsSortMode.None);
 				if (found != null)
 					for (int i = 0; i < found.Length; i++)
 					{
@@ -811,7 +892,7 @@ namespace VRChatArchiveMod.Modules
 			try
 			{
 				var tType = Il2CppType.Of<TMPro.TMP_Text>();
-				var found = UnityEngine.Object.FindObjectsByType(tType, FindObjectsSortMode.None);
+				var found = VRChatArchiveMod.Core.Live.AllOfType(tType, FindObjectsSortMode.None);
 				if (found != null)
 					for (int i = 0; i < found.Length; i++)
 					{
@@ -894,12 +975,27 @@ namespace VRChatArchiveMod.Modules
 				}
 				catch (Exception bex) { VRChatArchiveModPlugin.Logger.LogWarning($"[UdonManager] Button click failed on {e.Path}: {bex.Message}"); }
 
-				// 2) ANY uGUI BUTTON WIRED TO THIS SCRIPT. The usual layout is a Button on a menu
-				//    object whose onClick targets an UdonBehaviour living SOMEWHERE ELSE in the
-				//    hierarchy \u2014 the script the user selected has no Button of its own, so stage 1
-				//    finds nothing and Interact() below is a no-op for it. The persistent listeners
-				//    of every scene Button name their target object; the ones aimed at OUR behaviour
-				//    (same instance id) are the buttons that actually drive it, so those are pressed.
+				// 1b) uGUI TOGGLE ON THE SCRIPT'S OWN OBJECT. Many menus (settings, switches, options)
+				//     use Toggle components whose onValueChanged drives the Udon script.
+				try
+				{
+					var tog = go.GetComponent<UnityEngine.UI.Toggle>();
+					if (tog != null)
+					{
+						tog.isOn = !tog.isOn;
+						Status = (tog.isOn ? "enabled toggle " : "disabled toggle ") + Trunc(e.Short, 28);
+						VRChatArchiveModPlugin.Logger.LogInfo($"[UdonManager] uGUI Toggle.isOn={tog.isOn} on {e.Path}");
+						return true;
+					}
+				}
+				catch (Exception tex) { VRChatArchiveModPlugin.Logger.LogWarning($"[UdonManager] Toggle click failed on {e.Path}: {tex.Message}"); }
+
+				// 2) ANY uGUI BUTTON OR TOGGLE WIRED TO THIS SCRIPT. The usual layout is a Button or Toggle
+				//    on a menu object whose onClick/onValueChanged targets an UdonBehaviour living SOMEWHERE
+				//    ELSE in the hierarchy — the script the user selected has no Button/Toggle of its own, so
+				//    stage 1 finds nothing and Interact() below is a no-op for it. The persistent listeners
+				//    of every scene Button and Toggle name their target object; the ones aimed at OUR behaviour
+				//    (same instance id) are the controls that actually drive it, so those are triggered.
 				//    Same filters as Rescan: no assets (HideAndDontSave), no unloaded-scene objects.
 				try
 				{
@@ -910,7 +1006,6 @@ namespace VRChatArchiveMod.Modules
 						{
 							try
 							{
-								// TryCast, never `as`: the managed type of a proxy is not its runtime type.
 								var btn = allBtn[i]?.TryCast<UnityEngine.UI.Button>();
 								if (btn == null || btn.hideFlags == HideFlags.HideAndDontSave) continue;
 								var bgo = btn.gameObject;
@@ -934,13 +1029,43 @@ namespace VRChatArchiveMod.Modules
 							}
 							catch { }
 						}
+
+					var allTog = Resources.FindObjectsOfTypeAll(Il2CppType.From(typeof(UnityEngine.UI.Toggle)));
+					if (allTog != null)
+						for (int i = 0; i < allTog.Length; i++)
+						{
+							try
+							{
+								var tog = allTog[i]?.TryCast<UnityEngine.UI.Toggle>();
+								if (tog == null || tog.hideFlags == HideFlags.HideAndDontSave) continue;
+								var tgo = tog.gameObject;
+								if (tgo == null) continue;
+								Scene sc;
+								try { sc = tgo.scene; } catch { continue; }
+								if (!sc.IsValid() || !sc.isLoaded) continue;
+								var ev = tog.onValueChanged;
+								if (ev == null) continue;
+								int n = ev.GetPersistentEventCount();
+								for (int k = 0; k < n; k++)
+								{
+									var target = ev.GetPersistentTarget(k);
+									if (target == null || target.GetInstanceID() != e.Id) continue;
+									tog.isOn = !tog.isOn;
+									clicked++;
+									VRChatArchiveModPlugin.Logger.LogInfo($"[UdonManager] uGUI Toggle {PathOf(tog.transform)} \u2192 {ev.GetPersistentMethodName(k)} on {e.Path}");
+									break;
+								}
+							}
+							catch { }
+						}
+
 					if (clicked > 0)
 					{
-						Status = "clicked " + clicked + " UI button(s) wired to " + Trunc(e.Short, 24);
+						Status = "clicked/toggled " + clicked + " UI control(s) wired to " + Trunc(e.Short, 24);
 						return true;
 					}
 				}
-				catch (Exception sex) { VRChatArchiveModPlugin.Logger.LogWarning($"[UdonManager] button scan failed for {e.Path}: {sex.Message}"); }
+				catch (Exception sex) { VRChatArchiveModPlugin.Logger.LogWarning($"[UdonManager] UI controls scan failed for {e.Path}: {sex.Message}"); }
 
 				// 3) WORLD-SPACE interactable (_interact) \u2014 doors, levers, pickups. Interact() only
 				//    fires a script's _interact entry point, so when the export list is readable and

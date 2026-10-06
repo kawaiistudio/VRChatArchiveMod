@@ -76,6 +76,17 @@ namespace VRChatArchiveMod.Core
 		}
 		catch { }
 
+		// 2b) ImmutableArray<string>, read WITHOUT calling it. A script with no exported symbols hands
+		//     back a DEFAULT ImmutableArray whose backing `array` is null, and its native get_Length /
+		//     ICollection.Count dereference that null: an access violation that killed the game the
+		//     moment such a script was selected in the Udon Manager (reported 2026-09-19). The backing
+		//     field is read at its offset instead; null simply means "no symbols".
+		try
+		{
+			if (TryImmutableArray(seq, outp, out bool handled) && handled) { LastPath = "ImmutableArray.array"; return outp; }
+		}
+		catch { }
+
 		// 3) ANY ICollection<string> -- Dictionary.KeyCollection included -- is COPIED into an array
 		//    with its own CopyTo and then indexed. This replaces the enumerator walk that was here:
 		//    on 2026-09-02 the game died on the first MoveNext() of the boxed struct enumerator that
@@ -117,11 +128,13 @@ namespace VRChatArchiveMod.Core
 		}
 		catch { }
 
-		// 4) Indexable proxy (ImmutableArray<string> and friends): Length/Count + Item.
+		// 4) Indexable proxy: Length/Count + Item. Never for an ImmutableArray — its getters are the
+		//    ones that crash on a default instance (see 2b).
 			try
 			{
 				LastPath = "indexer";
 				var t = seq.GetType();
+				if (t.Name.StartsWith("ImmutableArray", StringComparison.Ordinal)) return outp;
 				var lenP = t.GetProperty("Length") ?? t.GetProperty("Count");
 				var item = t.GetProperty("Item");
 				if (lenP?.GetValue(seq) is int len && item != null)
@@ -147,6 +160,122 @@ namespace VRChatArchiveMod.Core
 			}
 			catch { }
 			return outp;
+		}
+
+		// INDEXING AN IL2CPP List<T> WITHOUT CALLING get_Item.
+		//
+		// `list[i]` compiles to List<T>.get_Item, and on VRChat 1903 that method is MIS-BOUND. The mod
+		// says so at startup, in as many words:
+		//
+		//     [MemberAlign] List`1 : le token 0x060035A6 tombe sur une methode de forme 'o5' au lieu
+		//                            de 'g5' — appel refuse.
+		//
+		// 'g5' is "returns the generic parameter, takes an int" -- that is get_Item -- and the token
+		// lands on something of shape 'o5' instead. Invoking it jumps into the wrong method and the
+		// process dies inside il2cpp_runtime_invoke, an access violation no try/catch can stop. That
+		// is what killed the game from ArchiveHijackModule.PickTarget, whose only sin was `live[i]`.
+		//
+		// The backing store is reachable with no call at all: `_items` and `_size` are FIELDS, and a
+		// field read is an offset read repaired by FieldOffsetFix, never a runtime_invoke. Indexing the
+		// array wrapper is likewise direct memory.
+		//
+		// The snapshot is also the safer shape for callers: VRChat rebuilds its category list while you
+		// browse, and a managed copy cannot be invalidated mid-loop.
+		internal static List<T> Items<T>(Il2CppSystem.Collections.Generic.List<T> list) where T : Il2CppObjectBase
+		{
+			var outp = new List<T>();
+			if (list == null) return outp;
+
+			// VALIDATE EVERY POINTER BEFORE TOUCHING IT — a try/catch CANNOT save this.
+			//
+			// The first version read `list._items` and then `arr.Length`, and on 1903 that crashed the
+			// game inside il2cpp_array_length: `_items` came back pointing at memory that is not a live
+			// array, and `.Length` dereferenced it. An access violation in native code is not a .NET
+			// exception, so the surrounding try/catch never ran. The reflected/property reads of a
+			// generic List on this reshuffled build are simply not trustworthy.
+			//
+			// So nothing is dereferenced until NativeGuard (VirtualQuery-backed) confirms the pointer is
+			// a real il2cpp object: the list itself, then the backing array, then each element. A bad
+			// pointer makes the feature return empty; it can no longer end the process.
+			try
+			{
+				IntPtr listPtr;
+				try { listPtr = list.Pointer; } catch { return outp; }
+				if (!NativeGuard.IsLiveObject(listPtr)) return outp;
+
+				int n;
+				try { n = list._size; } catch { return outp; }
+				if (n <= 0 || n > 16384) return outp;      // a category list of 16k is corruption, not data
+
+				Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppArrayBase<T> arr;
+				try { arr = list._items; } catch { return outp; }
+				if (arr == null) return outp;
+
+				IntPtr arrPtr;
+				try { arrPtr = arr.Pointer; } catch { return outp; }
+				// The crash was here: a garbage array pointer. Proven live before Length or indexing.
+				if (!NativeGuard.IsLiveObject(arrPtr)) return outp;
+
+				int cap;
+				try { cap = arr.Length; } catch { return outp; }
+				if (cap < 0 || cap > 16384) return outp;
+				if (n > cap) n = cap;
+
+				for (int i = 0; i < n; i++)
+				{
+					T item;
+					try { item = arr[i]; } catch { continue; }
+					if (item == null) continue;
+					IntPtr ip;
+					try { ip = item.Pointer; } catch { continue; }
+					if (ip == IntPtr.Zero || !NativeGuard.IsLiveObject(ip)) continue;
+					outp.Add(item);
+				}
+			}
+			catch (Exception e)
+			{
+				if (!_itemsWarned)
+				{
+					_itemsWarned = true;
+					VRChatArchiveModPlugin.Logger.LogWarning(
+						"[Il2CppSeq] lecture de List<T> par _items/_size impossible (" + e.Message
+						+ ") — liste rendue vide plutot que d'appeler get_Item, qui tue le process sur ce build.");
+				}
+			}
+			return outp;
+		}
+
+		private static bool _itemsWarned;
+
+		// handled = the object IS an ImmutableArray (answer final, even when empty).
+		private static bool TryImmutableArray(object seq, List<string> outp, out bool handled)
+		{
+			handled = false;
+			var bo = seq as Il2CppObjectBase;
+			if (bo == null) return false;
+			IntPtr obj;
+			try { obj = bo.Pointer; } catch { return false; }
+			if (obj == IntPtr.Zero || !NativeGuard.IsLiveObject(obj)) return false;
+
+			IntPtr klass = IL2CPP.il2cpp_object_get_class(obj);
+			if (klass == IntPtr.Zero) return false;
+			IntPtr np = IL2CPP.il2cpp_class_get_name(klass);
+			string cn = np == IntPtr.Zero ? null : System.Runtime.InteropServices.Marshal.PtrToStringAnsi(np);
+			if (cn == null || !cn.StartsWith("ImmutableArray", StringComparison.Ordinal)) return false;
+			handled = true;
+
+			IntPtr field = IL2CPP.il2cpp_class_get_field_from_name(klass, "array");
+			if (field == IntPtr.Zero) return true;
+			uint off = IL2CPP.il2cpp_field_get_offset(field);
+			if (off < 0x10 || off > 0x100) return true;
+			IntPtr arrPtr = System.Runtime.InteropServices.Marshal.ReadIntPtr(obj, (int)off);
+			if (arrPtr == IntPtr.Zero || !NativeGuard.IsLiveObject(arrPtr)) return true;
+
+			var arr = new Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppStringArray(arrPtr);
+			int n = arr.Length;
+			if (n < 0 || n > 100000) return true;
+			for (int i = 0; i < n && i < Cap; i++) { string s = arr[i]; if (!string.IsNullOrEmpty(s)) outp.Add(s); }
+			return true;
 		}
 	}
 }

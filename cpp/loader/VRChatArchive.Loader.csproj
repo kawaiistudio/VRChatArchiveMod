@@ -1,0 +1,46 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    The managed half of VRChat Archive (C++). It is a thin BepInEx IL2CPP plugin that loads the
+    native engine; it links against the BepInEx install in the game folder, never NuGet (BepInEx 6
+    IL2CPP is not version-tolerant). Point it at your modded VRChat folder with -p:GameDir="<folder>", or set the VRCHAT_GAME_DIR
+    environment variable.
+  -->
+  <PropertyGroup>
+    <TargetFramework>net6.0</TargetFramework>
+    <AssemblyName>VRChatArchiveMod</AssemblyName>
+    <RootNamespace>VRChatArchive</RootNamespace>
+    <LangVersion>latest</LangVersion>
+    <Nullable>disable</Nullable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+    <GenerateAssemblyInfo>true</GenerateAssemblyInfo>
+
+    <GameDir Condition="'$(GameDir)' == ''">$(VRCHAT_GAME_DIR)</GameDir>
+    <BepInExDir>$(GameDir)\BepInEx</BepInExDir>
+    <CoreDir>$(BepInExDir)\core</CoreDir>
+  </PropertyGroup>
+
+  <Target Name="CheckBepInEx" BeforeTargets="BeforeBuild">
+    <Error Condition="!Exists('$(CoreDir)')"
+           Text="BepInEx core not found at '$(CoreDir)'. Build with -p:GameDir=&quot;&lt;your VRChat folder&gt;&quot;." />
+  </Target>
+
+  <ItemGroup>
+    <Reference Include="BepInEx.Core"          HintPath="$(CoreDir)\BepInEx.Core.dll"          Private="false" />
+    <Reference Include="BepInEx.Unity.Common"  HintPath="$(CoreDir)\BepInEx.Unity.Common.dll"  Private="false" />
+    <Reference Include="BepInEx.Unity.IL2CPP"  HintPath="$(CoreDir)\BepInEx.Unity.IL2CPP.dll"  Private="false" />
+  </ItemGroup>
+
+  <!--
+    ONE SHIPPED DLL. The native engine is embedded as a resource and written out at load, so the
+    whole mod deploys as a single file. The engine must be built first; if it is missing the build
+    still succeeds (a developer build can run with a loose engine beside the plugin).
+  -->
+  <ItemGroup>
+    <EmbeddedResource Include="..\native\x64\Release\VRChatArchiveNative.dll"
+                      Condition="Exists('..\native\x64\Release\VRChatArchiveNative.dll')"
+                      LogicalName="VRChatArchive.Native.dll" />
+  </ItemGroup>
+
+</Project>

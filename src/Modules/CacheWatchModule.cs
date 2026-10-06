@@ -36,7 +36,7 @@ namespace VRChatArchiveMod.Modules
 		{
 			try
 			{
-				float now = Time.realtimeSinceStartup;
+				float now = VaClock.Now;
 				if (now < _next) return;
 				_next = now + 1f;
 

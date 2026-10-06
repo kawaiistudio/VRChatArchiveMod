@@ -57,7 +57,7 @@ namespace VRChatArchiveMod.Modules
 			try
 			{
 				if (!Active) return;
-				float now = Time.realtimeSinceStartup;
+				float now = VaClock.Now;
 				if (now < _nextSweep) return;
 				// 5 s, not 2: this walks the loaded-asset table, which is far heavier than a scene
 				// query, and the set of backgrounds changes about once per session.

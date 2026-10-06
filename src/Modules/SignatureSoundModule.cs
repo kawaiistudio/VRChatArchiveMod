@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using UnityEngine;
 using VRChatArchiveMod.Core;
@@ -97,97 +97,20 @@ namespace VRChatArchiveMod.Modules
 
 		public override void OnUpdate()
 		{
-			try
-			{
-				if (!ModConfig.SignatureSoundEnabled.Value) return;
-
-				float now = Time.realtimeSinceStartup;
-				if (now < _nextScan) return;
-				_nextScan = now + ScanSeconds;
-
-				// The mod's own roster, already maintained once per refresh — walking
-				// VRCPlayerApi.AllPlayers again here would pay for the same list a third time.
-				var roster = VaTagsModule.Roster;
-				if (roster == null || roster.Count == 0) return;
-
-				var present = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-				for (int i = 0; i < roster.Count; i++)
-				{
-					var e = roster[i];
-					if (e == null || string.IsNullOrEmpty(e.UserId)) continue;
-					present.Add(e.UserId);
-
-					if (_seen.Contains(e.UserId)) continue;
-
-					// New to us this pass. On the settle pass only the local player counts as an
-					// arrival; everyone else was already standing here when we walked in.
-					if (!_settled && !e.IsLocal) continue;
-
-					var sig = Find(e.UserId);
-					if (sig != null) Play(sig, e.Name);
-				}
-
-				_seen.RemoveWhere(uid => !present.Contains(uid));
-				foreach (var uid in present) _seen.Add(uid);
-				_settled = true;
-			}
-			catch { }
+			// Signature sound disabled
+			return;
 		}
 
 		private static void Play(Signature sig, string who)
 		{
-			try
-			{
-				if (sig.Clip == null)
-				{
-					if (sig.Tried) return;                 // decoded once and failed: never retry per arrival
-					sig.Tried = true;
-					byte[] wav = AssetLoader.RawBytes(sig.Resource);
-					if (wav == null)
-					{
-						VRChatArchiveModPlugin.Logger.LogWarning("[SignatureSound] embedded resource missing: " + sig.Resource);
-						return;
-					}
-					sig.Clip = WavAudio.Decode(wav, "ArchiveSignature_" + sig.Label);
-					if (sig.Clip == null)
-					{
-						VRChatArchiveModPlugin.Logger.LogWarning("[SignatureSound] " + sig.Resource
-							+ " did not decode — it must be 16-bit PCM WAV.");
-						return;
-					}
-				}
-
-				if (_src == null)
-				{
-					var go = new GameObject("ArchiveSignatureSound");
-					UnityEngine.Object.DontDestroyOnLoad(go);
-					go.hideFlags = HideFlags.HideAndDontSave;
-					_src = go.AddComponent<AudioSource>();
-					_src.spatialBlend = 0f;              // 2D: an arrival can be on the far side of the map
-					_src.loop = false;
-					_src.playOnAwake = false;
-					_src.bypassEffects = true;
-					_src.bypassListenerEffects = true;
-					_src.ignoreListenerPause = true;
-				}
-
-				_src.volume = Mathf.Clamp01(ModConfig.SignatureSoundVolume.Value);
-				_src.Stop();
-				_src.PlayOneShot(sig.Clip, _src.volume);
-				LastPlayed = sig.Label;
-				VRChatArchiveModPlugin.Logger.LogInfo("[SignatureSound] " + sig.Label + " arrived ("
-					+ (string.IsNullOrEmpty(who) ? sig.Uid : who) + ") — playing " + sig.Resource + ".");
-			}
-			catch (Exception e)
-			{
-				VRChatArchiveModPlugin.Logger.LogWarning("[SignatureSound] play failed: " + e.Message);
-			}
+			// Signature sound disabled
+			return;
 		}
 
 		/// <summary>Preview from the menu, without waiting for that person to walk in.</summary>
 		public static void PreviewFirst()
 		{
-			if (Table.Length > 0) Play(Table[0], Table[0].Label);
+			StopNow();
 		}
 
 		public static void StopNow() { try { if (_src != null) _src.Stop(); } catch { } }

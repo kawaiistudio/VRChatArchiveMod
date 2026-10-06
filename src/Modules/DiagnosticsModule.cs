@@ -101,7 +101,7 @@ namespace VRChatArchiveMod.Modules
 
 		private float _nextHealth;
 		private float _nextFlush;
-		private Application.LogCallback _unityCb;
+		private Action<string, string, LogType> _unityHandler;
 		private BepInEx.Logging.ManualLogSource _src;
 
 		public override void OnInitialize()
@@ -124,11 +124,12 @@ namespace VRChatArchiveMod.Modules
 				_src = VRChatArchiveModPlugin.Logger;
 				if (_src != null) _src.LogEvent += OnPluginLog;
 
-				// Unity's errors only. Ordinary Debug.Log traffic belongs in LogCapture.
-				// IL2CPP needs the delegate marshalled and kept alive, same idiom as LogCapture.
-				_unityCb = Core.Il2CppDelegates.TryConvert<Application.LogCallback>(
-					(Action<string, string, LogType>)OnUnityLog, "Diagnostics");
-				if (_unityCb != null) Application.add_logMessageReceivedThreaded(_unityCb);
+				// Unity's errors only. Ordinary Debug.Log traffic belongs in LogCapture. Routed through
+				// Core.UnityLog rather than a converted Application.LogCallback: the delegate bridge is
+				// closed on this build, and a diagnostics report that cannot see Unity's own errors is
+				// exactly the report you need when something is broken.
+				_unityHandler = OnUnityLog;
+				Core.UnityLog.Subscribe(_unityHandler, "Diagnostics");
 
 				// ALWAYS ON, not only in a debug build.
 				//
@@ -158,7 +159,7 @@ namespace VRChatArchiveMod.Modules
 			try
 			{
 				if (_src != null) _src.LogEvent -= OnPluginLog;
-				if (_unityCb != null) Application.remove_logMessageReceivedThreaded(_unityCb);
+				Core.UnityLog.Unsubscribe(_unityHandler); _unityHandler = null;
 			}
 			catch { }
 			Line("=== session ended ===");
@@ -190,7 +191,6 @@ namespace VRChatArchiveMod.Modules
 				Line($" esp              : capsule={ModConfig.EspCapsule.Value} meshGlow={ModConfig.EspHighlight.Value} portals={ModConfig.EspPortals.Value} items={ModConfig.EspItems.Value} throughWalls={ModConfig.EspThroughWalls.Value}");
 				Line($" radar            : {ModConfig.RadarEnabled.Value}");
 				Line($" antiCrash        : {ModConfig.AntiCrashEnabled.Value}");
-				Line($" antiBlock        : {ModConfig.AntiBlockEnabled.Value}");
 				Line($" udonLog          : {ModConfig.UdonLogEnabled.Value}  frameEvents={ModConfig.UdonLogFrameEvents.Value}");
 				Line($" watchlist        : {ModConfig.WatchlistEnabled.Value}");
 			}
@@ -239,7 +239,7 @@ namespace VRChatArchiveMod.Modules
 			try
 			{
 				if (_w == null) return;
-				float now = Time.realtimeSinceStartup;
+				float now = VaClock.Now;
 
 				// Buffered writer (AutoFlush is off): push it to disk about once a second, so a log
 				// storm costs one syscall per second instead of thousands per second.
@@ -305,9 +305,23 @@ namespace VRChatArchiveMod.Modules
 			float total = 0f;
 			for (int i = 0; i < report.Count; i++) total += report[i].Value;
 
-			var sb = new System.Text.StringBuilder(160);
+			// THE TWO NUMBERS THAT DECIDE HOW TO READ THE REST (2026-09-13).
+			//
+			// The same 400 ms/s means completely different things depending on whether the QuickMenu
+			// was open (the menu's own drawing is most of it, and closing it costs nothing) and how
+			// many players are in the instance (every per-player pass scales with it). Both were
+			// missing, so every reading of this line needed a second investigation to interpret —
+			// the menu state alone was what separated "31 ms/s" from "443 ms/s" in the same session.
+			bool qmOpen = false;
+			try { qmOpen = Core.QuickMenu.Visible; } catch { }
+			int players = 0;
+			try { players = VaTagsModule.Roster.Count; } catch { }
+
+			var sb = new System.Text.StringBuilder(192);
 			sb.Append("[Perf] ").Append(fps.ToString("F0")).Append(" fps — mod costs ")
-			  .Append(total.ToString("F1")).Append(" ms/s in total. Worst:");
+			  .Append(total.ToString("F1")).Append(" ms/s in total")
+			  .Append(" [menu ").Append(qmOpen ? "OPEN" : "shut")
+			  .Append(", ").Append(players).Append(" player(s)]. Worst:");
 			for (int i = 0; i < report.Count && i < 5; i++)
 			{
 				if (report[i].Value < 0.5f) break;
@@ -327,11 +341,12 @@ namespace VRChatArchiveMod.Modules
 		{
 			try
 			{
-				int players = 0;
-				try { var ps = VRC.SDKBase.VRCPlayerApi.AllPlayers; players = ps != null ? ps.Count : -1; } catch { players = -1; }
+				int players = -1;
+				if (Core.VaPlayers.Ready)
+					try { var ps = VRChatArchiveMod.Core.VaPlayers.All(); players = ps != null ? ps.Count : -1; } catch { players = -1; }
 
 				Line("");
-				Line($"--- health @ {DateTime.Now:HH:mm:ss}  ({Mathf.RoundToInt(1f / Mathf.Max(0.0001f, Time.smoothDeltaTime))} fps) ---");
+				Line($"--- health @ {DateTime.Now:HH:mm:ss}  ({Mathf.RoundToInt(1f / Mathf.Max(0.0001f, VaClock.Delta))} fps) ---");
 				Line($"  players in instance : {players}");
 				Line($"  roster (VaTags)     : {VaTagsModule.Roster.Count}   tagged users in DB: {VaTagsModule.RecordsLoaded}");
 				Line($"  tag fetch           : {VaTagsModule.LastFetchInfo}");

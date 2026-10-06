@@ -35,7 +35,7 @@ namespace VRChatArchiveMod.Modules
 			{
 				// No config gate: Favorites/SocialList went 2026-09-01. Whether this runs at all is
 				// decided by its Register line in Plugin.cs (currently disarmed).
-				float now = Time.realtimeSinceStartup;
+				float now = VaClock.Now;
 				if (now < _next) return;
 
 				// FAST UNTIL IT WORKS, then slow. The first attempt often fires before the mod has

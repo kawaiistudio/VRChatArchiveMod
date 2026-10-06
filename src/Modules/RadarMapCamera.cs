@@ -65,7 +65,13 @@ namespace VRChatArchiveMod.Modules
 		{
 			try
 			{
-				if (!ModConfig.RadarMap.Value || _failed) { Release(); return false; }
+				// OFF RE-ARMS THE FEATURE (2026-09-13). _failed latches on the first render or create
+				// error and nothing ever cleared it, so a single bad frame disabled the map for the
+				// rest of the session and switching it off and back on could not recover it — a dead
+				// switch. The OFF state is the natural place to clear the latch: the next ON gets a
+				// real retry, and a genuinely broken camera simply latches again on its first frame.
+				if (!ModConfig.RadarMap.Value) { _failed = false; Release(); return false; }
+				if (_failed) { Release(); return false; }
 				if (playerCam == null) return false;
 
 				var local = PlayerRef.LocalTransform();
@@ -101,7 +107,7 @@ namespace VRChatArchiveMod.Modules
 				// (5 / 1000) rather than these values, so a fresh, never-rendered texture is drawn on
 				// its first tick instead of showing uncleared VRAM -- HasRender alone cannot tell,
 				// since Release() leaves it set.
-				if (due && HasRender && _frame < 15 && Time.timeSinceLevelLoad > 2f
+				if (due && HasRender && _frame < 15 && VaClock.Now > 2f
 					&& (pos - RenderPos).sqrMagnitude < 0.0025f
 					&& Mathf.Abs(Mathf.DeltaAngle(yaw, RenderYaw)) < 0.3f
 					&& Mathf.Abs(_cam.orthographicSize - size) < 0.01f
@@ -124,7 +130,7 @@ namespace VRChatArchiveMod.Modules
 				// waits ~650 ms, so a world that is already at 9 fps stops paying half its frame for a
 				// minimap. Nothing disappears in between: OnGui keeps blitting the cached texture, and
 				// the blit pans and rotates it to follow the player.
-				if (due && Time.realtimeSinceStartup < _nextAllowed) due = false;
+				if (due && VaClock.Now < _nextAllowed) due = false;
 
 				if (due)
 				{
@@ -153,7 +159,7 @@ namespace VRChatArchiveMod.Modules
 					// 1 ms render may repeat after 12 ms and a 52 ms one waits ~650 ms.
 					float ms = (float)((System.Diagnostics.Stopwatch.GetTimestamp() - t0) * 1000.0 / System.Diagnostics.Stopwatch.Frequency);
 					LastRenderMs = LastRenderMs <= 0f ? ms : LastRenderMs * 0.7f + ms * 0.3f;
-					_nextAllowed = Time.realtimeSinceStartup + Mathf.Clamp(LastRenderMs / 1000f / Budget, 0f, 1f);
+					_nextAllowed = VaClock.Now + Mathf.Clamp(LastRenderMs / 1000f / Budget, 0f, 1f);
 				}
 				return true;
 			}

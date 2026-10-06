@@ -25,7 +25,294 @@ Two consequences worth stating up front:
 
 ## [Unreleased]
 
-Nothing since 3.9.58.
+### Added — this repository becomes the open-source pack (2026-10-06)
+
+VRChat build 25686233 (2 October 2026) moved the client to Unity 6 and broke the mod. Rather than
+keep fighting it in private, the whole effort now lives here, with a call for help in the README:
+
+- `cpp/` — the native (C++) rewrite of the mod: a BepInEx IL2CPP plugin that embeds a native
+  engine talking to il2cpp directly, with neither Il2CppInterop nor the struct-layout patcher.
+- `tools/pack-port/` — the Unity 6 port kit: the il2cpp export remap for build 25686233, the
+  `VRChatStructFix` patcher source, the il2cpp struct-layout notes and the probes used to derive them.
+- `docs/UNITY6-PORT.md`, `docs/LOADER-AND-PACK.md`, `docs/MODULES.md` — what Unity 6 broke and how
+  far each fix got, how the pack and the loader work, and the module catalogue moved out of the README.
+- `src/` is synced with the current private tree (`<Version>` 3.9.347), which loads on Unity 6 but
+  with many features broken; the README lists them.
+
+### Removed
+
+- `DexCapture*` (the Dex patcher) and every reference to `AssetBundlePatchModule` (the plaintext-cache
+  decryptor). Both are server-gated paid features of the private build and are not part of this
+  repository. The call sites are stubbed and marked `[open-source build]`; nothing else depends on them.
+- `AntiBlockModule` (replaced by `TrueViewModule` at 3.9.245) and `EraLoadingModule` with its seven era resources, which the current private tree no longer carries.
+
+### Changed — `AntiBlockModule` replaced by `TrueViewModule` (3.9.245)
+
+The old module answered the problem by lying to the game: a Harmony prefix on *every* `bool(string)`
+method of `ModerationManager`, forced to return `false`, so VRChat never reached the decision to swap
+the avatar. That is one patch standing on a type whose shape is obfuscated afresh on every build — it
+patches each matching method without knowing which question that method actually answers, and the
+build where the check changes shape is the build where it silently patches the wrong thing.
+
+`TrueViewModule` patches nothing. It watches the player's own hierarchy and reacts to what is there:
+
+- the fallback `ForwardDirection/AvatarProxy` — the skeleton-less robot — is switched back off the
+  frame it appears, so it is never what you see;
+- while the real avatar is healthy, exactly one inactive clone of it is cached under the player;
+- when the real avatar is emptied, that clone is shown in its place, so the player keeps their own
+  appearance instead of becoming a robot or vanishing;
+- with nothing cached (you arrived after the swap), `VRCAvatarManager` is asked at most once every
+  30 s to re-download the real avatar, which brings the bone rig and animation back with it.
+
+Nameplate visibility and head-height placement, the `SelectRegion` laser hitbox, the local USpeak
+mute and animator culling are restored alongside, each behind its own config switch under
+`Moderation`. On by default.
+
+Two things were deliberately not carried over from the standalone this came from. Its survey ran
+`FindGameObjectsWithTag("Player")` plus a `GetComponentsInChildren` sweep per player on *every*
+frame; here the survey walks `VRCPlayerApi.AllPlayers` with a round-robin budget so each player is
+inspected ~4×/second, and the only per-frame work is one check over the players already known to be
+proxied. And every change is written to a ledger keyed by player id *before* it is made — disable,
+scene change and shutdown replay that ledger in reverse, so a player who left, or a world that
+reloaded, cannot leave a hidden fallback object, a parked nameplate positioner, an orphan clone or a
+raised culling mode behind.
+
+The config key is new (`Moderation/TrueView`) rather than inherited: the old `Moderation/AntiBlock`
+value was a decision about a different implementation, so an existing setting is not carried over.
+`AntiBlock.cs` is kept as `AntiBlock.cs.bak-trueview`.
+
+### Fixed — the favourites grid was built inside a switched-off panel (3.9.140)
+
+`ARCHIVE FAVORITES` took over its sidebar row, renamed the heading, answered the click and reported
+`populated 34 cell(s) for 34 favourite(s)` — on an empty screen. The cards were real; the column
+they were parented to was not on:
+
+```
+[FavGrid:avatar] grille posee sur la colonne
+    Panel_MM_DynamicSidePanel/Main/Panel_MM_AvatarLooks/.../Contents
+```
+
+Build 1903 parks four complete content panels side by side under `Main` — `Panel_My_Current_Avatar`,
+`Panel_MM_AvatarLooks`, `Panel_MM_Accessories`, `Panel_MM_Avatars` — each carrying an identically
+named `Panel_MM_ScrollRect/Viewport/VerticalLayoutGroup/Contents`, and leaves exactly **one** active.
+Resolving the container by name and taking the first match therefore picked a dormant one.
+This is the inactive-prefab-row trap, two levels higher up the tree.
+
+The name search now sweeps for an `activeInHierarchy` candidate first and only falls back to a
+dormant one when the page has nothing live at all; `Show()` additionally *proves* the overlay is on
+screen before claiming to have shown it, and rebuilds against the live column if VRChat has since
+switched pages. The log line now states the outcome (`[vivante]` / `[DORMANTE]`) rather than the
+intent — a log that says "placed" about a dead object is a log that lies.
+
+### Fixed — the menu theme cost 425 ms/s and dropped the game to 8 fps (3.9.140)
+
+```
+8 fps — mod costs 518.8 ms/s [menu OPEN, 0 player(s)]
+Worst: MenuTheme=425.4ms  MenuSkin=80.4ms  ArchiveFavGrid=1.6ms
+```
+
+The repaint, not the features. `MenuThemeModule` re-asserted its colours across **every** themed
+text and card three times a second; each element costs several il2cpp crossings (`TMP_Text.color`,
+`Selectable.colors` returning a `ColorBlock`, and Unity's null check, itself a native call), and
+`Canvas_MainMenu` holds thousands of texts.
+
+Nothing on screen needed that rate: VRChat restyles a page when it *shows* it, and a page is shown
+because something was pressed. `Button.Press` is already hooked for every button in the game, so
+`UiClick.LastPressAt` is now stamped there — before the early-out, since the press we do not handle
+is exactly the one that changes the page. The full sweep runs for 1.25 s after a press (and after a
+rescan); otherwise a bounded 192-item slice per canvas advances a rolling cursor.
+
+Three smaller cuts in the same pass: `TextCol()` was parsing a hex string **once per text** and is
+now hoisted; `IsEditable` and `IsOurButton` walked four ancestors calling `GetComponent` twice at
+each — eight interop calls per text on every scan — for an answer that cannot change, and are now
+skipped for any text already in `_seen`.
+
+### Fixed — the inspection socket reported a timeout it had caused (3.9.140)
+
+A scene-wide query runs on the frame, and the frame was 125 ms with the menu open, so the walk
+outlived its 3 s deadline and the socket answered `le thread principal n'a pas repondu` about a
+main thread that was answering, slowly. Raised to 20 s: this is a loopback diagnostic socket, off
+by default, where waiting is free and a wrong answer is not.
+
+### Fixed — two access violations that ended the process (3.9.117, 3.9.119)
+
+Opening the ARCHIVE FAVORITE category killed VRChat outright. The trace named it:
+
+```
+System.AccessViolationException
+  at Il2CppInterop.Runtime.IL2CPP.il2cpp_runtime_invoke
+  at Il2CppSystem.Collections.Generic.List`1.get_Item(Int32)
+  at ArchiveHijackModule.PickTarget()
+```
+
+`live[i]` on an il2cpp `List<T>` compiles to `get_Item`, and on 1903 that method is **mis-bound** — the
+mod says so at startup and nobody had read it as a crash warning: *"le token 0x060035A6 tombe sur une
+methode de forme 'o5' au lieu de 'g5'"*. `'g5'` is "returns the generic parameter, takes an int", which
+is `get_Item`; invoking it jumps into the wrong method. Those `MemberAlign … appel refuse` lines are
+future crashes, not noise.
+
+`Il2CppSeq.Items` replaces the indexer by reading the list's `_items`/`_size` **fields** — offset reads
+repaired by FieldOffsetFix, never a `runtime_invoke`. The first version then crashed in
+`il2cpp_array_length` because `_items` itself came back pointing at memory that is not a live array, and
+a try/catch cannot catch a native access violation. Every pointer is now proven with
+`NativeGuard.IsLiveObject` before it is dereferenced: the list, the backing array, then each element. A
+bad pointer yields an empty list; it can no longer end the process. Applied to all four indexing sites
+(`ArchiveHijackModule.PickTarget`, `ArchiveCategoryModule` ×3).
+
+### Fixed — the mod accused everyone in the room of blocking you (3.9.121)
+
+The `[B]` marker fired on every remote player at once. It reads `prop_Boolean_17` — "the 17th boolean",
+a **1886 index**. The obfuscator reorders members, so on 1903 that name lands on a different boolean,
+one that is true for any loaded player. This is not a cosmetic bug: the mod was stating a falsehood
+about real people.
+
+Two guards. A trustworthiness gate (the flag is only read when the class's members can actually be
+placed), and — the one that matters, because it is build-agnostic — a plausibility gate: **"everyone
+blocked you" is never true**. When the flag marks every remote player present (≥2), it is the flag that
+is wrong, not the room; the marker disarms for the session and shows nothing. A real block is rare and
+individual and cannot trip it.
+
+### Fixed — MenuTheme burned 700 ms/s of every second (3.9.118)
+
+With the menu open the profiler read `MenuTheme=700.4ms`. The "nothing found yet, keep looking" clause
+tested only the IMAGE target lists, but themed TEXT goes into `_live` — so on a canvas with text and no
+themed backgrounds both image lists read 0 while `_live` was full, and a complete
+`GetComponentsInChildren` sweep of `Canvas_MainMenu` ran **three times a second**. The emptiness test
+now counts text, and the bootstrap rescan is rate-limited instead of firing every tick. Steady state
+with the menu open is now ~25 ms/s.
+
+`ArchiveFavButtonModule` was separately caught at 990 ms/s: its lookup used `GameObject.Find`, a
+by-name sweep of every active object in the game, and its back-off was armed *before* the pass rather
+than after — so a pass as long as its own wait ran at 100% duty. It now descends from the cached menu
+root and re-arms in a `finally`.
+
+### Fixed — nameplate tags, by the name written on the plate (3.9.116)
+
+Two earlier approaches failed and both looked right. The plate's own fields: 207 references indexed off
+the live containers, not one of them the player. Its position: every container reads `(0,0,0)`, which
+was taken as proof that VRChat draws no nameplate for the local player — until a screenshot showed the
+plate, drawn, with the owner's name on it. The container is laid out inside a canvas and placed at
+render time, so `Transform.position` says nothing about where it appears.
+
+Plates are now matched by the **display name they show**, compared against the raw text and against the
+text with rich-text tags stripped (VRChat colours the name by trust rank). Two plates with the same name
+are refused rather than tagging the wrong player.
+
+### Fixed — VRCPlayer no longer carries the nameplate container (3.9.111)
+
+`FindNameplateContainer` fell through a chain that reads every proxy property and *invokes* every
+parameterless `GameObject` getter across 271 methods, then walks the whole field table — every two
+seconds, per player. The field dump proves the container is not on VRCPlayer for anyone on this build,
+so a failure on one player can never become a success on the next. Three complete failures now retire
+the chain for the session: `VaTags` went from **938.8 ms/s to 21.4 ms/s**.
+
+`CurrentInstanceOwnerId()` is memoised — third instance of "expensive failing lookup retried every
+frame", after `LocalUserId()` and the nameplate container.
+
+### Fixed — features that were dark because of the il2cpp delegate bridge (3.9.115, 3.9.116)
+
+The instance log's video URLs, the diagnostics report's Unity errors and the world-favourites watchdog
+all asked for an `Application.LogCallback`, and `ConvertDelegate` ends the process on 1903. `Core.UnityLog`
+hooks `Application.CallLogCallback` — the static method Unity's native logger calls for every line — so
+no delegate is created at all. One hook, shared. Harmony binds injected parameters by NAME and an
+Il2CppInterop proxy does not keep Unity's, so the postfix takes `__0/__1/__2` positionally.
+
+### Added — RuntimeUnityEditor, hosted by the mod (3.9.113)
+
+RUE's own BepInEx loader does one thing the mod cannot survive: `AddComponent<RuntimeUnityEditorHelper>()`,
+i.e. `ClassInjector`, which ends the process on 1903. It is not shipped. The core is constructed directly
+— the path RUE itself recommends — and driven from `IModule`'s `OnUpdate`/`OnLateUpdate`/`OnGui` through
+FramePump's Harmony anchors, so no type is injected anywhere. The assembly rides inside the mod as a
+gzipped embedded resource (+680 KB) and is served from memory, and a crash marker written before the
+constructor disarms it for the session if a boot ever kills the game. `F12`.
+
+### Changed — silent failures now say what they saw
+
+A miss that says nothing is a miss nobody can fix, and this build was full of them. `ArchiveFavButtonModule`
+returned on a null panel without a word; the answer, once it spoke, was that VRChat renamed the pane to
+**`Panel_AvatarDetailsCompact`** on 1903. The category retitle searched two paths that no longer exist and
+failed inside an empty `catch`; it now renames by the label's **text**, which cannot rot. `ArchiveHijack`'s
+`PickTarget` returned false from three branches in silence. `FindPanel` cached the first scene-valid panel
+even when it held no categories.
+
+`BuildRow` cloned the **inactive prefab template** rather than a live row, because
+`GetComponentsInChildren(true)` walks inactive objects — so the row was created in the template's container
+and never appeared, while the log honestly reported it added. Donors must now be `activeInHierarchy`, and
+both the row and grid logs name the container path: "built" is true even when it is built in the wrong place.
+
+### Changed — Archive avatar favourites get their own grid (3.9.123)
+
+`ArchiveHijackModule` cannot borrow VRChat's category on 1903: the obfuscated panel TYPE it targets was
+reassigned, so `Il2CppType.Of<Panel>()` resolves a stranger whose list reads empty, and re-deriving
+Panel/Category/Section by shape would rot again next build. `ArchiveFavGridModule` — the own-grid path
+already proven for worlds and social — is re-armed for **avatars only**, fed straight from the 34
+favourites the bridge already holds. Cards are built from scratch and a click wears the avatar through
+`VaTagsModule.WearById`, wired by `UiClick`. No obfuscated VRChat type is touched.
+
+
+### Fixed — the mod cost 938 ms/s looking for a nameplate that is not there (3.9.111)
+
+`FindNameplateContainer` looks for the plate's host **on VRCPlayer**: every proxy property read, every
+parameterless `GameObject` getter *invoked* across 271 methods, then the whole field table walked. On
+1903 the field dump proves the container is not on VRCPlayer for anyone — it moved under the global
+`NameplateManager` — so a failure on one player can never become a success on the next. The miss was
+nevertheless retried every two seconds, per player: with the menu open the profiler read
+`VaTags=938.8ms` and VRChat ran at 0 fps. Three complete failures now retire the chain for the session;
+the manager path stays, and a build that still carries the field returns before reaching it.
+
+`VaTagsModule.CurrentInstanceOwnerId()` is memoised (5 s hit / 1 s miss). It reads a property off the
+recovered `RoomManager` and then a member by name off `ApiWorldInstance`, and the roster called it on
+every pass — which is the whole of the *254 ms roster pass with zero players in it*. Third instance of
+the same defect, after `LocalUserId()` and the nameplate container.
+
+### Changed — two silent failures now say what they found
+
+`ArchiveFavButtonModule.Build()` returned on a null `Avatar_Marketplace_Panel` without a word, so a
+whole session of opening the avatar pane produced not one `[ArchiveFavBtn]` line and "the button never
+appears" was indistinguishable from "VRChat renamed the panel". It now lists the active
+`Avatar*Panel`/`CTA`/`Marketplace` objects, once every 30 s, only while the main menu is open and the
+row is missing.
+
+When every nameplate container sits on the origin, the log says so in plain words instead of printing
+distances: VRChat has drawn no nameplate, and it never draws one for the local player, so tags have
+nowhere to go until somebody else is in the instance.
+
+### Fixed — VRChat build 1903
+
+The interop assemblies this mod is built against were generated from VRChat build **1886**. On **1903**
+almost nothing reached what it was aiming at: a proxy binds each method by metadata token and each field
+by name, and the new build shifted the tokens and re-randomised VRChat's own class and member names. The
+console carried **359 `Field … was not found` errors**, fourteen types were reported missing, and every
+feature built on them was dark.
+
+The repair does not regenerate the interop; it re-identifies the members at runtime.
+
+- **Member shapes.** `vrchat-pack-tools/tokmap --table` now records, for every type of the 1886 interop,
+  the shape of each member in declaration order — arity, staticness, the kind of every parameter, and
+  the names of the types an obfuscator cannot rename. `Core/MemberAlign` reads the same sequence off the
+  live class and lines the two up. **544 methods and 137 fields** are placed this way.
+- **Classes are identified by their members, not by counting them.** Two numbers agreeing is weak
+  evidence: HighlightsFX was recovered as an unrelated class with the same 19 methods and 8 fields,
+  sharing five signatures out of nineteen. The member fingerprint now overrules the count, sees past a
+  wrongly recovered parent, and is given the nearest candidates rather than the first hundred and sixty
+  the image happens to list.
+- **Types still missing on 1903: 14 → 1.** Portal glow, the ESP highlight, the whole Photon stack
+  (guard, network log, voice mimic in both directions), VRC.Player, VRCPlayer, PlayerManager and
+  LoadBalancingClient all resolve again. **Console errors: 0.**
+- **A member that cannot be identified is refused, not guessed.** Every token translation is checked
+  against the member's recorded shape; a method VRChat stripped (a healthy `MethodInfo` with a null entry
+  point) is never handed out; and a hook is refused on any member placed only by a shape it shares with a
+  neighbour — a detour there hands VRChat's real arguments to a prefix written for different ones, which
+  is an access violation inside the trampoline before any of the mod's own code runs.
+
+### Fixed — performance
+
+- `VaTagsModule.LocalUserId()` was recomputed every frame by player grab and three more times per roster
+  pass, at four il2cpp crossings per miss — and before you are logged in, every call is a miss. Memoised.
+  **Mod cost with the menu open: 744 ms/s → 29 ms/s.**
+- Several player walks treated `api == null` as a liveness check. `VRCPlayerApi` is not a
+  `UnityEngine.Object`, so that test says nothing about the object behind the handle, and reading one
+  member off a stale entry is an access violation inside the proxy that no `try`/`catch` can stop.
 
 ---
 
@@ -203,12 +490,12 @@ VRChat then refuses to open the QuickMenu at all; the Launch Pad's 1024x280 prom
 re-purposed into the archiver and cache console; wallpaper and gradient theming with exact restore when
 switched off.
 
-**Safety, anti-crash and anti-abuse** — `AntiCrashModule`, `PhotonGuardModule`, `AntiBlockModule`,
+**Safety, anti-crash and anti-abuse** — `AntiCrashModule`, `PhotonGuardModule`, `TrueViewModule`,
 `NsfwFilterModule`, `WatchlistModule`, `BlockedByProbeModule`. The anti-crash pass clamps particle,
 light, audio, cloth, PhysBone, contact, polygon, material and shader bombs above thresholds set far over
 VRChat's own ratings, and journals every clamp so switching it off restores the avatar exactly. Photon
 Guard drops hostile **inbound** events (per-code block list, per-actor-and-code rolling rate limit)
-before VRChat dispatches them, and never sends, raises, edits or replays anything. Anti-Block locally
+before VRChat dispatches them, and never sends, raises, edits or replays anything. TrueView locally
 re-reveals avatars VRChat force-hides after a block, re-enabling only the exact objects it switched off.
 `BlockedByProbeModule` reads `ApiPlayerModeration.FetchAllAgainstMe` to fill the "who blocked me" sets
 and draws nothing.

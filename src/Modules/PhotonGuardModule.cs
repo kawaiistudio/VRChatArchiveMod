@@ -93,7 +93,7 @@ namespace VRChatArchiveMod.Modules
 		private static int _dropsSinceLog;
 		private const int DropLogEvery = 200;
 
-		// Monotonic, thread-neutral clock. Time.realtimeSinceStartup is main-thread only, and while
+		// Monotonic, thread-neutral clock. VaClock.Now is main-thread only, and while
 		// Photon dispatch is on the main thread today, a guard that would throw from a worker thread
 		// is a guard that silently returns true (see the catch in the prefix) — i.e. no guard.
 		private static long NowMs => Environment.TickCount64;
@@ -291,6 +291,14 @@ namespace VRChatArchiveMod.Modules
 				int sender = -1;
 				try { code = (byte)GetMember(__0, "Code"); } catch { return true; }
 				try { sender = (int)GetMember(__0, "Sender"); } catch { return true; }
+
+				// Rule 0: Frozen players are dropped unconditionally (motion, voice, avatar sync)
+				if (sender > 0 && PlayerFreezeModule.IsActorFrozen(sender))
+				{
+					return false;
+				}
+
+				if (!_fEnabled) return true;
 
 				// If Code cannot be resolved on this build every event reads as code 0 from nobody,
 				// and a rate limit on that would mute the ENTIRE room. Unidentifiable = untouched.

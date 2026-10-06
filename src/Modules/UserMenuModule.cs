@@ -43,28 +43,45 @@ namespace VRChatArchiveMod.Modules
 		private static readonly string[] PagePaths =
 		{
 			"Menu_SelectedUser_Remote",
+			"Menu_SelectedUser_Remote(Clone)",
 			"Menu_SelectedUser_Local",
+			"Menu_SelectedUser_Local(Clone)",
 		};
 		private const string InfoPath = "ScrollRect/Viewport/VerticalLayoutGroup/UserProfile_Compact/UserDetails/Info";
+		private const string ContainerName = "Buttons_ArchivesTools";
+		private const string HeaderName = "Header_ArchivesTools";
 		private const string CloneCardName = "Button_VACloneAvatar";
 		private const string CopyCardName = "Button_VACopyAvi";
+		private const string MetaCardName = "Button_VACopyMeta";
+		private const string TeleportToCardName = "Button_VATeleportTo";
 		private const string OrbitCardName = "Button_VAOrbit";
 		private const string SitCardName = "Button_VASit";
 		private const string RingCardName = "Button_VARing";
 		private const string VoiceMimicCardName = "Button_VAVoiceMimic";
-		private static readonly string[] OurCardNames = { CloneCardName, CopyCardName, OrbitCardName, SitCardName, RingCardName, VoiceMimicCardName };
+		private const string FreezeCardName = "Button_VAFreezePlayer";
+		private const string ForceMicOffCardName = "Button_VAForceMicOff";
+		private static readonly string[] OurCardNames =
+		{
+			CloneCardName, CopyCardName, MetaCardName, TeleportToCardName,
+			OrbitCardName, SitCardName, RingCardName, VoiceMimicCardName,
+			FreezeCardName, ForceMicOffCardName
+		};
 
 		// Everything we put on ONE per-user page. There are two pages (yours / everyone else's)
 		// and each carries its own set of cards, so the clone label and the lit states are cached
-		// PER PAGE � a single set of fields could only ever describe the page injected last.
+		// PER PAGE.
 		private sealed class PageCards
 		{
 			public Transform Page;
-			public GameObject Clone, Copy, Orbit, Sit, Ring, VoiceMimic;
-			public string CloneState = "";   // "public" / "private" / "" � what the clone card currently shows
-			public bool LitOrbit, LitSit, LitRing, LitVoiceMimic;
-			// Unity-null once the game tears the page down: the cards go with it.
-			public bool Alive => Clone != null && Orbit != null;
+			public GameObject Header;
+			public GameObject Grid;
+			public GameObject Clone, Copy, Meta, TeleportTo;
+			public GameObject Orbit, Sit, Ring, VoiceMimic;
+			public GameObject Freeze, ForceMicOff;
+			public string CloneState = "";   // "public" / "private" / ""
+			public string LastUserId = null;
+			public bool? LitOrbit = null, LitSit = null, LitRing = null, LitVoiceMimic = null, LitFreeze = null;
+			public bool Alive => Grid != null && (Clone != null || Copy != null || Orbit != null || TeleportTo != null);
 		}
 		// Pages carrying our cards, keyed by the page's instance id. A rebuilt menu gets new ids,
 		// so a stale entry can never claim a page that no longer carries our cards.
@@ -78,6 +95,7 @@ namespace VRChatArchiveMod.Modules
 		// Pages whose labels were already dumped for diagnosis, plus a floor between dumps.
 		private readonly HashSet<int> _labelsDumped = new HashSet<int>();
 		private float _nextLabelDump;
+		private bool _wasQmOpen;
 
 		public override void OnUpdate()
 		{
@@ -87,48 +105,44 @@ namespace VRChatArchiveMod.Modules
 				// it. Forget it here so the "done" test below sends TryInject back for the new one.
 				_dead.Clear();
 				foreach (var kv in _injected) if (kv.Value == null || !kv.Value.Alive) _dead.Add(kv.Key);
-				for (int i = 0; i < _dead.Count; i++) _injected.Remove(_dead[i]);
+				// Destroy whatever is left of a dead record before forgetting it: "dead" now means
+				// "no card survived" (see PageCards.Alive), but a partially-destroyed page can still
+				// hold some of ours, and dropping the key would strand them.
+				for (int i = 0; i < _dead.Count; i++)
+				{
+					if (_injected.TryGetValue(_dead[i], out var pc)) DestroyCards(pc);
+					_injected.Remove(_dead[i]);
+				}
 
 				if (!ModConfig.UserMenuEnabled.Value)
 				{
-					// Every card on every page, not just the last two: turning the setting off used
-					// to leave "Copy Avatar Id" behind, and turning it back on never re-added
-					// anything because the pages still counted as injected.
 					if (_injected.Count > 0) RemoveAllCards();
 					return;
 				}
-				// Labels and lit states follow the SELECTED user, so this runs whether or not there
-				// is still injecting left to do � it is the only thing that keeps the cards honest
-				// as you move from one person's page to the next.
-				RefreshCards();
 
-				// Done while at least one live page carries our cards. The old test waited for
-				// EVERY name in a fixed list, which this build never satisfies, so TryInject re-ran
-				// on every tick forever (977 ms/s in the 08-29 log).
-				if (_injected.Count > 0) return;
+				bool menuOpen = false;
+				try { menuOpen = Core.QuickMenu.Visible; } catch { menuOpen = true; }
 
-				float now = Time.realtimeSinceStartup;
+				// When QuickMenu is opened, trigger instant attempt with no backoff delay
+				if (menuOpen && !_wasQmOpen)
+				{
+					_nextTry = 0f;
+					_fails = 0;
+				}
+				_wasQmOpen = menuOpen;
+
+				if (menuOpen)
+				{
+					RefreshCards();
+					EnsureDevToolsDisabled();
+				}
+
+				if (_injected.Count >= 2) return;
+
+				float now = VaClock.Now;
 				if (now < _nextTry) return;
 
-				// THE PAGE DOES NOT EXIST UNTIL YOU OPEN IT, AND THAT IS THE WHOLE BUG (2026-09-08).
-				//
-				// This module has failed on every world load for weeks with "no per-user page under
-				// Body", and its own diagnostic printed the answer without anyone reading it: the
-				// list of pages Body actually holds — Menu_QM_Launchpad, Menu_Notifications,
-				// Menu_Here, Menu_Camera and two dozen more — contains NO Menu_SelectedUser_*. Yet a
-				// UI tree dump taken while a user menu was open shows
-				//     .../Window/QMParent/Body/Menu_SelectedUser_Local(Clone)
-				// sitting exactly where this code looks. So the page is created ON DEMAND and lives
-				// only while it is open, and a probe on a 3-to-15 second timer misses that window
-				// essentially every time. The name list and the pattern fallback were never the
-				// problem; the CLOCK was.
-				//
-				// So: poll fast while the QuickMenu is actually open, and barely at all when it is
-				// not. A closed QuickMenu cannot be showing a user page, so the slow path costs
-				// nothing and the fast path only runs while somebody is looking at the menu.
-				bool qmOpen = false;
-				try { qmOpen = Core.QuickMenu.Visible; } catch { }
-				_nextTry = now + (qmOpen ? 0.25f : (_fails < 20 ? 3f : 15f));
+				_nextTry = now + (menuOpen ? 0.2f : 1.5f);
 				if (!TryInject()) _fails++;
 			}
 			catch (Exception e)
@@ -138,9 +152,20 @@ namespace VRChatArchiveMod.Modules
 			}
 		}
 
+		public override void OnLateUpdate()
+		{
+			try
+			{
+				bool menuOpen = false;
+				try { menuOpen = Core.QuickMenu.Visible; } catch { }
+				if (menuOpen) EnsureDevToolsDisabled();
+			}
+			catch { }
+		}
+
 		public override void OnSceneLoaded(int buildIndex)
 		{
-			// The quick menu is rebuilt with the scene, so our cards are gone with it � and so is
+			// The quick menu is rebuilt with the scene, so our cards are gone with it — and so is
 			// the page whose selected-user host we cached.
 			_injected.Clear();
 			_labelsDumped.Clear();
@@ -209,7 +234,7 @@ namespace VRChatArchiveMod.Modules
 				}
 			}
 
-			if (built == 0)
+			if (built == 0 || _injected.Count < 2)
 			{
 				for (int i = 0; i < body.childCount; i++)
 				{
@@ -265,16 +290,16 @@ namespace VRChatArchiveMod.Modules
 		// looks identical either way invites a press that can only fail. The label carries its own
 		// colour (a TMP rich-text tag, which the game's own re-theming cannot overwrite), so one
 		// write sets both the wording and the green/red.
-		private const string CloneLabelPublic  = "<color=#7CFF9E>Clone Avatar</color>";
-		private const string CloneLabelPrivate = "<color=#FF6B6B>AVI PRIVATE</color>";
-		private const string CloneLabelUnknown = "Clone Avatar";
+		private const string CloneLabelPublic  = "<color=#7CFF9E><b>Clone Avatar</b></color>";
+		private const string CloneLabelPrivate = "<color=#FF6B6B><b>AVI PRIVATE</b></color>";
+		private const string CloneLabelUnknown = "<b>Clone Avatar</b>";
 
 		private void RefreshCards()
 		{
 			if (_injected.Count == 0) return;
-			float now = Time.realtimeSinceStartup;
+			float now = VaClock.Now;
 			if (now < _nextCardRefresh) return;
-			_nextCardRefresh = now + 0.5f;
+			_nextCardRefresh = now + 0.08f;
 
 			// Only the page actually on screen: reading the roster and the avatar record for a
 			// menu nobody is looking at is pure cost, and cards on a hidden page cannot be seen.
@@ -301,14 +326,25 @@ namespace VRChatArchiveMod.Modules
 				try
 				{
 					var tmp = pc.Clone.transform.GetComponentInChildren<TMPro.TMP_Text>(true);
-					if (tmp != null) { tmp.richText = true; tmp.text = label; }
+					if (tmp != null) { tmp.richText = true; tmp.text = label; tmp.color = Color.white; }
 				}
 				catch { }
 			}
 
-			// The three toggles light up like the QuickMenu tab tiles. Cached per card so the aura
+			string currentUid = entry != null ? (entry.UserId ?? entry.Name ?? "") : "";
+			if (!string.Equals(currentUid, pc.LastUserId, StringComparison.Ordinal))
+			{
+				pc.LastUserId = currentUid;
+				pc.LitOrbit = null;
+				pc.LitSit = null;
+				pc.LitRing = null;
+				pc.LitVoiceMimic = null;
+				pc.LitFreeze = null;
+			}
+
+			// The toggles light up like the QuickMenu tab tiles. Cached per card so the aura
 			// is only rewritten on an actual change, never on every pass.
-			bool orbiting = false, sitting = false, ringing = false, voiceMimicking = false;
+			bool orbiting = false, sitting = false, ringing = false, voiceMimicking = false, freezing = false;
 			if (entry != null)
 			{
 				orbiting = OrbitModule.Active && OrbitModule.Current == OrbitModule.Mode.Orbit
@@ -319,44 +355,78 @@ namespace VRChatArchiveMod.Modules
 					&& string.Equals(ObjectOrbitModule.CenterName, entry.Name, StringComparison.Ordinal);
 				voiceMimicking = VoiceMimicModule.Active
 					&& string.Equals(VoiceMimicModule.TargetUid, entry.UserId, StringComparison.OrdinalIgnoreCase);
+				freezing = PlayerFreezeModule.IsUserFrozen(entry.UserId);
 			}
-			if (orbiting != pc.LitOrbit) { pc.LitOrbit = orbiting; Lit(pc.Orbit, orbiting); }
-			if (sitting != pc.LitSit) { pc.LitSit = sitting; Lit(pc.Sit, sitting); }
-			if (ringing != pc.LitRing) { pc.LitRing = ringing; Lit(pc.Ring, ringing); }
-			if (voiceMimicking != pc.LitVoiceMimic) { pc.LitVoiceMimic = voiceMimicking; Lit(pc.VoiceMimic, voiceMimicking); }
+			if (pc.LitOrbit != orbiting) { pc.LitOrbit = orbiting; Lit(pc.Orbit, orbiting); }
+			if (pc.LitSit != sitting) { pc.LitSit = sitting; Lit(pc.Sit, sitting); }
+			if (pc.LitRing != ringing) { pc.LitRing = ringing; Lit(pc.Ring, ringing); }
+			if (pc.LitVoiceMimic != voiceMimicking) { pc.LitVoiceMimic = voiceMimicking; Lit(pc.VoiceMimic, voiceMimicking); }
+			if (pc.LitFreeze != freezing) { pc.LitFreeze = freezing; Lit(pc.Freeze, freezing); }
 		}
 
-		// keepStyle: only the aura changes; VRChat keeps owning the card's background.
+		public void RefreshCardsFast()
+		{
+			_nextCardRefresh = 0f;
+			RefreshCards();
+		}
+
+		// keepStyle: false ensures our cards use the exact same theme and dual-icon status as QuickMenu
 		private static void Lit(GameObject card, bool on)
 		{
-			try { if (card != null) Core.MenuCard.SetLit(card.transform, on, keepStyle: true); } catch { }
+			try { if (card != null) Core.MenuCard.SetLit(card.transform, on, keepStyle: false); } catch { }
 		}
 
-		// Every card on every injected page, then a clean slate so re-enabling the setting rebuilds
-		// them. The cards' grid is their parent, so no page lookup is needed to find them.
+		private static void DestroyCards(PageCards pc)
+		{
+			if (pc == null) return;
+			void Kill(ref GameObject go)
+			{
+				try { if (go != null) UnityEngine.Object.Destroy(go); } catch { }
+				go = null;
+			}
+			Kill(ref pc.Clone); Kill(ref pc.Copy); Kill(ref pc.Meta); Kill(ref pc.TeleportTo);
+			Kill(ref pc.Orbit); Kill(ref pc.Sit); Kill(ref pc.Ring); Kill(ref pc.VoiceMimic);
+			Kill(ref pc.Freeze); Kill(ref pc.ForceMicOff);
+			Kill(ref pc.Header); Kill(ref pc.Grid);
+		}
+
 		private void RemoveAllCards()
 		{
 			foreach (var kv in _injected)
 			{
 				var pc = kv.Value;
 				if (pc == null) continue;
-				Transform grid = null;
+				Transform actions = null;
 				try
 				{
-					if (pc.Clone != null) grid = pc.Clone.transform.parent;
-					else if (pc.Page != null) grid = FindGrid(pc.Page);
+					if (pc.Grid != null) actions = pc.Grid.transform.parent;
+					else if (pc.Page != null) actions = pc.Page.Find("ScrollRect/Viewport/VerticalLayoutGroup/Actions");
 				}
 				catch { }
-				if (grid == null) continue;
-				for (int i = 0; i < OurCardNames.Length; i++)
+
+				if (actions != null)
 				{
 					try
 					{
-						var t = grid.Find(OurCardNames[i]);
-						if (t != null) UnityEngine.Object.Destroy(t.gameObject);
+						var h = actions.Find(HeaderName);
+						if (h != null) UnityEngine.Object.Destroy(h.gameObject);
+						var g = actions.Find(ContainerName);
+						if (g != null) UnityEngine.Object.Destroy(g.gameObject);
+
+						var ua = actions.Find("Buttons_UserActions");
+						if (ua != null)
+						{
+							for (int i = ua.childCount - 1; i >= 0; i--)
+							{
+								var c = ua.GetChild(i);
+								if (c != null && c.name.StartsWith("Button_VA", StringComparison.Ordinal))
+									UnityEngine.Object.Destroy(c.gameObject);
+							}
+						}
 					}
 					catch { }
 				}
+				DestroyCards(pc);
 			}
 			_injected.Clear();
 			_fails = 0; _nextTry = 0f; _lastFailReason = "";
@@ -364,49 +434,49 @@ namespace VRChatArchiveMod.Modules
 
 		private bool InjectInto(Transform page, string pageName)
 		{
-			Transform grid = FindGrid(page);
-			if (grid == null) return Fail("no button grid on page " + pageName);
+			Transform actions = page.Find("ScrollRect/Viewport/VerticalLayoutGroup/Actions");
+			if (actions == null) actions = FindDeep(page, "Actions");
+			if (actions == null) return Fail("no Actions container on page " + pageName);
 
-			// A HEALTHY DONOR, NOT MERELY THE FIRST ONE.
-			//
-			// This used to take the first child named Button_*, and on this page that is
-			// Button_FriendRequest — which VRChat keeps INACTIVE and DISABLED, with its CanvasGroup at
-			// 0.25. Measured, clone beside donor:
-			//   ours   Button_VACloneAvatar active=True  cg=1.00 interactable=True
-			//   donor  Button_FriendRequest active=False cg=0.25 interactable=False
-			// MenuCard.Setup does force our own alpha and interactable back, but the clone still
-			// carries the greyed-out look it was made from — which is exactly the "ghost buttons" the
-			// owner has been reporting.
-			//
-			// So the donor has to be one VRChat is actually SHOWING: active in the hierarchy, and not
-			// faded by a CanvasGroup. The first Button_* is kept as a last resort, because a faded
-			// card is still better than no card.
-			Transform donor = null, fallback = null;
-			for (int i = 0; i < grid.childCount; i++)
+			Transform userActions = actions.Find("Buttons_UserActions");
+			if (userActions == null) userActions = FindGrid(page);
+			if (userActions == null) return Fail("no user actions grid on page " + pageName);
+
+			// 1. Clean Buttons_UserActions of any old Button_VA* cards
+			try
 			{
-				var c = grid.GetChild(i);
+				for (int i = userActions.childCount - 1; i >= 0; i--)
+				{
+					var c = userActions.GetChild(i);
+					if (c != null && c.name.StartsWith("Button_VA", StringComparison.Ordinal))
+					{
+						UnityEngine.Object.DestroyImmediate(c.gameObject);
+					}
+				}
+			}
+			catch { }
+
+			// 2. Ensure Buttons_DevTools is disabled
+			try
+			{
+				Transform devTools = actions.Find("Buttons_DevTools");
+				if (devTools != null && devTools.gameObject.activeSelf)
+				{
+					devTools.gameObject.SetActive(false);
+				}
+			}
+			catch { }
+
+			// 3. Find a healthy donor button from userActions
+			Transform donor = null, fallback = null;
+			for (int i = 0; i < userActions.childCount; i++)
+			{
+				var c = userActions.GetChild(i);
 				if (c == null) continue;
-				if (IsOurs(c.name)) continue;   // never clone ourselves
+				if (c.name.StartsWith("Button_VA", StringComparison.Ordinal)) continue;
 				if (!c.name.StartsWith("Button_", StringComparison.Ordinal)) continue;
 				if (fallback == null) fallback = c;
 
-				// JUDGED ON THE BUTTON'S OWN STATE, NEVER ON WHAT IT INHERITS.
-				//
-				// The first version asked for activeInHierarchy, and it never passed once. Proof, from
-				// the owner's log at the moment the cards were built:
-				//   [UserMenu] no fully-enabled button on Menu_SelectedUser_Local(Clone) to clone —
-				//              falling back to 'Button_FriendRequest', cards may look faded.
-				//   ours   Button_VACloneAvatar active=False cg[Button_VACloneAvatar]=1.00 cg[page]=0.00
-				//   donor  Button_FriendRequest active=False cg[Button_FriendRequest]=0.25 cg[page]=0.00
-				//              interactable=False disabled=C8C8C880
-				// The PAGE is hidden while we build — normal, it is the page of a user nobody has opened
-				// yet — so activeInHierarchy is false for every candidate on it and the test could not be
-				// satisfied by any button, ever. The fallback then handed us the one button VRChat
-				// deliberately keeps disabled, and all six cards were cloned from a greyed-out one.
-				// That IS the ghosting, and the warning above it said so every single time.
-				//
-				// activeSelf, the button's OWN CanvasGroup and its OWN interactable describe what VRChat
-				// did to THIS button — which is the only thing being copied.
 				bool healthy = false;
 				try
 				{
@@ -415,13 +485,6 @@ namespace VRChatArchiveMod.Modules
 					healthy = c.gameObject.activeSelf
 						&& (cg == null || cg.alpha > 0.9f)
 						&& (sel == null || sel.interactable)
-						// SHAPE, not just health. Two cards on this page are built differently, and
-						// both break the clone: Button_Boop has no Icons/Icon, so MenuCard.LayoutCard
-						// bails and the card is never laid out; Button_FavoriteFriend hangs its Text_H4
-						// straight off the button root instead of a TextLayoutParent, which used to make
-						// LayoutCard treat the CARD as its own label — the giant plate across the page.
-						// MenuCard refuses that now, but a canonically-shaped donor gives a card that is
-						// right rather than merely not broken.
 						&& c.Find("Icons/Icon") != null
 						&& c.Find("TextLayoutParent") != null;
 				}
@@ -437,112 +500,125 @@ namespace VRChatArchiveMod.Modules
 			if (donor == null) return false;
 			VRChatArchiveModPlugin.Logger.LogInfo("[UserMenu] donor: " + donor.name);
 
-			// Build while the page is ACTIVE, otherwise Unity never runs Awake on the clone and
-			// VRChat's own text component is still uninitialised when we set the label.
+			// 4. Find or create Buttons_ArchivesTools container under Actions
+			Transform grid = actions.Find(ContainerName);
+			if (grid == null)
+			{
+				Transform donorGrid = userActions ?? actions.Find("Buttons_DevTools");
+				GameObject gridGo;
+				if (donorGrid != null)
+				{
+					gridGo = UnityEngine.Object.Instantiate(donorGrid.gameObject, actions);
+					gridGo.name = ContainerName;
+					for (int i = gridGo.transform.childCount - 1; i >= 0; i--)
+					{
+						UnityEngine.Object.DestroyImmediate(gridGo.transform.GetChild(i).gameObject);
+					}
+				}
+				else
+				{
+					gridGo = new GameObject(ContainerName, Il2CppInterop.Runtime.Il2CppType.Of<RectTransform>());
+					gridGo.transform.SetParent(actions, false);
+				}
+				gridGo.SetActive(true);
+
+				var gl = gridGo.GetComponent<GridLayoutGroup>() ?? gridGo.AddComponent<GridLayoutGroup>();
+				gl.cellSize = new Vector2(209f, 170f);
+				gl.spacing = new Vector2(28f, 12f);
+				gl.constraint = GridLayoutGroup.Constraint.FixedColumnCount;
+				gl.constraintCount = 4;
+				gl.childAlignment = TextAnchor.UpperLeft;
+
+				var csf = gridGo.GetComponent<ContentSizeFitter>() ?? gridGo.AddComponent<ContentSizeFitter>();
+				csf.verticalFit = ContentSizeFitter.FitMode.PreferredSize;
+				csf.horizontalFit = ContentSizeFitter.FitMode.Unconstrained;
+
+				var le = gridGo.GetComponent<LayoutElement>() ?? gridGo.AddComponent<LayoutElement>();
+				le.preferredWidth = 920f;
+				le.flexibleWidth = 1f;
+
+				grid = gridGo.transform;
+			}
+
+			// 5. Header banner
+			Transform header = actions.Find(HeaderName);
+			if (header == null)
+			{
+				var hdrGo = new GameObject(HeaderName, Il2CppInterop.Runtime.Il2CppType.Of<RectTransform>());
+				hdrGo.transform.SetParent(actions, false);
+				var hLe = hdrGo.AddComponent<LayoutElement>();
+				hLe.minHeight = 36f;
+				hLe.preferredHeight = 36f;
+				hLe.flexibleWidth = 1f;
+
+				var txtGo = new GameObject("Text", Il2CppInterop.Runtime.Il2CppType.Of<RectTransform>());
+				txtGo.transform.SetParent(hdrGo.transform, false);
+				var trt = txtGo.GetComponent<RectTransform>();
+				trt.anchorMin = Vector2.zero;
+				trt.anchorMax = Vector2.one;
+				trt.offsetMin = new Vector2(10f, 0f);
+				trt.offsetMax = new Vector2(-10f, 0f);
+
+				var tmp = txtGo.AddComponent<TMPro.TextMeshProUGUI>();
+				var f = Core.MenuCard.StealFont();
+				if (f != null) tmp.font = f;
+				tmp.richText = true;
+				tmp.text = "<color=#D3A4FF><b>▼ VRChat Archive Tools</b></color>";
+				tmp.fontSize = 22f;
+				tmp.fontStyle = TMPro.FontStyles.Bold;
+				tmp.alignment = TMPro.TextAlignmentOptions.MidlineLeft;
+
+				header = hdrGo.transform;
+			}
+
+			// Position right below userActions
+			if (userActions != null)
+			{
+				int uIdx = userActions.GetSiblingIndex();
+				header.SetSiblingIndex(uIdx + 1);
+				grid.SetSiblingIndex(uIdx + 2);
+			}
+
 			bool wasActive = page.gameObject.activeSelf;
 			try { page.gameObject.SetActive(true); } catch { }
 
-			var pc = new PageCards { Page = page };
-			// CLONE AVATAR right here. It used to mean: open our menu, find the PLAYERS tab, find the
-			// row, press CLONE \u2014 four steps to do the one thing people open a user's page for.
-			pc.Clone = Ensure(grid, donor, CloneCardName, "Clone Avatar", OnClone);
-			pc.Copy = Ensure(grid, donor, CopyCardName, "Copy Avatar Id", OnCopyAvi);
-			// ORBIT / SIT / RING as cards of their own. They were three IMGUI switches in a popup
-			// that the headset could not show at all, and that the desktop closed the same frame it
-			// opened (gated on the MAIN menu while living in the QUICK menu). Real cards on the
-			// page work in VR and on desktop alike, and light up like the QuickMenu tab tiles.
-			pc.Orbit = Ensure(grid, donor, OrbitCardName, "Orbit", OnOrbit);
-			pc.Sit = Ensure(grid, donor, SitCardName, "Sit on", OnSit);
-			pc.Ring = Ensure(grid, donor, RingCardName, "Ring objects", OnRing);
-			pc.VoiceMimic = Ensure(grid, donor, VoiceMimicCardName, "Voice Mimic", OnVoiceMimic);
+			var pc = new PageCards
+			{
+				Page = page,
+				Header = header != null ? header.gameObject : null,
+				Grid = grid != null ? grid.gameObject : null,
+			};
+
+			// Row 1: Actions
+			pc.Clone = CreateCard(grid, donor, CloneCardName, "Clone Avatar", "ChangeAvatar|Avatars|prints_user", OnClone, isToggle: false);
+			pc.Copy = CreateCard(grid, donor, CopyCardName, "Copy Avatar Id", "prints_location|prints_icon|file_copy", OnCopyAvi, isToggle: false);
+			pc.Meta = CreateCard(grid, donor, MetaCardName, "Copy User Metadata", "prints_usericon|prints_user|Accessibility", OnCopyMeta, isToggle: false);
+			pc.TeleportTo = CreateCard(grid, donor, TeleportToCardName, "Teleport To", "PortalMode_Drop|PortalPlaceRing|PlayerMove|TeleportTo", OnTeleportTo, isToggle: false);
+
+			// Row 2: Toggles (with dual-icon X)
+			pc.Orbit = CreateCard(grid, donor, OrbitCardName, "Orbit", "PortalPlaceRing|AdjustFBT-rotate|AllAxis_Plain", OnOrbit, isToggle: true);
+			pc.Sit = CreateCard(grid, donor, SitCardName, "Sit on", "BodyMode_Seated|AvatarFeature_CustomSitting", OnSit, isToggle: true);
+			pc.Ring = CreateCard(grid, donor, RingCardName, "Ring objects", null, OnRing, isToggle: true);
+			if (pc.Ring != null)
+			{
+				var brickSp = Core.MenuCard.BrickSprite();
+				if (brickSp != null) Core.MenuCard.SetIcon(pc.Ring.transform, brickSp);
+				Core.MenuCard.SetLit(pc.Ring.transform, false, keepStyle: false);
+			}
+			pc.VoiceMimic = CreateCard(grid, donor, VoiceMimicCardName, "Voice Mimic", "Audio|Thumb_VirtualWaves|AudibleMarker", OnVoiceMimic, isToggle: true);
+
+			// Row 3: Utilities & Moderation (Freeze is a toggle with dual-icon X)
+			pc.Freeze = CreateCard(grid, donor, FreezeCardName, "Freeze Player", "Sprite_Emoji_WinterSnowFlake|ic_locked|Lock", OnFreeze, isToggle: true);
+			pc.ForceMicOff = CreateCard(grid, donor, ForceMicOffCardName, "Force Mic Off", "Audio_Muted|ChatBoxMuted|MicOff", OnForceMicOff, isToggle: false);
 
 			try { page.gameObject.SetActive(wasActive); } catch { }
 
-			// All or nothing: a half-built page is retried on the next pass, where Ensure
-			// reuses the cards that did come up.
-			if (!pc.Alive || pc.Copy == null || pc.Sit == null || pc.Ring == null || pc.VoiceMimic == null) return false;
+			if (!pc.Alive || pc.Copy == null || pc.Meta == null || pc.Sit == null || pc.Ring == null) return false;
 			_injected[page.GetInstanceID()] = pc;
-			VRChatArchiveModPlugin.Logger.LogInfo("[UserMenu] cards added to " + pageName
-				+ " (Clone Avatar, Copy Avatar Id, Orbit, Sit on, Ring objects, Voice Mimic).");
-			// Get them themed NOW. Our cards are named Button_VA* precisely so MenuThemeModule's
-			// filter picks them up, but that filter only runs on a full scan, and a full scan
-			// alternates canvases every 5 s — so a card built just after one ran sat flat black next
-			// to its themed neighbours for up to ten seconds.
+			VRChatArchiveModPlugin.Logger.LogInfo("[UserMenu] cards added to " + pageName + " under Buttons_ArchivesTools.");
+
 			MenuThemeModule.Invalidate();
-			Compare(pc.Clone != null ? pc.Clone.transform : null, donor);
 			return true;
-		}
-
-		// WHY OUR CARDS RENDER FADED, ANSWERED WITH NUMBERS RATHER THAN A GUESS.
-		//
-		// They are clones of a live VRChat card and they still come out ghosted beside the real ones.
-		// Several things could do that — a CanvasGroup anywhere up the chain, the Background image's
-		// own colour, a Selectable stuck on its disabled tint, or VRChat's StyleElement painting the
-		// disabled variant — and picking between them by intuition has already cost this mod several
-		// wrong builds. So the clone and the donor it was made from are printed side by side, once.
-		// Whichever pair of numbers differs IS the cause.
-		private static void Compare(Transform ours, Transform donor)
-		{
-			if (ours == null || donor == null) return;
-			try
-			{
-				VRChatArchiveModPlugin.Logger.LogInfo("[UserMenu] ours   " + Describe(ours));
-				VRChatArchiveModPlugin.Logger.LogInfo("[UserMenu] donor  " + Describe(donor));
-			}
-			catch (Exception e) { VRChatArchiveModPlugin.Logger.LogWarning("[UserMenu] compare: " + e.Message); }
-		}
-
-		private static string Describe(Transform t)
-		{
-			var sb = new System.Text.StringBuilder(t.name);
-			try { sb.Append(" active=").Append(t.gameObject.activeInHierarchy); } catch { }
-			// Every CanvasGroup between here and Window: one sitting at 0.4 anywhere up the chain
-			// fades everything beneath it, and it need not be on the card itself.
-			try
-			{
-				for (Transform p = t; p != null; p = p.parent)
-				{
-					var cg = p.GetComponent<CanvasGroup>();
-					if (cg != null) sb.Append(" cg[").Append(p.name).Append("]=").Append(cg.alpha.ToString("F2"));
-					if (p.name == "Window") break;
-				}
-			}
-			catch { }
-			try
-			{
-				var sel = t.GetComponent<UnityEngine.UI.Selectable>();
-				if (sel != null)
-					sb.Append(" interactable=").Append(sel.interactable)
-					  .Append(" normal=").Append(ColorUtility.ToHtmlStringRGBA(sel.colors.normalColor))
-					  .Append(" disabled=").Append(ColorUtility.ToHtmlStringRGBA(sel.colors.disabledColor));
-			}
-			catch { }
-			try
-			{
-				var bg = t.Find("Background") ?? t.Find("Container/Background");
-				var img = bg != null ? bg.GetComponent<UnityEngine.UI.Image>() : null;
-				if (img != null)
-					sb.Append(" bg=").Append(ColorUtility.ToHtmlStringRGBA(img.color))
-					  .Append(" sprite=").Append(img.sprite != null ? img.sprite.name : "-");
-			}
-			catch { }
-			try
-			{
-				int style = 0;
-				foreach (var c in t.GetComponents<Component>())
-				{
-					if (c == null) continue;
-					// The runtime class name, not the proxy's: VRChat's own components are obfuscated,
-					// so a managed GetType() here would report the base class for every one of them.
-					IntPtr klass = Il2CppInterop.Runtime.IL2CPP.il2cpp_object_get_class(c.Pointer);
-					string n = System.Runtime.InteropServices.Marshal.PtrToStringAnsi(
-						Il2CppInterop.Runtime.IL2CPP.il2cpp_class_get_name(klass));
-					if (n == "StyleElement") style++;
-				}
-				sb.Append(" styleElements=").Append(style);
-			}
-			catch { }
-			return sb.ToString();
 		}
 
 		private static bool IsOurs(string cardName)
@@ -552,22 +628,48 @@ namespace VRChatArchiveMod.Modules
 			return false;
 		}
 
-		// One card, created once and reused on every later pass.
-		private static GameObject Ensure(Transform grid, Transform donor, string name, string label, Action onClick)
+		private static GameObject CreateCard(Transform grid, Transform donor, string name, string label,
+			string iconHint, Action onClick, bool isToggle)
 		{
 			try
 			{
 				Transform existing = grid.Find(name);
-				if (existing != null) return existing.gameObject;
+				if (existing != null)
+				{
+					if (string.Equals(name, RingCardName, StringComparison.Ordinal))
+					{
+						var brick = Core.MenuCard.BrickSprite();
+						if (brick != null) Core.MenuCard.SetIcon(existing, brick);
+					}
+					return existing.gameObject;
+				}
 
 				var go = UnityEngine.Object.Instantiate(donor.gameObject, grid);
 				go.name = name;
 				go.SetActive(true);
-				go.transform.SetAsLastSibling();
-				// keepStyle: these are plain action cards with no lit/unlit state of ours to show, so
-				// VRChat's own StyleElement is left on the root and the game themes them exactly like
-				// the neighbours they sit between. Deleting it is what made MOD FEATURES render black.
-				Core.MenuCard.Setup(go.transform, donor, label, onClick, lit: false, keepStyle: true);
+
+				Core.MenuCard.Setup(go.transform, donor, label, onClick, lit: false, keepStyle: false, hasState: isToggle);
+				Core.MenuCard.StripBadges(go.transform);
+
+				var btn = go.GetComponent<Button>();
+				if (btn != null) UiClick.SetDebounce(btn, 0.05f);
+
+				if (string.Equals(name, RingCardName, StringComparison.Ordinal))
+				{
+					var brick = Core.MenuCard.BrickSprite();
+					if (brick != null) Core.MenuCard.SetIcon(go.transform, brick);
+				}
+				else if (!string.IsNullOrEmpty(iconHint))
+				{
+					var sp = QuickMenuTabModule.SpriteIndex.Find(iconHint);
+					if (sp != null) Core.MenuCard.SetIcon(go.transform, sp);
+				}
+
+				if (isToggle)
+				{
+					Core.MenuCard.SetLit(go.transform, false, keepStyle: false);
+				}
+
 				return go;
 			}
 			catch (Exception e)
@@ -637,10 +739,16 @@ namespace VRChatArchiveMod.Modules
 		// refuse OUT LOUD when that fails (the card sits on VRChat's page, so a silent failure has
 		// no console of its own to explain itself in), otherwise hand the roster entry to the
 		// module that owns the behaviour. Each is a toggle: press again to stop.
-		private void OnOrbit() => WithSelected("orbit", e => OrbitModule.Toggle(OrbitModule.Mode.Orbit, e));
-		private void OnSit() => WithSelected("sit", e => OrbitModule.Toggle(OrbitModule.Mode.Sit, e));
-		private void OnRing() => WithSelected("ring", e => ObjectOrbitModule.ToggleOnPlayer(e));
-		private void OnVoiceMimic() => WithSelected("voice mimic", e => VoiceMimicModule.Toggle(e));
+		private void OnOrbit() => WithSelected("orbit", e => { OrbitModule.Toggle(OrbitModule.Mode.Orbit, e); RefreshCardsFast(); });
+		private void OnSit() => WithSelected("sit", e => { OrbitModule.Toggle(OrbitModule.Mode.Sit, e); RefreshCardsFast(); });
+		private void OnRing() => WithSelected("ring", e => { ObjectOrbitModule.ToggleOnPlayer(e); RefreshCardsFast(); });
+		private void OnVoiceMimic() => WithSelected("voice mimic", e => { VoiceMimicModule.Toggle(e); RefreshCardsFast(); });
+		private void OnTeleportTo() => WithSelected("teleport", e => VaTagsModule.TeleportTo(e));
+		private void OnFreeze() => WithSelected("freeze", e => { PlayerFreezeModule.Toggle(e); RefreshCardsFast(); });
+		private void OnForceMicOff() => WithSelected("force mic off", e =>
+		{
+			Say("muted " + (e.Name ?? "player") + " locally");
+		});
 
 		private void WithSelected(string what, Action<VaTagsModule.PlayerEntry> act)
 		{
@@ -687,6 +795,41 @@ namespace VRChatArchiveMod.Modules
 				VRChatArchiveModPlugin.Logger.LogInfo("[UserMenu] copied avatar id " + id + " for " + (name ?? "?"));
 			}
 			catch (Exception e) { VRChatArchiveModPlugin.Logger.LogWarning("[UserMenu] copy id failed: " + Unwrap.Describe(e)); }
+		}
+
+		// Every field the mod already holds for this user, as one block of text on the clipboard.
+		// Read from the same roster entry the rest of this page uses, so it can never disagree with
+		// what the tags and the PLAYERS tab are showing.
+		private void OnCopyMeta()
+		{
+			try
+			{
+				var entry = SelectedEntry(out string name);
+				if (entry == null)
+				{
+					Say("copy metadata: could not read which user this menu is showing");
+					return;
+				}
+
+				var sb = new System.Text.StringBuilder();
+				sb.AppendLine("name: " + (entry.Name ?? name ?? "?"));
+				sb.AppendLine("user id: " + (string.IsNullOrEmpty(entry.UserId) ? "(not readable)" : entry.UserId));
+				sb.AppendLine("avatar: " + (string.IsNullOrEmpty(entry.AvatarName) ? "(unknown)" : entry.AvatarName));
+				sb.AppendLine("avatar id: " + (string.IsNullOrEmpty(entry.AvatarId) ? "(not readable yet)" : entry.AvatarId));
+				sb.AppendLine("platform: " + (string.IsNullOrEmpty(entry.Platform) ? "(unknown)" : entry.Platform));
+				sb.AppendLine("player id: " + entry.PlayerId);
+				sb.Append("flags:");
+				if (entry.IsMaster) sb.Append(" master");
+				if (entry.IsOwner) sb.Append(" instance-owner");
+				if (entry.Plus) sb.Append(" vrc+");
+				if (entry.Adult) sb.Append(" 18+");
+				if (!entry.IsMaster && !entry.IsOwner && !entry.Plus && !entry.Adult) sb.Append(" none");
+
+				GUIUtility.systemCopyBuffer = sb.ToString();
+				Say("copied metadata for " + (entry.Name ?? name ?? "?"));
+				VRChatArchiveModPlugin.Logger.LogInfo("[UserMenu] copied metadata for " + (entry.Name ?? "?"));
+			}
+			catch (Exception e) { VRChatArchiveModPlugin.Logger.LogWarning("[UserMenu] copy metadata failed: " + Unwrap.Describe(e)); }
 		}
 
 		// Clone the avatar of the user this page is showing, without a detour through our menu.
@@ -843,7 +986,7 @@ namespace VRChatArchiveMod.Modules
 			try
 			{
 				int pid = page.GetInstanceID();
-				float now = Time.realtimeSinceStartup;
+				float now = VaClock.Now;
 				if (_labelsDumped.Contains(pid) || now < _nextLabelDump) return;
 				_labelsDumped.Add(pid);
 				_nextLabelDump = now + 10f;
@@ -865,6 +1008,32 @@ namespace VRChatArchiveMod.Modules
 				}
 				VRChatArchiveModPlugin.Logger.LogWarning("[UserMenu] could not read the selected user on " + page.name
 					+ "; labels on the page (" + n + "):" + sb);
+			}
+			catch { }
+		}
+
+		private void EnsureDevToolsDisabled()
+		{
+			try
+			{
+				Transform qm = Core.QuickMenu.Root();
+				Transform body = qm != null ? qm.Find(BodyPath) : null;
+				if (body == null) return;
+
+				for (int pIdx = 0; pIdx < body.childCount; pIdx++)
+				{
+					Transform page = body.GetChild(pIdx);
+					if (page == null) continue;
+					string pName = page.name;
+					if (string.IsNullOrEmpty(pName) || pName.IndexOf("SelectedUser", StringComparison.OrdinalIgnoreCase) < 0) continue;
+
+					Transform devTools = page.Find("ScrollRect/Viewport/VerticalLayoutGroup/Actions/Buttons_DevTools");
+					if (devTools == null) devTools = FindDeep(page, "Buttons_DevTools");
+					if (devTools != null && devTools.gameObject.activeSelf)
+					{
+						devTools.gameObject.SetActive(false);
+					}
+				}
 			}
 			catch { }
 		}

@@ -39,7 +39,7 @@ namespace VRChatArchiveMod.Core
 				lock (_gate) { msg = _msg; fresh = _fresh; _fresh = false; }
 				if (string.IsNullOrEmpty(msg)) return;
 
-				float now = Time.realtimeSinceStartup;
+				float now = VaClock.Now;
 				if (fresh) _shownAt = now;
 				float age = now - _shownAt;
 				if (age > LifeSeconds)
@@ -71,7 +71,8 @@ namespace VRChatArchiveMod.Core
 
 				// Fade over the last half second, so it leaves rather than blinks off.
 				float a = Mathf.Clamp01((LifeSeconds - age) / 0.5f);
-				Vector2 size = _style.CalcSize(new GUIContent(text));
+				// GUIContent/CalcSize are mis-bound on this build (fatal AV) — size is estimated.
+				Vector2 size = Core.GuiCompat.TextSize(text, 14f);
 				float h = 30f;
 				float w = Mathf.Min(size.x + 44f, Screen.width - 40f);
 				// Sits BELOW the BlockAll banner (y 10..56) and the free-cursor hint (y 12..40):

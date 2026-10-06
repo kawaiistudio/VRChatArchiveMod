@@ -72,7 +72,7 @@ namespace VRChatArchiveMod.Core
 
 		private const float ColId = 50f;     // "[12]"
 		private const float ColPos = 104f;   // "0.1 -0.0 -12.4"
-		private const float ColBadge = 96f;  // "VRC+ 18+ PC"
+		private const float ColBadge = 126f; // "[B] VRC+ 18+ PC" — the blocked tag rides in this column
 		private const float ColGap = 6f;
 
 		// The wing is 420 wide when open; the panel clears it plus a small gap. Both are needed at
@@ -231,7 +231,7 @@ namespace VRChatArchiveMod.Core
 
 					if (float.IsNaN(_x)) _x = target;                        // first frame: no slide
 					else if (Mathf.Abs(_x - target) < 0.5f) return;          // settled: write nothing
-					else _x = Mathf.Lerp(_x, target, 1f - Mathf.Pow(0.001f, Time.unscaledDeltaTime));
+					else _x = Mathf.Lerp(_x, target, 1f - Mathf.Pow(0.001f, VaClock.Delta));
 
 					rt.anchoredPosition = new Vector2(_x, TopY);
 				}

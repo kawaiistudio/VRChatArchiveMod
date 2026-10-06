@@ -17,7 +17,7 @@ namespace VRChatArchiveMod.Core
 	// The obvious repair is to find the export's new name and point Il2CppInterop at it. That is a
 	// bad trade: guessing wrong is not a failure, it is a fatal access violation, and the answer
 	// expires at the next VRChat update. Disassembly says the iterator with the nested-type counter
-	// is `npApjJKKUuO`, reading its array from Il2CppClass+0x88 — but the struct offset is the
+	// is `npApjJKKUuO`, reading its array from Il2CppClass+0x88 on build 1886 (0x10 on 1903 - which is why it is FOUND, not assumed) — but the struct offset is the
 	// durable half of that answer, so this walks the array itself and never calls the export.
 	//
 	// Which slot holds the array is not assumed either. VRChat reorders these structs, so the offset
@@ -28,8 +28,8 @@ namespace VRChatArchiveMod.Core
 	internal static class NestedTypeFix
 	{
 		// Measured on this build (VRChatStructFix reports the same values at startup).
-		private const int OffDeclaringType = 0x58;
-		private const int OffName = 0x98;
+		private const int OffDeclaringType = 0x48;   // build 1903 (etait 0x58)
+		private const int OffName = 0x58;   // build 1903 (etait 0x98)
 		private const int OffNestedCount = 0x128;
 		private const int Il2CppClassSize = 0x138;
 
@@ -141,14 +141,31 @@ namespace VRChatArchiveMod.Core
 				if (run > bestRun) { bestRun = run; best = off; }
 			}
 
-			return bestRun > 0 ? best : -1;
+			// NO GUESSING. The old fallback returned the longest partial run, i.e. a slot that
+			// merely starts with one self-declaring class. A wrong array here is not a missed
+			// lookup, it is a fatal access violation in the caller, so an inexact match must fail
+			// closed: Resolve() then returns Zero, Il2CppInterop takes its normal path and throws
+			// a MANAGED exception that ModuleManager catches. Degraded beats dead.
+			return -1;
 		}
 
 		private static unsafe string NameOf(IntPtr klass)
 		{
 			IntPtr p = *(IntPtr*)((byte*)klass + OffName);
 			if (!NativeGuard.IsReadable(p, 1, requireAligned: false)) return null;
-			return System.Runtime.InteropServices.Marshal.PtrToStringAnsi(p);
+			// PtrToStringAnsi walks to the first NUL with NO bound. One readable byte is not a
+			// promise that a NUL arrives before the page ends, and running off it is fatal. Read
+			// it manually, re-checking readability, and give up past a length no type name has.
+			byte* b = (byte*)p;
+			int n = 0;
+			while (n < 256)
+			{
+				if (!NativeGuard.IsReadable((IntPtr)(b + n), 1, requireAligned: false)) return null;
+				if (b[n] == 0) break;
+				n++;
+			}
+			if (n == 0 || n >= 256) return null;
+			return System.Text.Encoding.ASCII.GetString(b, n);
 		}
 	}
 }

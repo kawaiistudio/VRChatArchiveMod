@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using UnityEngine;
 using VRChatArchiveMod.Core;
 
@@ -36,34 +36,8 @@ namespace VRChatArchiveMod.Modules
 
 		public override void OnUpdate()
 		{
-			try
-			{
-				bool present = false;
-				try { present = PlayerRef.LocalPlayer() != null; } catch { }
-				float now = Time.realtimeSinceStartup;
-
-				if (!present)
-				{
-					if (_goneSince < 0f) _goneSince = now;          // start counting the absence
-					_inWorld = false;
-					return;
-				}
-
-				if (!_inWorld)
-				{
-					// Present again. Only a LONG absence means a real instance load; anything
-					// shorter is a blink and must not re-fire the stinger.
-					bool realSpawn = _goneSince < 0f || (now - _goneSince) >= AwaySeconds;
-					_inWorld = true;
-					_goneSince = -1f;
-					// A SIGNATURE WINS OVER THE STINGER. Somebody who has their own arrival clip would
-					// otherwise hear both at once on their own spawn, one on top of the other.
-					bool mine = false;
-					try { mine = SignatureSoundModule.HasSignature(VaTagsModule.LocalUserId()); } catch { }
-					if (realSpawn && !mine && ModConfig.SpawnSoundEnabled.Value) Play();
-				}
-			}
-			catch { }
+			// Spawn sound disabled
+			return;
 		}
 
 		// A world change tears the local player down; clearing the timestamp here means the next
@@ -71,39 +45,17 @@ namespace VRChatArchiveMod.Modules
 		public override void OnSceneLoaded(int buildIndex)
 		{
 			_inWorld = false;
-			_goneSince = 0f;      // 0 is "long ago" against realtimeSinceStartup, so the next
-			                      // appearance is treated as a genuine spawn.
+			_goneSince = 0f;
 		}
 
 		private static void Play()
 		{
-			try
-			{
-				if (_clip == null) { RequestClip(); return; }               // not decoded yet: skip this spawn
-				if (_src == null)
-				{
-					var go = new GameObject("ArchiveSpawnSound");
-					UnityEngine.Object.DontDestroyOnLoad(go);
-					go.hideFlags = HideFlags.HideAndDontSave;
-					_src = go.AddComponent<AudioSource>();
-					_src.spatialBlend = 0f;              // 2D, plays in your head regardless of position
-					_src.loop = false;
-					_src.playOnAwake = false;
-					_src.bypassEffects = true;
-					_src.bypassListenerEffects = true;
-					_src.ignoreListenerPause = true;
-					_src.clip = _clip;
-				}
-				_src.volume = Mathf.Clamp01(ModConfig.SpawnSoundVolume.Value);
-				_src.Stop();
-				_src.Play();
-				VRChatArchiveModPlugin.Logger.LogInfo("[SpawnSound] spawn stinger played.");
-			}
-			catch (Exception e) { VRChatArchiveModPlugin.Logger.LogWarning($"[SpawnSound] play failed: {e.Message}"); }
+			// Spawn sound disabled
+			return;
 		}
 
 		// Preview from the Settings "Test" button, without having to rejoin an instance.
-		public static void PlayNow() => Play();
+		public static void PlayNow() => StopNow();
 
 		// Cut it off immediately when the user flips the toggle off from the menu.
 		public static void StopNow() { try { if (_src != null) _src.Stop(); } catch { } }

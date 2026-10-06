@@ -30,6 +30,34 @@ namespace VRChatArchiveMod.Modules
 		public override string Name => "CapsuleEsp";
 
 		private const string CapsuleName = "VA_CapsuleESP";
+
+		// EVERY CAPSULE WE EVER BUILT, so OFF can destroy the ones _caps no longer knows about.
+		//
+		// _caps is keyed by player and is rebuilt as people come and go; a capsule can leave that
+		// dictionary while its GameObject is still in the scene (a rescan that re-keys, a scene load
+		// mid-build, an exception between creating the object and recording it). ClearAll() only ever
+		// walked _caps, so such a capsule was never destroyed and kept glowing with the switch OFF —
+		// the "the ESP toggle does nothing" report. This list is the authority for teardown: it holds
+		// a reference to everything we made, so nothing can be orphaned out of reach.
+		private static readonly List<GameObject> _made = new List<GameObject>();
+
+		private static void Remember(GameObject go)
+		{
+			if (go == null) return;
+			try { _made.Add(go); } catch { }
+		}
+
+		/// <summary>Destroys every capsule this module ever created, tracked or not, and forgets them.
+		/// Safe to call repeatedly: entries already gone are simply skipped.</summary>
+		private static void DestroyAllMade()
+		{
+			for (int i = 0; i < _made.Count; i++)
+			{
+				var go = _made[i];
+				try { if (go != null && Core.NativeGuard.Alive(go)) UnityEngine.Object.Destroy(go); } catch { }
+			}
+			_made.Clear();
+		}
 		private const int RescanFrames = 60;
 
 		private sealed class Cap
@@ -59,7 +87,26 @@ namespace VRChatArchiveMod.Modules
 				try { on = ModConfig.EspCapsule.Value; } catch { }
 				if (!on)
 				{
-					if (_caps.Count > 0) ClearAll();
+					// _made, not just _caps: an orphaned capsule leaves _caps empty while the object is
+					// still in the scene, and keying the cleanup off _caps alone meant OFF skipped it.
+					if (_caps.Count > 0 || _made.Count > 0) ClearAll();
+					// AND HAND THE CAMERAS BACK. EspCameraGuard strips our layer from every other
+					// camera and forces it onto Camera.main; with the capsules gone nothing was
+					// undoing that, because only HighlightEsp's tick reaches the guard and it may be
+					// off too. Restore only when NO ESP consumer still needs the guard, or turning
+					// capsules off would un-hide the glow ESP from the photo camera.
+					if (_wasOn)
+					{
+						bool otherEspWantsGuard = false;
+						try
+						{
+							otherEspWantsGuard = ModConfig.EspHighlight.Value
+								|| ModConfig.EspPortals.Value
+								|| ModConfig.EspItems.Value;
+						}
+						catch { }
+						if (!otherEspWantsGuard) EspCameraGuard.Restore();
+					}
 					_wasOn = false;
 					FeatureHealth.Idle("ESP/Capsule", "off");
 					return;
@@ -87,15 +134,33 @@ namespace VRChatArchiveMod.Modules
 				// Position every frame — the capsule has to sit on the player, not near them.
 				foreach (var c in _caps.Values) Track(c);
 
-				// A GRADIENT HAS TO MOVE. The colour is otherwise only set on the rescan tick, once a
-				// second, which reads as a capsule that abruptly changes colour rather than one that
-				// sweeps through the spectrum. Only rainbow capsules pay for this.
-				Color now = TrustKit.Spectrum();
-				foreach (var c in _caps.Values)
+				// A GRADIENT HAS TO MOVE — AND ADDING A LIT RENDERER AGAIN DOES NOT MOVE IT. HighlightsFX
+				// takes a renderer's colour on its FIRST add and ignores every later add of the same
+				// renderer, so this loop used to call add() 60 times a second per rainbow capsule (the
+				// HighlightEsp=100 ms/s in the Perf log) and the glow never changed colour: a Legendary's
+				// box cycled while the capsule sat on one colour. The only thing that changes a glow's
+				// colour is un-light then re-light (Repaint), at ~1 ms the pair — so it runs every ten
+				// frames, ~6 Hz, which a glow reads as a sweep. Only rainbow capsules pay for this.
+				// CADENCED IN TIME, NOT IN FRAMES — that is what made it stutter next to the box.
+				//
+				// Ten frames is ~6 Hz at 60 fps, and a sweep at 6 Hz reads as steps. Worse, it is not even a
+				// fixed rate: at 30 fps it drops to 3 Hz, at 200 fps it climbs to 20 -- so the smoothness
+				// changed with the framerate. The box looks perfect because it is redrawn every frame with a
+				// freshly computed colour; a glow cannot be, since only un-light + re-light changes it and
+				// that pair costs about a millisecond.
+				//
+				// 20 Hz is the compromise: three times smoother than before, identical at any framerate, and
+				// still only ~10 ms/s per rainbow capsule. Only rainbow capsules pay it at all.
+				float nowT; try { nowT = VaClock.Now; } catch { nowT = 0f; }
+				if (nowT - _rainbowAt >= RainbowInterval)
 				{
-					if (c == null || !c.Rainbow || c.Rend == null) continue;
-					c.Col = now;
-					Light(c, true);
+					_rainbowAt = nowT;
+					Color now = TrustKit.Spectrum();
+					foreach (var c in _caps.Values)
+					{
+						if (c == null || !c.Rainbow || c.Rend == null) continue;
+						Repaint(c, now);
+					}
 				}
 
 				if (++_frame < RescanFrames) return;
@@ -112,7 +177,7 @@ namespace VRChatArchiveMod.Modules
 
 		private void Rescan()
 		{
-			var players = VRC.SDKBase.VRCPlayerApi.AllPlayers;
+			var players = VRChatArchiveMod.Core.VaPlayers.All();
 			if (players == null) return;
 
 			var seen = new HashSet<int>();
@@ -125,9 +190,14 @@ namespace VRChatArchiveMod.Modules
 				try
 				{
 					var api = players[i];
+					// A NULL CHECK IS NOT A LIVENESS CHECK. VRCPlayerApi is not a UnityEngine.Object, so
+					// `== null` is the plain managed test and says nothing about the il2cpp object behind
+					// the handle -- and reading isLocal off a stale one is an access violation inside the
+					// proxy, which no try/catch around it can stop.
+					if (api == null || !NativeGuard.Alive(api)) continue;
 					// Never yourself: your own capsule would sit in the middle of your view and tell
 					// you nothing. A rainbow id is about how OTHER people's clients draw YOU.
-					if (api == null || api.isLocal) continue;
+					if (api.isLocal) continue;
 					// 0 (or less) = UNLIMITED distance, same rule as every other ESP type.
 					if (maxDist > 0f && Vector3.Distance(me, api.GetPosition()) > maxDist) continue;
 
@@ -157,21 +227,44 @@ namespace VRChatArchiveMod.Modules
 					// has already spawned, and a capsule stuck on the Visitor grey is misleading.
 					// A rainbow capsule is re-lit every pass rather than only when the colour
 					// CHANGES — the whole point is that it is always changing.
-					if (TrustKit.IsRainbow(Core.ApiUsers.Get(api)))
+					if (TrustKit.IsRainbowFor(api) || TrustKit.IsRainbow(Core.ApiUsers.Get(api)))
 					{
-						cap.Rainbow = true;
-						cap.Col = TrustKit.Spectrum();
-						Light(cap, true);
+						// The throttled loop in OnUpdate paints rainbow capsules; here only the state
+						// flips, plus one immediate repaint on the flip so it does not sit on the old
+						// solid colour for up to ten frames.
+						if (!cap.Rainbow) { cap.Rainbow = true; Repaint(cap, TrustKit.Spectrum()); }
 					}
 					else
 					{
+						// "I DO NOT KNOW" IS NOT "NO", AND TREATING IT AS NO IS THE WHOLE BUG.
+						//
+						// The owner described it exactly: the rainbow worked for a while, then the trust colour came
+						// back over it. ApiUsers.Get() answers from a one-second cache and returns NULL whenever the
+						// lookup misses -- which on 1903 is most of the time, since VRC.Player's members cannot be
+						// placed. A null made IsRainbow false, which dropped into this branch, which REPAINTED the
+						// capsule with the plain trust colour. The box never showed it because the ESP caches the
+						// rainbow verdict; the capsule re-decided every pass and flickered.
+						//
+						// So a pass that learned nothing now changes nothing: the capsule keeps whatever it had.
+						var who = Core.ApiUsers.Get(api);
+						if (who == null && string.IsNullOrEmpty(TrustKit.UidOf(api)))
+						{
+							if (cap.Fx == null) Light(cap, true);   // still worth retrying a capsule that never lit
+						}
+						else
+						{
+						bool wasRainbow = cap.Rainbow;
 						cap.Rainbow = false;
-						Color col = TrustKit.ColorOf(Core.ApiUsers.Get(api));
-						if (col != cap.Col) { cap.Col = col; Light(cap, true); }
+						Color col = TrustKit.ColorOf(who);
+						// A changed colour has to be REPAINTED, not re-added: add() on a lit renderer is
+						// ignored, which is why a capsule built on the Visitor grey never took its rank
+						// colour once the rank resolved.
+						if (wasRainbow || col != cap.Col) Repaint(cap, col);
 						// NEVER LIT IS NOT THE SAME AS LIT. A capsule built while the effect was still
 						// absent (world still loading) had no glow and, its colour never changing
 						// again, never got one. Retry on every rescan until it takes.
 						else if (cap.Fx == null) Light(cap, true);
+						}
 					}
 				}
 				catch { }
@@ -241,6 +334,7 @@ namespace VRChatArchiveMod.Modules
 				// into localScale. lossyScale is already the WORLD scale, so any scale on the root
 				// multiplied it a second time and the capsule swallowed the screen.
 				var go = new GameObject(CapsuleName);
+				Remember(go);                         // teardown authority: OFF destroys this even if _caps loses it
 				go.layer = EspCameraGuard.EspLayer;   // rendered by your view only (see EspCameraGuard)
 				go.transform.SetParent(region, false);
 				go.transform.localPosition = Vector3.zero;
@@ -378,6 +472,23 @@ namespace VRChatArchiveMod.Modules
 		// HighlightsFX is reached through HighlightEspModule, which already resolves it by
 		// reflection and copes with the builds where it is missing. The instance a renderer was lit
 		// on is remembered, so the un-light goes to the effect that actually holds it.
+		// Rainbow capsules are repainted every this many frames (~6 Hz at 60 fps). Each repaint is an
+		// un-light plus a light, about a millisecond together; per frame that would be 60 ms/s per
+		// capsule, which is the budget this whole module used to burn for no visible change.
+		private const float RainbowInterval = 0.05f;   // 20 Hz, framerate-independent
+		private float _rainbowAt;
+
+		// THE ONLY WAY TO CHANGE A GLOW'S COLOUR. HighlightsFX honours add(renderer, colour, true)
+		// once per renderer and ignores it afterwards; add(renderer, _, false) removes it. So a new
+		// colour is: remove, then add with the new colour.
+		private static void Repaint(Cap c, Color col)
+		{
+			if (c?.Rend == null) return;
+			Light(c, false);
+			c.Col = col;
+			Light(c, true);
+		}
+
 		private static void Light(Cap c, bool on)
 		{
 			try
@@ -403,11 +514,29 @@ namespace VRChatArchiveMod.Modules
 		}
 
 		// Everything, each on its own guard, and the table is emptied even if a removal threw.
+		// The menus call this after changing an ESP setting. This module already notices a setting
+		// change by itself, so all this does is drop what is drawn and make the next frame rescan
+		// rather than waiting out the interval.
+		public static void TriggerRelight()
+		{
+			try
+			{
+				var mod = ModuleManager.Get<CapsuleEspModule>();
+				if (mod == null) return;
+				mod.ClearAll();
+				mod._frame = RescanFrames;
+			}
+			catch { }
+		}
+
 		private void ClearAll()
 		{
 			var ids = new List<int>(_caps.Keys);
 			foreach (int id in ids) { try { Remove(id); } catch { } }
 			_caps.Clear();
+			// THEN the ones _caps no longer knows about. Without this an orphaned capsule survived
+			// every OFF and glowed for the rest of the session.
+			DestroyAllMade();
 		}
 	}
 
@@ -455,7 +584,7 @@ namespace VRChatArchiveMod.Modules
 
 				int count = -1;
 				try { count = Camera.allCamerasCount; } catch { }
-				float now = Time.realtimeSinceStartup;
+				float now = VaClock.Now;
 				if (count != _lastCount || now >= _nextRescan)
 				{
 					_lastCount = count;
@@ -496,7 +625,7 @@ namespace VRChatArchiveMod.Modules
 					if (cam.GetInstanceID() == mainId) continue;
 					_cams.Add(cam);
 					if (_fxIl2 == null) continue;
-					var comp = cam.GetComponent(_fxIl2);
+					var comp = cam.GetComponentSafe(_fxIl2);
 					if (comp == null) continue;
 					if (ours != IntPtr.Zero && comp.Pointer == ours) continue;   // the instance the glow ESP itself uses
 					var b = comp.TryCast<Behaviour>();
@@ -515,6 +644,28 @@ namespace VRChatArchiveMod.Modules
 			{
 				try { var b = _fxOff[i]; if (b != null && Core.NativeGuard.Alive(b)) b.enabled = true; } catch { }
 			}
+			// THE CULLING MASKS GO BACK TOO (2026-09-13). Restore() only ever re-enabled the
+			// HighlightsFX copies it had switched off; the layer bit this guard strips from every
+			// other camera (line ~535) and forces onto Camera.main (line ~516) was never reversed, so
+			// after the option went off every mirror, photo and stream camera kept layer 7 culled for
+			// the rest of the session — a permanent, invisible edit to cameras that belong to the
+			// world, made by a switch the user had already turned off.
+			for (int i = 0; i < _cams.Count; i++)
+			{
+				try
+				{
+					var cam = _cams[i];
+					if (cam == null) continue;   // destroyed: Unity's == answers without a native read
+					if ((cam.cullingMask & Bit) == 0) cam.cullingMask |= Bit;
+				}
+				catch { }
+			}
+			try
+			{
+				var main = Camera.main;
+				if (main != null && (main.cullingMask & Bit) != 0) main.cullingMask &= ~Bit;
+			}
+			catch { }
 			_fxOff.Clear();
 			_cams.Clear();
 			_lastCount = -1;

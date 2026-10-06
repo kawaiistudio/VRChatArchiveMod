@@ -52,8 +52,17 @@ namespace VRChatArchiveMod.Modules
 		public static string Status = "off";
 		public static bool Active { get; private set; }
 
-		/// <summary>Body tilt held by the module, in degrees. Yaw stays VRChat's.</summary>
-		private static float _pitch, _roll;
+		/// <summary>Body tilt held by the module. Yaw stays VRChat's.</summary>
+		// The tilt away from upright, as a rotation. Kept as a quaternion precisely so that pitch
+		// and roll cannot collapse into each other the way two euler angles do past vertical.
+		private static Quaternion _tilt = Quaternion.identity;
+
+		/// <summary>Turn by `deg` about an axis expressed in the BODY's own frame.</summary>
+		private static void Turn(Vector3 bodyAxis, float deg)
+		{
+			if (Mathf.Abs(deg) < 0.0001f) return;
+			_tilt = _tilt * Quaternion.AngleAxis(deg, bodyAxis);
+		}
 
 		// ------------------------------------------------------------------ the neck clamp
 		private static object _neck;                 // NeckMouseRotator proxy
@@ -69,6 +78,12 @@ namespace VRChatArchiveMod.Modules
 		private static Quaternion _applied = Quaternion.identity;
 		private static float _yaw;                   // VRChat's heading, tracked so tilt composes on top
 		private static bool _holdProbed;
+		// Set when an OFF could not reach the rig; OnLateUpdate keeps retrying the un-tilt until it
+		// succeeds, so a transient failure can never leave the body rotated with the switch off.
+		private static bool _restorePending;
+		// Last asserted state of RotatorFreeLook, so that switch can widen/restore the neck clamp on
+		// its own edge rather than only when the rotator itself is armed.
+		private static bool? _lastFreeLook;
 
 		public static void Toggle() { Set(!Active); }
 
@@ -80,8 +95,8 @@ namespace VRChatArchiveMod.Modules
 
 			if (on)
 			{
-				_pitch = 0f; _roll = 0f;
-				_rig = null; _holdProbed = false;
+				_tilt = Quaternion.identity;
+				_rig = null; _holdProbed = false; _animCached = null;
 				WidenNeck();
 				Status = "on — arrows tilt, PgUp/PgDn roll, RShift+F flips, RShift+Backspace resets"
 					+ (_neckWidened ? "" : " (view clamp unchanged: " + _neckWhy + ")");
@@ -90,6 +105,7 @@ namespace VRChatArchiveMod.Modules
 			{
 				RestoreNeck();
 				RestoreBody();
+				HoldGravity(false);
 				Status = "off";
 			}
 			VRChatArchiveModPlugin.Logger.LogInfo("[Rotator] " + Status);
@@ -102,15 +118,16 @@ namespace VRChatArchiveMod.Modules
 		public static void Flip()
 		{
 			if (!Active) Set(true);
-			_roll = Mathf.Abs(Mathf.DeltaAngle(_roll, 180f)) < 1f ? 0f : 180f;
-			Status = _roll == 0f ? "upright" : "upside down";
+			bool wasOver = Quaternion.Angle(_tilt, Quaternion.identity) > 90f;
+			_tilt = wasOver ? Quaternion.identity : Quaternion.AngleAxis(180f, Vector3.forward);
+			Status = wasOver ? "upright" : "upside down";
 			Toast.Show("Rotator — " + Status);
 		}
 
 		/// <summary>Back to level WITHOUT switching the rotator off, so the keys stay live.</summary>
 		public static void ResetUpright()
 		{
-			_pitch = 0f; _roll = 0f;
+			_tilt = Quaternion.identity;
 			Status = Active ? "upright — arrows tilt, PgUp/PgDn roll, RShift+F flips" : "off";
 			if (!Active) RestoreBody();
 			Toast.Show("Rotator — upright");
@@ -122,27 +139,74 @@ namespace VRChatArchiveMod.Modules
 			{
 				// RShift+R arms it. Same family as the mod's other RShift hotkeys, and R was free.
 				if (Input.GetKey(KeyCode.RightShift) && Input.GetKeyDown(KeyCode.R)) { Toggle(); return; }
+
+				// THE CONFIG TOGGLE ACTUALLY ARMS THE ROTATOR (2026-09-13). RotatorEnabled was only
+				// ever WRITTEN, by Set(); nothing in the mod read it back, so the persisted switch in
+				// the menu and the config file neither armed nor disarmed anything — the state lived
+				// purely in the static Active. Reading it on the edge makes the switch real, and
+				// because Set() writes it too, flipping it from either side stays consistent.
+				try
+				{
+					if (ModConfig.RotatorEnabled != null)
+					{
+						bool wantActive = ModConfig.RotatorEnabled.Value;
+						if (wantActive != Active) Set(wantActive);
+					}
+				}
+				catch { }
+
+				// FREE LOOK IS ITS OWN TOGGLE, WATCHED EVERY PASS. WidenNeck() is called only from
+				// Set(true) and OnSceneLoaded, and the switch was read INSIDE it — so turning free
+				// look off while the rotator was already on never reached RestoreNeck() and the neck
+				// clamp stayed widened, while turning it on did nothing until the rotator was cycled.
+				if (Active)
+				{
+					bool wantFree = false;
+					try { wantFree = ModConfig.RotatorFreeLook != null && ModConfig.RotatorFreeLook.Value; } catch { }
+					if (_lastFreeLook != wantFree)
+					{
+						_lastFreeLook = wantFree;
+						if (wantFree) WidenNeck();
+						else RestoreNeck();
+					}
+				}
+				else if (_lastFreeLook != null)
+				{
+					// Rotator off: the neck is restored by Set(false); forget the asserted state so a
+					// later arm re-applies free look from scratch.
+					_lastFreeLook = null;
+				}
+
 				if (!Active) return;
 
-				float step = Time.deltaTime * Speed();
+				float step = VaClock.Delta * Speed();
 
-				// Up/Down = pitch. MovementModule takes Left/Right for yaw and leaves these alone,
-				// despite what its config description claims.
-				if (Input.GetKey(KeyCode.UpArrow)) _pitch -= step;
-				if (Input.GetKey(KeyCode.DownArrow)) _pitch += step;
+				// EACH KEY TURNS YOU AROUND YOUR OWN AXIS, NOT AROUND A FIXED ONE.
+				//
+				// Pitch and roll used to be two angles fed to Quaternion.Euler. That composition is
+				// degenerate: once pitch passes about ±90° the pitch and roll axes line up, roll
+				// stops doing anything recognisable and the keys fight each other — which is the
+				// "not all the arrows work properly" you get after the first somersault. It is
+				// gimbal lock, and no amount of clamping fixes it because the representation is
+				// what is wrong.
+				//
+				// SDraw's rotator has no such state: every key is an incremental turn about an axis
+				// taken from the body ITSELF that frame —
+				//     RotateAround(origin, usePlayerAxis ? playerTransform.right : origin.right, …)
+				// — so up is always "nose down from where you are now", whatever way up you are.
+				// The tilt is therefore kept as a quaternion and multiplied, never as euler angles.
+				if (Input.GetKey(KeyCode.UpArrow)) Turn(Vector3.right, -step);
+				if (Input.GetKey(KeyCode.DownArrow)) Turn(Vector3.right, step);
 
 				// PageUp/PageDown = roll. Nothing in the mod or in VRChat desktop uses them.
-				if (Input.GetKey(KeyCode.PageUp)) _roll -= step;
-				if (Input.GetKey(KeyCode.PageDown)) _roll += step;
+				if (Input.GetKey(KeyCode.PageUp)) Turn(Vector3.forward, step);
+				if (Input.GetKey(KeyCode.PageDown)) Turn(Vector3.forward, -step);
 
 				if (Input.GetKey(KeyCode.RightShift))
 				{
 					if (Input.GetKeyDown(KeyCode.F)) Flip();
 					if (Input.GetKeyDown(KeyCode.Backspace)) ResetUpright();
 				}
-
-				_pitch = Wrap(_pitch);
-				_roll = Wrap(_roll);
 			}
 			catch (Exception e) { Status = "rotator: " + e.Message; }
 		}
@@ -152,6 +216,26 @@ namespace VRChatArchiveMod.Modules
 		// also writes it in LateUpdate is exactly what the probe below measures.
 		public override void OnLateUpdate()
 		{
+			// A PENDING RESTORE IS RETRIED UNTIL IT LANDS (2026-09-13). RestoreBody() opens with
+			// `if (rig == null) return;` and OnLateUpdate used to bail on `!Active` before anything
+			// else, so if the rig happened to be unresolvable at the exact moment the rotator was
+			// switched off — around a respawn or an avatar load, which is when a rig IS unresolvable —
+			// the body stayed tilted permanently with the switch reading OFF and nothing left to try
+			// again. The flag is set by Set(false) and cleared by the first restore that succeeds.
+			if (_restorePending)
+			{
+				try
+				{
+					Transform r0 = Rig();
+					if (r0 != null)
+					{
+						r0.rotation = Quaternion.AngleAxis(_yaw, Vector3.up);
+						_applied = r0.rotation;
+						_restorePending = false;
+					}
+				}
+				catch { }
+			}
 			if (!Active) return;
 			try
 			{
@@ -179,11 +263,131 @@ namespace VRChatArchiveMod.Modules
 						+ rig.name + ".");
 				}
 
-				Quaternion want = Quaternion.AngleAxis(_yaw, Vector3.up) * Quaternion.Euler(_pitch, 0f, _roll);
-				rig.rotation = want;
-				_applied = want;
+				Quaternion want = Quaternion.AngleAxis(_yaw, Vector3.up) * _tilt;
+
+				// GRAVITY FOLLOWS THE TILT, NOT THE SWITCH.
+				//
+				// The first version took the gravity hold the moment the rotator was armed, which
+				// meant arming it upright — the normal state, most of the time — silently switched
+				// your gravity off for no reason at all. Gravity is only in the way while you are
+				// actually leaning: upright, VRChat standing you up is exactly what you want.
+				bool tilted = Quaternion.Angle(_tilt, Quaternion.identity) > 0.5f;
+				HoldGravity(tilted && HoldGravityWanted);
+
+				// ROTATE AROUND THE BODY, NOT AROUND THE FEET.
+				//
+				// Writing rig.rotation turns the transform about its own origin, which sits at the
+				// player's feet — the body swings like a hinged plank and the viewpoint is carried
+				// off sideways instead of staying where your head is. Psychloor's PlayerRotater does
+				// the one thing this was missing:
+				//
+				//     playerTransform.RotateAround(originTransform.position, axis, angle)
+				//
+				// RotateAround moves POSITION as well as rotation, pivoting about a bone — the hips,
+				// or the viewpoint. That is what makes the view come with you rather than needing a
+				// second lever to drag it along.
+				//
+				// The absolute target is kept (Flip and ResetUpright need it), so the delta between
+				// where the rig is and where it should be is what gets pivoted.
+				Quaternion delta = want * Quaternion.Inverse(rig.rotation);
+				float angle; Vector3 axis;
+				delta.ToAngleAxis(out angle, out axis);
+				if (angle > 180f) angle -= 360f;
+				if (Mathf.Abs(angle) > 0.01f && axis.sqrMagnitude > 0.0001f)
+					rig.RotateAround(Pivot(rig), axis.normalized, angle);
+				else
+					rig.rotation = want;               // nothing to pivot; keep the heading exact
+
+				_applied = rig.rotation;
 			}
 			catch (Exception e) { Status = "rotator body: " + e.Message; }
+		}
+
+		// GRAVITY, THE PIECE THAT WAS MISSING ENTIRELY.
+		//
+		// Psychloor's PlayerRotater zeroes gravity for as long as it is rotating, and that is not a
+		// detail: VRChat pulls the player down and stands them back up every frame, so a tilt that
+		// is not held against gravity is fought to a standstill — which is exactly "nothing happens".
+		//
+		// It zeroes the GLOBAL Physics.gravity. We do not: GravityModule already owns that value,
+		// saves the world's own figure and restores it, and a second writer is how one module ends
+		// up recording the other's zero as "the original" — the orphan pattern this code base has
+		// already been bitten by. VRCPlayerApi.SetGravityStrength is the per-player equivalent, is
+		// the call worlds themselves use for low-gravity rooms, and touches nothing but you.
+		private static bool _gravityHeld;
+		private static float _gravityOriginal = 1f;
+
+		private static bool HoldGravityWanted
+		{
+			get { try { return ModConfig.RotatorHoldGravity == null || ModConfig.RotatorHoldGravity.Value; } catch { return true; } }
+		}
+
+		private static void HoldGravity(bool hold)
+		{
+			try
+			{
+				var api = PlayerRef.LocalApi();
+				if (api == null)
+				{
+					// No local player yet (arming during a load). Nothing was changed, so nothing is
+					// owed back — but say so, because a rotator without this fights VRChat and loses.
+					if (hold) VRChatArchiveModPlugin.Logger.LogInfo(
+						"[Rotator] no local player yet — gravity left alone; tilt may be fought until you respawn.");
+					return;
+				}
+
+				if (hold && !_gravityHeld)
+				{
+					try { _gravityOriginal = api.GetGravityStrength(); } catch { _gravityOriginal = 1f; }
+					if (_gravityOriginal <= 0.001f) _gravityOriginal = 1f;   // never "restore" to a zero we set
+					api.SetGravityStrength(0f);
+					_gravityHeld = true;
+					VRChatArchiveModPlugin.Logger.LogInfo("[Rotator] your gravity held at 0 while tilted (world untouched).");
+				}
+				else if (!hold && _gravityHeld)
+				{
+					api.SetGravityStrength(_gravityOriginal);
+					_gravityHeld = false;
+					VRChatArchiveModPlugin.Logger.LogInfo("[Rotator] your gravity put back to " + _gravityOriginal + ".");
+				}
+			}
+			catch (Exception e)
+			{
+				try { VRChatArchiveModPlugin.Logger.LogWarning("[Rotator] gravity: " + e.Message); } catch { }
+			}
+		}
+
+		// What the tilt turns about. The hips are the reference implementation's default origin and
+		// the one that feels like turning yourself rather than being swung on a rope; the head is
+		// the fallback, and the rig's own position plus a metre is the last resort so a missing
+		// Animator degrades instead of throwing.
+		private static Transform _animCached;
+		private static float _animCheckedAt;
+
+		private static Vector3 Pivot(Transform rig)
+		{
+			try
+			{
+				float now = VaClock.Now;
+				Animator anim = null;
+				if (_animCached != null && now - _animCheckedAt < 1f && NativeGuard.Alive(_animCached))
+					anim = _animCached.GetComponent<Animator>();
+				if (anim == null)
+				{
+					_animCheckedAt = now;
+					anim = rig.GetComponentInChildren<Animator>(true);
+					_animCached = anim != null ? anim.transform : null;
+				}
+				if (anim != null && anim.isHuman)
+				{
+					var hips = anim.GetBoneTransform(HumanBodyBones.Hips);
+					if (hips != null) return hips.position;
+					var head = anim.GetBoneTransform(HumanBodyBones.Head);
+					if (head != null) return head.position;
+				}
+			}
+			catch { }
+			return rig.position + Vector3.up;
 		}
 
 		public override void OnSceneLoaded(int buildIndex)
@@ -193,12 +397,22 @@ namespace VRChatArchiveMod.Modules
 			_rig = null; _neck = null; _rangeProp = null; _rangeOriginal = null;
 			_neckResolved = false; _neckWidened = false; _holdProbed = false;
 			_applied = Quaternion.identity;
-			if (Active) WidenNeck();
+			_animCached = null;
+
+			// The new world rebuilds the player at ITS own gravity, so the figure we saved belonged
+			// to the old one — keeping it would mean "restoring" a number from somewhere else, the
+			// mistake GravityModule documents on this exact value. Forget it, then take the hold
+			// again on the fresh player if we are still armed.
+			_gravityHeld = false;
+			_gravityOriginal = 1f;
+
+			if (Active) { HoldGravity(true); WidenNeck(); }
 		}
 
 		public override void OnShutdown()
 		{
 			try { RestoreNeck(); } catch { }
+			try { HoldGravity(false); } catch { }
 		}
 
 		// ------------------------------------------------------------------ body
@@ -221,7 +435,7 @@ namespace VRChatArchiveMod.Modules
 		// runs in LateUpdate.
 		private static Transform Rig()
 		{
-			float now = Time.realtimeSinceStartup;
+			float now = VaClock.Now;
 			if (_rig != null)
 			{
 				if (now - _rigCheckedAt < 0.25f) return _rig;
@@ -248,11 +462,14 @@ namespace VRChatArchiveMod.Modules
 			try
 			{
 				Transform rig = Rig();
-				if (rig == null) return;
+				// Unresolvable right now: leave the request standing so OnLateUpdate retries it every
+				// frame until it lands. Dropping it here is what left players permanently tilted.
+				if (rig == null) { _restorePending = true; return; }
 				rig.rotation = Quaternion.AngleAxis(_yaw, Vector3.up);
 				_applied = rig.rotation;
+				_restorePending = false;
 			}
-			catch { }
+			catch { _restorePending = true; }
 		}
 
 		// ------------------------------------------------------------------ view (the neck clamp)
@@ -287,13 +504,28 @@ namespace VRChatArchiveMod.Modules
 				int guard = 0;
 				while (root.parent != null && guard++ < 32) root = root.parent;
 
+				// FOUND BY SHAPE, NOT BY NAME.
+				//
+				// This used to insist the component be called GamelikeInputController or
+				// LocomotionInputController. Those names are obfuscated afresh on every VRChat
+				// build, so on this one the match never happened and the module reported, every
+				// single time, "view clamp unchanged: no desktop locomotion controller (VR, or
+				// renamed this build)" — the body tilted and the camera never followed, which is
+				// exactly the half-armed feature this file's own header warns about.
+				//
+				// What cannot be renamed away is the SHAPE: the controller is whichever component
+				// holds a NeckMouseRotator. VRC.DataModel types are hand-written and the obfuscator
+				// leaves them alone — the same anchor ApiAvatar provides elsewhere in this mod.
 				object ctl = null;
+				PropertyInfo neckProp = null;
+
 				foreach (var b in root.GetComponentsInChildren<Behaviour>(true))
 				{
 					if (b == null) continue;
 					string n;
 					try { n = MenuCard.Il2CppNameOf(b); } catch { continue; }
-					if (n != "GamelikeInputController" && n != "LocomotionInputController") continue;
+					if (string.IsNullOrEmpty(n)) continue;
+
 					Type ct = null;
 					foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
 					{
@@ -301,28 +533,95 @@ namespace VRChatArchiveMod.Modules
 						if (ct != null) break;
 					}
 					if (ct == null) continue;
-					var tryCast = typeof(Il2CppInterop.Runtime.InteropTypes.Il2CppObjectBase)
-						.GetMethod("TryCast").MakeGenericMethod(ct);
-					ctl = tryCast.Invoke(b, null);
-					if (ctl != null) break;
-				}
-				if (ctl == null)
-				{
-					_neckWhy = "no desktop locomotion controller (VR, or renamed this build)";
-					return;
+
+					PropertyInfo found = null;
+					try
+					{
+						foreach (var pi in ct.GetProperties(
+							BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.FlattenHierarchy))
+						{
+							if (pi.PropertyType.Name != "NeckMouseRotator") continue;
+							found = pi; break;
+						}
+					}
+					catch { continue; }
+					if (found == null) continue;
+
+					try
+					{
+						var tryCast = typeof(Il2CppInterop.Runtime.InteropTypes.Il2CppObjectBase)
+							.GetMethod("TryCast").MakeGenericMethod(ct);
+						object cast = tryCast.Invoke(b, null);
+						if (cast == null) continue;
+						ctl = cast; neckProp = found;
+						VRChatArchiveModPlugin.Logger.LogInfo(
+							"[Rotator] view controller found by shape: '" + n + "' holds a NeckMouseRotator.");
+						break;
+					}
+					catch { }
 				}
 
-				PropertyInfo neckProp = null;
-				foreach (var pi in ctl.GetType().GetProperties(
-					BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.FlattenHierarchy))
+				if (ctl != null && neckProp != null)
 				{
-					if (pi.PropertyType.Name != "NeckMouseRotator") continue;
-					neckProp = pi; break;
+					try { _neck = neckProp.GetValue(ctl); }
+					catch (Exception e) { _neckWhy = "neck read threw: " + e.Message; return; }
 				}
-				if (neckProp == null) { _neckWhy = "controller has no NeckMouseRotator member"; return; }
 
-				try { _neck = neckProp.GetValue(ctl); } catch (Exception e) { _neckWhy = "neck read threw: " + e.Message; return; }
-				if (_neck == null) { _neckWhy = "NeckMouseRotator is null"; return; }
+				// STOP LOOKING FOR THE OWNER, LOOK FOR THE THING.
+				//
+				// Two searches have now failed on this build, and both were looking for the wrong
+				// object: first the controller by NAME (obfuscated, never matched), then any
+				// component under the PLAYER holding one (it is not under the player). Measured
+				// both times in the log — "no desktop locomotion controller", then "nothing on the
+				// player holds a NeckMouseRotator".
+				//
+				// But the controller was never the goal; the NeckMouseRotator is. It is a component
+				// like any other, it lives in Assembly-CSharp under its own hand-written name, and
+				// Unity can be asked for every loaded instance of a type regardless of where in the
+				// scene VRChat parented it. That is the same lookup UserMenuModule uses to find the
+				// per-user page after the path-based searches failed there too.
+				//
+				// FindObjectsOfTypeAll, not FindObjectsOfType: it is on an object that may be
+				// inactive, and the active-only query would not see it.
+				if (_neck == null)
+				{
+					try
+					{
+						Type nmr = null;
+						foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
+						{
+							try { nmr = asm.GetType("NeckMouseRotator", false); } catch { }
+							if (nmr != null) break;
+						}
+						if (nmr == null) { _neckWhy = "type NeckMouseRotator not present on this build"; return; }
+
+						var il2 = Il2CppInterop.Runtime.Il2CppType.From(nmr);
+						var all = Resources.FindObjectsOfTypeAll(il2);
+
+						// CAST, don't just take the reference. FindObjectsOfTypeAll hands back
+						// UnityEngine.Object wrappers: reflecting on one of those finds Object's
+						// members, not NeckMouseRotator's, and the NeckRange lookup below would
+						// come up empty while the real member sat there the whole time.
+						var tryCast = typeof(Il2CppInterop.Runtime.InteropTypes.Il2CppObjectBase)
+							.GetMethod("TryCast").MakeGenericMethod(nmr);
+
+						for (int i = 0; all != null && i < all.Length; i++)
+						{
+							if (all[i] == null) continue;
+							object cast = null;
+							try { cast = tryCast.Invoke(all[i], null); } catch { }
+							if (cast == null) continue;
+							_neck = cast;
+							VRChatArchiveModPlugin.Logger.LogInfo(
+								"[Rotator] NeckMouseRotator found by type, anywhere in the scene ("
+								+ all.Length + " instance(s)).");
+							break;
+						}
+					}
+					catch (Exception e) { _neckWhy = "type search threw: " + e.Message; return; }
+				}
+
+				if (_neck == null) { _neckWhy = "no NeckMouseRotator instance loaded (VR, or not built yet)"; return; }
 
 				foreach (var pi in _neck.GetType().GetProperties(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic))
 				{

@@ -327,7 +327,7 @@ namespace VRChatArchiveMod.Modules
 
 				if (!ModConfig.UdonBlockCrashers.Value) return false;
 
-				float now = Time.realtimeSinceStartup;
+				float now = VaClock.Now;
 
 				// Global flood net first: while a flood is being ridden out, every non-lifecycle event
 				// is suspended regardless of its own per-name rate.
@@ -381,7 +381,7 @@ namespace VRChatArchiveMod.Modules
 		{
 			try
 			{
-				if (!_fNames && !ModConfig.UdonBlockAll.Value && !ModConfig.UdonBlockCrashers.Value) return true;
+				if (!_fNames && !_fBlockAll && !_fBlockCrashers) return true;   // cached in RefreshFlags
 				return !ShouldBlock(__0);
 			}
 			catch { return true; }   // never let the guard itself break the world
@@ -396,7 +396,7 @@ namespace VRChatArchiveMod.Modules
 		{
 			try
 			{
-				if (!ModConfig.UdonBlockAll.Value) return true;
+				if (!_fBlockAll) return true;   // cached in RefreshFlags; see the note on _fBlockAll
 				BlockedTotal++;
 				return false;
 			}
@@ -418,9 +418,17 @@ namespace VRChatArchiveMod.Modules
 		// _update on every behaviour every frame — so reading a ConfigEntry (a dictionary lookup
 		// behind a property) here was paid thousands of times a second. A plain bool is a field read.
 		private static bool _fLog, _fFrame;
+		// Same reasoning as _fLog / _fFrame, applied to the two BLOCK switches (2026-09-13). They are
+		// read by the Udon prefixes, which run for every Udon event in the world, and a ConfigEntry
+		// read is a dictionary lookup behind a property: with both switches off that was still two of
+		// them per event, thousands of times a second, to decide to do nothing. Cached here once a
+		// frame; the prefixes read plain static bools.
+		private static bool _fBlockAll, _fBlockCrashers;
 		public static void RefreshFlags()
 		{
 			try { _fLog = ModConfig.UdonLogEnabled.Value; _fFrame = ModConfig.UdonLogFrameEvents.Value; }
+			catch { }
+			try { _fBlockAll = ModConfig.UdonBlockAll.Value; _fBlockCrashers = ModConfig.UdonBlockCrashers.Value; }
 			catch { }
 			RefreshBlockNames();   // once per frame: a string compare, and a re-parse only when it changed
 		}
@@ -473,7 +481,7 @@ namespace VRChatArchiveMod.Modules
 			try
 			{
 				int id = go.GetInstanceID();
-				float now = Time.realtimeSinceStartup;
+				float now = VaClock.Now;
 				if (Owners.TryGetValue(id, out OwnerCache c) && now - c.At < 1f) return c.Name;
 
 				string name = "";
@@ -500,14 +508,14 @@ namespace VRChatArchiveMod.Modules
 				if (last.Event == ev && last.Obj == obj && last.User == user)
 				{
 					last.Repeats++;
-					last.Time = Time.realtimeSinceStartup;
+					last.Time = VaClock.Now;
 					return;
 				}
 			}
 			if (Log.Count >= Capacity) Log.RemoveAt(0);
 			Log.Add(new Entry
 			{
-				Time = Time.realtimeSinceStartup,
+				Time = VaClock.Now,
 				Clock = DateTime.Now.ToString("HH:mm:ss"),
 				User = user,
 				Obj = obj,
@@ -523,7 +531,7 @@ namespace VRChatArchiveMod.Modules
 			// when OnInitialize ran, and a scene later they are.
 			if (!_hooked && _hookAttempts < MaxHookAttempts)
 			{
-				float t = Time.realtimeSinceStartup;
+				float t = VaClock.Now;
 				if (t >= _nextHookTry)
 				{
 					_nextHookTry = t + 3f;
@@ -541,7 +549,7 @@ namespace VRChatArchiveMod.Modules
 			}
 
 			// events/second readout
-			float now = Time.realtimeSinceStartup;
+			float now = VaClock.Now;
 			if (now - _rateWindow >= 1f)
 			{
 				_rateWindow = now;

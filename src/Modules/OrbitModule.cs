@@ -64,12 +64,17 @@ namespace VRChatArchiveMod.Modules
 
 		public static void Stop(string why)
 		{
-			// The orbit hands the network a velocity every frame; the mode ending must hand it a zero once.
-			try { var lp = PlayerRef.LocalPlayer(); if (lp != null) PlayerRef.ZeroVelocity(lp); } catch { }
+			// Nothing was orbiting: do not touch the player at all. This is the path a scene change takes
+			// (OnSceneLoaded => Stop("")), on the very first frame, before the local player exists and
+			// before the il2cpp player APIs are safe to call -- reaching into PlayerRef here was an
+			// access violation that took the whole process down on load.
 			if (Current == Mode.Off) return;
 			Current = Mode.Off;
 			TargetUid = null;
 			TargetName = null;
+			// The orbit handed the network a velocity every frame; now that it has ended, hand it a zero
+			// once. Only reached when an orbit really was running, so the local player is present.
+			try { var lp = PlayerRef.LocalPlayer(); if (lp != null) PlayerRef.ZeroVelocity(lp); } catch { }
 			if (!string.IsNullOrEmpty(why)) VaTagsModule.LastStatus = why;
 		}
 
@@ -148,7 +153,7 @@ namespace VRChatArchiveMod.Modules
 				Quaternion rot;
 				if (Current == Mode.Orbit)
 				{
-					_angle += ModConfig.OrbitSpeed.Value * Time.deltaTime;
+					_angle += ModConfig.OrbitSpeed.Value * VaClock.Delta;
 					if (_angle >= 360f) _angle -= 360f;
 					float r = Mathf.Max(0.5f, ModConfig.OrbitRadius.Value);
 					float rad = _angle * Mathf.Deg2Rad;
@@ -197,7 +202,7 @@ namespace VRChatArchiveMod.Modules
 				// ZeroVelocity call was there for). And the rotation nudge no longer uses the plain
 				// TeleportTo: that overload is a SNAP by contract, so every 4 degrees the remote rig
 				// jumped. lerpOnRemote is VRChat's own flag for "interpolate this on other clients".
-				float dtv = Mathf.Max(Time.deltaTime, 0.0001f);
+				float dtv = Mathf.Max(VaClock.Delta, 0.0001f);
 				Vector3 vel = _velValid ? (pos - _prevPos) / dtv : Vector3.zero;
 				if (vel.sqrMagnitude > 30f * 30f) vel = vel.normalized * 30f;   // a teleport-in, not a velocity
 				_prevPos = pos; _velValid = true;

@@ -30,6 +30,9 @@ namespace VRChatArchiveMod.Modules
 	{
 		public override string Name => "ArchiveFavButton";
 
+		private static ArchiveFavButtonModule _instance;
+		public ArchiveFavButtonModule() { _instance = this; }
+
 		private const string CloneName = "VA_ArchiveFavButton";
 		private static readonly Color ArchiveViolet = new Color(0.36f, 0.20f, 0.62f, 1f);
 
@@ -47,10 +50,91 @@ namespace VRChatArchiveMod.Modules
 		private string _seenName = "";
 		private string _id = "";
 		private bool _busy;
+		private static string _selectedArchiveId;
+		private static string _selectedArchiveName;
 
 		public static string Status = "";
 		// Written by Run()'s pool-thread continuation, consumed by OnUpdate on the main thread.
 		private static volatile string _pendingToast;
+
+		public static void ClearArchiveSelection()
+		{
+			_selectedArchiveId = null;
+			_selectedArchiveName = null;
+		}
+
+		public static void SelectAvatar(string id, string name, string author = null, string image = null)
+		{
+			if (string.IsNullOrEmpty(id)) return;
+			_selectedArchiveId = id;
+			_selectedArchiveName = name;
+			ArchiveHijackModule.LastPreviewedId = id;
+			if (_instance != null)
+			{
+				_instance._id = id;
+				_instance._seenName = name;
+				_instance.UpdatePaneUI(id, name);
+			}
+			Core.AvatarPreview.Open(id, name, author, image);
+		}
+
+		private void UpdatePaneUI(string id, string name)
+		{
+			try
+			{
+				if (_row == null) Build();
+				if (_row == null) return;
+
+				// Update Avatar Name Text
+				var nameT = _row.Find("Avatar_Name_Text");
+				if (nameT != null)
+				{
+					var tmp = nameT.GetComponent<TMPro.TMP_Text>();
+					if (tmp != null && !string.IsNullOrEmpty(name))
+					{
+						tmp.text = name;
+						tmp.color = Color.white;
+					}
+				}
+
+				// Update Apply Button (Avatar_CTA_Button)
+				var cta = _row.Find("Avatar_CTA_Button");
+				if (cta != null)
+				{
+					HookApply(cta);
+					bool isWearing = string.Equals(VaTagsModule.LocalAvatarId(), id, StringComparison.Ordinal);
+					var ctaText = cta.Find("Text_ButtonName")?.GetComponent<TMPro.TMP_Text>();
+					if (ctaText != null)
+					{
+						ctaText.text = isWearing ? "Applied" : "Apply";
+						ctaText.color = Color.white;
+					}
+					var btn = cta.GetComponent<Button>();
+					if (btn != null)
+					{
+						btn.interactable = !isWearing;
+					}
+					var bg = cta.Find("Background_Button")?.GetComponent<Image>();
+					if (bg != null)
+					{
+						bg.color = isWearing ? new Color(0.2f, 0.25f, 0.3f, 1f) : new Color(0f, 0.82f, 0.70f, 1f);
+					}
+					var cg = cta.GetComponent<CanvasGroup>();
+					if (cg != null)
+					{
+						cg.alpha = 1f;
+						cg.interactable = !isWearing;
+						cg.blocksRaycasts = true;
+					}
+				}
+
+				Retitle();
+			}
+			catch (Exception ex)
+			{
+				VRChatArchiveModPlugin.Logger.LogWarning("[ArchiveFavBtn] UpdatePaneUI: " + ex.Message);
+			}
+		}
 
 		public override void OnUpdate()
 		{
@@ -63,65 +147,72 @@ namespace VRChatArchiveMod.Modules
 				// once every four seconds — enough to notice the pane the frame it appears — and
 				// even a fully-built button coasts at once a second, since the whole point of the
 				// pass is to REACT to the pane changing.
-				float now = Time.realtimeSinceStartup;
+				float now = VaClock.Now;
 
 				// A status produced off the main thread (Run's continuation) is toasted here, before
-				// the throttle below, so it shows the next frame rather than up to four seconds later.
+				// the throttle below, so it shows the next frame rather than waiting.
 				string pending = _pendingToast;
-				if (pending != null) { _pendingToast = null; Core.Toast.Show(pending); }
+				if (pending != null)
+				{
+					_pendingToast = null;
+					Core.Toast.Show(pending);
+					Retitle();
+				}
 
 				if (now < _next) return;
 				bool menuOpen = false;
 				try { menuOpen = Core.QuickMenu.MainVisible; } catch { }
 
-				// BACK OFF WHEN THE PANE IS NOT THERE. Looking for it is cheap now, but retrying twice
-				// a second forever while somebody browses the rest of the menu is still pure waste. Each
-				// consecutive miss doubles the wait, up to eight seconds; the counter resets the moment
-				// the pane is found or the menu is closed, so opening an avatar still gets its button
-				// promptly rather than after the longest interval.
 				if (!menuOpen) _misses = 0;
+				// Cadence when menu is open (0.8s) keeps UI responsive without CPU spikes
 				float wait = menuOpen
-					? (_btn != null ? 1f : Mathf.Min(8f, 0.5f * (1 << Mathf.Min(4, _misses))))
-					: 4f;
+					? (_btn != null ? 0.8f : Mathf.Min(4f, 0.5f * (1 << Mathf.Min(4, _misses))))
+					: 3f;
 				_next = now + wait;
 
 				if (_row == null || _btn == null)
 				{
 					Build();
-					// Found it: drop straight back to the responsive cadence.
 					if (_btn != null) _misses = 0; else if (_misses < 4) _misses++;
 					return;
 				}
 
-				// Re-checked every pass: one Find and an int compare, and it is what keeps Apply
-				// working across the pane being rebuilt.
+				if (!_row.gameObject.activeInHierarchy) return;
+
 				HookApply(_row.Find("Avatar_CTA_Button"));
 
-				// Selection changed -> the cached id is stale.
 				string nm = NameOnPane();
-				if (!string.Equals(nm, _seenName, StringComparison.Ordinal))
+
+				// If an archive selection is active, verify the pane hasn't navigated away
+				if (!string.IsNullOrEmpty(_selectedArchiveId))
 				{
-					_seenName = nm;
-					// Resolved on SELECTION CHANGE, not on click: the label has to already say
-					// "REMOVE" for an avatar that is in the Archive, otherwise the button lies until
-					// you press it once. Costs one subtree scan per avatar you look at.
-					_id = ResolveId();
+					if (!string.IsNullOrEmpty(nm) && !string.IsNullOrEmpty(_selectedArchiveName)
+						&& !string.Equals(nm.Trim(), _selectedArchiveName.Trim(), StringComparison.OrdinalIgnoreCase))
+					{
+						// User navigated away to a different avatar in VRChat menus
+						ClearArchiveSelection();
+					}
+					else if (!string.Equals(_id, _selectedArchiveId, StringComparison.Ordinal))
+					{
+						_id = _selectedArchiveId;
+						_seenName = _selectedArchiveName ?? nm;
+						UpdatePaneUI(_id, _seenName);
+					}
 				}
 
-				// When the avatar was opened from OUR category, the id it exposed is authoritative —
-				// prefer it over the pane scan, which could latch onto a different avtr_ string in
-				// the marketplace panel and made the button read "Save" on an already-saved avatar.
-				string owned = ArchiveHijackModule.LastPreviewedId;
-				if (!string.IsNullOrEmpty(owned)
-					&& (nm ?? "") != "" && FavoritesModule.Has(owned) && !FavoritesModule.Has(_id))
-					_id = owned;
+				// If not in archive selection (or selection was just cleared), follow the pane's avatar
+				if (string.IsNullOrEmpty(_selectedArchiveId))
+				{
+					if (!string.Equals(nm, _seenName, StringComparison.Ordinal) || string.IsNullOrEmpty(_id))
+					{
+						_seenName = nm;
+						_id = ResolveId();
+					}
+				}
 
 				Retitle();
 
-				// Re-assert the extra buttons' colour every pass. VRChat's StyleElement gets
-				// re-added to a cloned button when the pane restyles and repaints it grey/disabled —
-				// which is why Copy/Get came out faded next to the violet main button. Cheap: a
-				// couple of colour writes twice a second.
+				KeepViolet(_btn);
 				KeepViolet(_metaBtn);
 			}
 			catch (Exception e) { VRChatArchiveModPlugin.Logger.LogWarning("[ArchiveFavBtn] " + e.Message); }
@@ -368,12 +459,9 @@ namespace VRChatArchiveMod.Modules
 			catch { return ""; }
 		}
 
-		// The id of the avatar this pane is showing: our owned-preview id first (authoritative),
-		// then the cached selection id, then a fresh pane scan.
+		// The id of the avatar this pane is showing: current resolved id, or a fresh resolve.
 		private string CurrentId()
 		{
-			string owned = ArchiveHijackModule.LastPreviewedId;
-			if (!string.IsNullOrEmpty(owned) && FavoritesModule.Has(owned)) return owned;
 			if (!string.IsNullOrEmpty(_id)) return _id;
 			return ResolveId();
 		}
@@ -468,7 +556,13 @@ namespace VRChatArchiveMod.Modules
 			try
 			{
 				if (_busy) return;
-				if (string.IsNullOrEmpty(_id)) _id = ResolveId();
+				string pn = NameOnPane();
+				if (string.IsNullOrEmpty(_id) || (!string.IsNullOrEmpty(pn) && !string.Equals(pn, _seenName, StringComparison.Ordinal)))
+				{
+					_seenName = pn;
+					_id = ResolveId();
+				}
+
 				if (string.IsNullOrEmpty(_id))
 				{
 					Status = "could not tell which avatar is shown";
@@ -480,30 +574,52 @@ namespace VRChatArchiveMod.Modules
 				bool has = FavoritesModule.Has(_id);
 				_busy = true;
 				Retitle();
-				_ = Run(has);
+				_ = Run(_id, _seenName, has);
 			}
 			catch (Exception e) { VRChatArchiveModPlugin.Logger.LogWarning("[ArchiveFavBtn] click: " + e.Message); }
 		}
 
-		private async System.Threading.Tasks.Task Run(bool remove)
+		private async System.Threading.Tasks.Task Run(string targetId, string targetName, bool remove)
 		{
 			try
 			{
-				bool ok = remove
-					? await FavoritesModule.RemoveAsync(_id)
-					: await FavoritesModule.AddAsync(_id);
+				bool ok;
+				if (remove)
+				{
+					ok = await FavoritesModule.RemoveAsync(targetId);
+				}
+				else
+				{
+					var idx = AvatarIndex.ById(targetId);
+					string name = !string.IsNullOrEmpty(targetName) ? targetName : idx?.Name;
+					string author = idx?.AuthorName;
+					string image = idx?.ThumbUrl ?? idx?.ImageUrl;
+					if (string.IsNullOrEmpty(name)) name = targetName;
+					if (string.IsNullOrEmpty(author) || string.IsNullOrEmpty(image))
+					{
+						try
+						{
+							var a = VRC.Core.API.FromCacheOrNew<VRC.Core.ApiAvatar>(targetId);
+							if (a != null && Core.NativeGuard.Alive(a) && a.Populated)
+							{
+								if (string.IsNullOrEmpty(name)) name = a.name;
+								if (string.IsNullOrEmpty(author)) author = a.authorName;
+								if (string.IsNullOrEmpty(image)) image = !string.IsNullOrEmpty(a.thumbnailImageUrl) ? a.thumbnailImageUrl : a.imageUrl;
+							}
+						}
+						catch { }
+					}
+					ok = await FavoritesModule.AddAsync(targetId, name, author, image);
+				}
 				Status = ok
-					? (remove ? "removed from your Archive favourites" : "added to your Archive favourites")
+					? (remove ? "removed from your Archive favourites" : "saved to your Archive favourites")
 					: FavoritesModule.LastStatus;
-				VRChatArchiveModPlugin.Logger.LogInfo($"[ArchiveFavBtn] {(remove ? "remove" : "add")} {_id} -> {ok}");
+				VRChatArchiveModPlugin.Logger.LogInfo($"[ArchiveFavBtn] {(remove ? "remove" : "add")} {targetId} -> {ok}");
 			}
 			catch (Exception e) { Status = "failed: " + e.Message; }
 			finally
 			{
 				_busy = false;
-				// This continuation runs on a POOL thread (the await above resumes wherever the HTTP
-				// call completed — BepInEx has no Unity synchronisation context). The toast stamps
-				// Unity time, so it is queued here and shown from OnUpdate on the main thread.
 				_pendingToast = Status;
 			}
 		}
@@ -607,51 +723,78 @@ namespace VRChatArchiveMod.Modules
 		{
 			try
 			{
-				Transform root = _row;
-				for (int up = 0; up < 4 && root != null && root.parent != null; up++) root = root.parent;
-				if (root == null) return "";
-				string hit = "";
-				Scan(root, 0, ref hit);
-				if (!string.IsNullOrEmpty(hit))
+				string pn = NameOnPane();
+
+				// 1. If currently showing an archive selection and the pane name matches it:
+				if (!string.IsNullOrEmpty(_selectedArchiveId) && !string.IsNullOrEmpty(_selectedArchiveName))
 				{
-					VRChatArchiveModPlugin.Logger.LogInfo("[ArchiveFavBtn] resolved avatar id " + hit);
-					return hit;
+					if (string.IsNullOrEmpty(pn) || string.Equals(pn.Trim(), _selectedArchiveName.Trim(), StringComparison.OrdinalIgnoreCase))
+					{
+						return _selectedArchiveId;
+					}
 				}
-				// THE AVATAR YOU ARE WEARING. When the pane shows the avatar you already have on,
-				// VRChat flips "Try" to "Applied" and no longer binds an avatar to the action buttons,
-				// so the subtree holds no avtr_ string at all and the scan comes back empty — that was
-				// "could not tell which avatar is shown" on your own avatar. The case is unambiguous:
-				// the shown avatar IS the worn one, whose id the local player knows.
+
+				// 2. Check AvatarIndex by displayed name (direct parse hook hit!)
+				if (!string.IsNullOrEmpty(pn))
+				{
+					string idByName = AvatarIndex.IdForName(pn);
+					if (!string.IsNullOrEmpty(idByName))
+					{
+						VRChatArchiveModPlugin.Logger.LogInfo("[ArchiveFavBtn] resolved id by name '" + pn + "' -> " + idByName);
+						return idByName;
+					}
+
+					// 2b. Check FavoritesModule by name
+					string idByFav = FavoritesModule.IdForName(pn);
+					if (!string.IsNullOrEmpty(idByFav))
+					{
+						VRChatArchiveModPlugin.Logger.LogInfo("[ArchiveFavBtn] resolved id by favorite name '" + pn + "' -> " + idByFav);
+						return idByFav;
+					}
+				}
+
+				// 3. Check if pane shows the worn avatar (name matches worn avatar)
 				string worn = WornIdIfPaneShowsIt();
 				if (!string.IsNullOrEmpty(worn))
+				{
 					VRChatArchiveModPlugin.Logger.LogInfo("[ArchiveFavBtn] pane shows the worn avatar -> " + worn);
-				return worn ?? "";
+					return worn;
+				}
+
+				// 4. Fallback: inspect pane hierarchy
+				Transform root = _row;
+				for (int up = 0; up < 4 && root != null && root.parent != null; up++) root = root.parent;
+				if (root != null)
+				{
+					string hit = "";
+					Scan(root, 0, ref hit);
+					if (!string.IsNullOrEmpty(hit))
+					{
+						VRChatArchiveModPlugin.Logger.LogInfo("[ArchiveFavBtn] resolved avatar id by scan " + hit);
+						return hit;
+					}
+				}
+
+				// 5. Fallback to recently parsed avatar (within 2s)
+				string recent = AvatarIndex.RecentId(2f);
+				if (!string.IsNullOrEmpty(recent)) return recent;
+
+				return "";
 			}
 			catch { return ""; }
 		}
 
-		// Two signals, either is enough: VRChat's own Try button reading "Applied" (English UI), or
-		// the pane's avatar name matching the worn avatar's name (any language). A merely DISABLED
-		// Try button is deliberately NOT a signal — a private / non-cloneable avatar disables it too,
-		// and that would pin the wrong id on someone else's avatar.
 		private string WornIdIfPaneShowsIt()
 		{
 			try
 			{
-				bool applied = false;
-				try
-				{
-					var t = _row != null ? _row.Find("Try_Avatar_Button/Text_ButtonName") : null;
-					var tmp = t != null ? t.GetComponent<TMPro.TMP_Text>() : null;
-					applied = tmp != null
-						&& string.Equals((tmp.text ?? "").Trim(), "Applied", StringComparison.OrdinalIgnoreCase);
-				}
-				catch { }
 				string wornName = VaTagsModule.LocalAvatarName();
 				string paneName = NameOnPane();
-				bool sameName = !string.IsNullOrEmpty(wornName) && !string.IsNullOrEmpty(paneName)
-					&& string.Equals(wornName.Trim(), paneName.Trim(), StringComparison.Ordinal);
-				if (!applied && !sameName) return null;
+				if (string.IsNullOrEmpty(wornName) || string.IsNullOrEmpty(paneName)) return null;
+
+				bool sameName = string.Equals(wornName.Trim(), paneName.Trim(), StringComparison.OrdinalIgnoreCase);
+				if (!sameName) return null;
+
 				return VaTagsModule.LocalAvatarId();
 			}
 			catch { return null; }
@@ -694,7 +837,7 @@ namespace VRChatArchiveMod.Modules
 		{
 			if (_typeIndex != null) return _typeIndex;
 			var idx = new Dictionary<string, Type>(StringComparer.Ordinal);
-			float t0 = Time.realtimeSinceStartup;
+			float t0 = VaClock.Now;
 			try
 			{
 				foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
@@ -718,7 +861,7 @@ namespace VRChatArchiveMod.Modules
 			_typeIndex = idx;
 			VRChatArchiveModPlugin.Logger.LogInfo(
 				"[ArchiveFavBtn] type index built: " + idx.Count + " type(s) in "
-				+ ((Time.realtimeSinceStartup - t0) * 1000f).ToString("0") + " ms (once per session).");
+				+ ((VaClock.Now - t0) * 1000f).ToString("0") + " ms (once per session).");
 			return _typeIndex;
 		}
 
@@ -846,6 +989,15 @@ namespace VRChatArchiveMod.Modules
 					if (go != null) return go.transform;
 				}
 				catch { }
+
+				var main = Core.QuickMenu.Main();
+				if (main != null)
+				{
+					foreach (var t in main.GetComponentsInChildren<Transform>(true))
+					{
+						if (t != null && t.name == name) return t;
+					}
+				}
 				return null;
 			}
 			catch { }

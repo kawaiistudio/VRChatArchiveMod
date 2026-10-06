@@ -15,7 +15,7 @@ namespace VRChatArchiveMod.Modules
 	// the moment one JOINS a notification banner pops on screen for a few seconds.
 	//
 	// Purely a local visualization/alert built on the same position data your client already
-	// receives (VRCPlayerApi.AllPlayers) and the same APIUser access as the ESP module — it
+	// receives (VRChatArchiveMod.Core.VaPlayers.All()) and the same APIUser access as the ESP module — it
 	// never targets, follows, or acts on anyone, and touches nothing networked.
 	public class WatchlistModule : IModule
 	{
@@ -40,40 +40,8 @@ namespace VRChatArchiveMod.Modules
 
 		private static void Alert()
 		{
-			try
-			{
-				// Several watched users can land in the same poll, and one bark per person would be a
-				// pile-up rather than a notification.
-				float now = Time.realtimeSinceStartup;
-				if (now < _alertNext) return;
-				_alertNext = now + 2.5f;
-
-				if (!_alertTried)
-				{
-					_alertTried = true;
-					byte[] wav = Core.AssetLoader.RawBytes("watch_join.wav");
-					if (wav != null) _alertClip = Core.WavAudio.Decode(wav, "watch_join");
-					if (_alertClip == null) VRChatArchiveModPlugin.Logger.LogWarning("[Watchlist] join sound could not be loaded.");
-				}
-				if (_alertClip == null) return;
-
-				if (_alertSrc == null)
-				{
-					var go = new GameObject("ArchiveWatchAlert");
-					UnityEngine.Object.DontDestroyOnLoad(go);
-					go.hideFlags = HideFlags.HideAndDontSave;
-					_alertSrc = go.AddComponent<AudioSource>();
-					_alertSrc.spatialBlend = 0f;
-					_alertSrc.loop = false;
-					_alertSrc.playOnAwake = false;
-					_alertSrc.bypassEffects = true;
-					_alertSrc.bypassListenerEffects = true;
-					_alertSrc.ignoreListenerPause = true;
-				}
-				_alertSrc.volume = 1f;
-				_alertSrc.PlayOneShot(_alertClip);
-			}
-			catch (Exception e) { VRChatArchiveModPlugin.Logger.LogWarning("[Watchlist] alert: " + e.Message); }
+			// Watchlist join sound disabled
+			return;
 		}
 
 		public override void OnSceneLoaded(int buildIndex)
@@ -103,7 +71,7 @@ namespace VRChatArchiveMod.Modules
 		public static void TestMemberNotification(string name)
 		{
 			_memberName = string.IsNullOrEmpty(name) ? "Test Member" : name;
-			_memberSince = Time.realtimeSinceStartup;
+			_memberSince = VaClock.Now;
 			_memberUntil = _memberSince + 7f;
 		}
 
@@ -158,7 +126,7 @@ namespace VRChatArchiveMod.Modules
 		{
 			ResolveReflection();
 			string localUid = VaTagsModule.LocalUserId();
-			var players = VRCPlayerApi.AllPlayers;
+			var players = VRChatArchiveMod.Core.VaPlayers.All();
 			if (players == null) return;
 
 			var now = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -189,7 +157,7 @@ namespace VRChatArchiveMod.Modules
 					if (!_presentWatched.Contains(uid))
 					{
 						_notifyName = nameByUid.TryGetValue(uid, out string n) ? n : uid;
-						_notifyUntil = Time.realtimeSinceStartup + 6f;
+						_notifyUntil = VaClock.Now + 6f;
 						VRChatArchiveModPlugin.Logger.LogInfo($"[Watchlist] watched user joined: {_notifyName} ({uid}).");
 						// The banner is easy to miss when you are not looking at that corner of the
 						// screen — which is most of the time, and the whole point of watching someone.
@@ -229,7 +197,7 @@ namespace VRChatArchiveMod.Modules
 				_memberName = newcomers.Count == 1
 					? newcomers[0]
 					: newcomers[0] + $" +{newcomers.Count - 1} more";
-				_memberSince = Time.realtimeSinceStartup;
+				_memberSince = VaClock.Now;
 				_memberUntil = _memberSince + 7f;
 			}
 			if (settled) _memberPrimed = true;
@@ -266,11 +234,11 @@ namespace VRChatArchiveMod.Modules
 			if (_watch.Count == 0) return;      // nothing watched -> resolve nobody
 			var cam = Camera.main;
 			if (cam == null) return;
-			var players = VRCPlayerApi.AllPlayers;
+			var players = VRChatArchiveMod.Core.VaPlayers.All();
 			if (players == null) return;
 
 			// rainbow colour cycles over time (super-RGB)
-			float t = Time.realtimeSinceStartup;
+			float t = VaClock.Now;
 			Color rgb = Color.HSVToRGB(Mathf.Repeat(t * 0.4f, 1f), 0.9f, 1f);
 			Color rgb2 = Color.HSVToRGB(Mathf.Repeat(t * 0.4f + 0.5f, 1f), 0.9f, 1f);
 
@@ -319,8 +287,8 @@ namespace VRChatArchiveMod.Modules
 		// sheen and a gentle fade in/out. Deliberately calm and premium, not a rainbow box.
 		private void DrawMemberNotification()
 		{
-			if (Time.realtimeSinceStartup > _memberUntil || string.IsNullOrEmpty(_memberName)) return;
-			float now = Time.realtimeSinceStartup;
+			if (VaClock.Now > _memberUntil || string.IsNullOrEmpty(_memberName)) return;
+			float now = VaClock.Now;
 
 			// fade in over the first 0.3s, out over the last 0.7s, with a soft ease-out entry pop.
 			float fin = Mathf.Clamp01((now - _memberSince) / 0.3f);
@@ -409,8 +377,8 @@ namespace VRChatArchiveMod.Modules
 
 		private void DrawNotification()
 		{
-			if (Time.realtimeSinceStartup > _notifyUntil || string.IsNullOrEmpty(_notifyName)) return;
-			float t = Time.realtimeSinceStartup;
+			if (VaClock.Now > _notifyUntil || string.IsNullOrEmpty(_notifyName)) return;
+			float t = VaClock.Now;
 			Color rgb = Color.HSVToRGB(Mathf.Repeat(t * 0.6f, 1f), 0.9f, 1f);
 
 			float w = 460f, h = 54f;

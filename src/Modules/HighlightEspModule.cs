@@ -112,9 +112,9 @@ namespace VRChatArchiveMod.Modules
 					long g0 = System.Diagnostics.Stopwatch.GetTimestamp();
 					EspCameraGuard.Tick();
 					double msG = (System.Diagnostics.Stopwatch.GetTimestamp() - g0) * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
-					if (msG > 8.0 && Time.realtimeSinceStartup >= _nextSlowLog)
+					if (msG > 8.0 && VaClock.Now >= _nextSlowLog)
 					{
-						_nextSlowLog = Time.realtimeSinceStartup + 10f;
+						_nextSlowLog = VaClock.Now + 10f;
 						VRChatArchiveModPlugin.Logger.LogWarning($"[HighlightEsp] EspCameraGuard.Tick took {msG:0.0} ms this frame.");
 					}
 				}
@@ -127,9 +127,9 @@ namespace VRChatArchiveMod.Modules
 				long r0 = System.Diagnostics.Stopwatch.GetTimestamp();
 				bool resolved = Resolve();
 				double msR = (System.Diagnostics.Stopwatch.GetTimestamp() - r0) * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
-				if (msR > 8.0 && Time.realtimeSinceStartup >= _nextSlowLog)
+				if (msR > 8.0 && VaClock.Now >= _nextSlowLog)
 				{
-					_nextSlowLog = Time.realtimeSinceStartup + 10f;
+					_nextSlowLog = VaClock.Now + 10f;
 					VRChatArchiveModPlugin.Logger.LogWarning($"[HighlightEsp] Resolve() took {msR:0.0} ms this frame (fx {(resolved ? "ok" : "missing")}, via {_how}).");
 				}
 				if (!resolved)
@@ -154,16 +154,16 @@ namespace VRChatArchiveMod.Modules
 				// WORLD PASS ON A REAL CLOCK, not the player frame counter (that once made "every 600"
 				// mean every 600*45 frames — seven minutes). Pickups and portals change on a human
 				// timescale; the scan is two FindObjectsOfType calls plus a liveness sweep of what glows.
-				float rt = Time.realtimeSinceStartup;
+				float rt = VaClock.Now;
 				if ((wantPortals || wantItems) && rt >= _nextWorld)
 				{
 					_nextWorld = rt + WorldIntervalSec;
 					long w0 = System.Diagnostics.Stopwatch.GetTimestamp();
 					WorldPass(wantPortals, wantItems);
 					double msWorld = (System.Diagnostics.Stopwatch.GetTimestamp() - w0) * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
-					if (msWorld > 20.0 && Time.realtimeSinceStartup >= _nextSlowLog)
+					if (msWorld > 20.0 && VaClock.Now >= _nextSlowLog)
 					{
-						_nextSlowLog = Time.realtimeSinceStartup + 10f;
+						_nextSlowLog = VaClock.Now + 10f;
 						VRChatArchiveModPlugin.Logger.LogWarning($"[HighlightEsp] world pass took {msWorld:0} ms ({_items.Count} pickup(s), {_portals.Count} portal(s) glowing).");
 					}
 				}
@@ -262,9 +262,9 @@ namespace VRChatArchiveMod.Modules
 			if (gone != null) foreach (string uid in gone) DropPlayer(uid);
 
 			double ms = (System.Diagnostics.Stopwatch.GetTimestamp() - t0) * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
-			if (ms > 20.0 && Time.realtimeSinceStartup >= _nextPlayerCostLog)
+			if (ms > 20.0 && VaClock.Now >= _nextPlayerCostLog)
 			{
-				_nextPlayerCostLog = Time.realtimeSinceStartup + 10f;
+				_nextPlayerCostLog = VaClock.Now + 10f;
 				VRChatArchiveModPlugin.Logger.LogWarning($"[HighlightEsp] player pass {ms:0} ms: {kept} avatar(s) kept, {relit} relit ({relitRenderers} renderers), {pruned} dead renderer(s) forgotten, {(gone != null ? gone.Count : 0)} left.");
 			}
 
@@ -295,6 +295,26 @@ namespace VRChatArchiveMod.Modules
 		}
 
 		// Just the avatar glow, leaving portals and pickups alone.
+		// Same entry point for the highlight pass, and it pokes the capsule one too: the menus treat
+		// them as one ESP, so a setting change has to refresh both or the two disagree on screen.
+		public static void TriggerRelight()
+		{
+			try
+			{
+				var mod = ModuleManager.Get<HighlightEspModule>();
+				if (mod != null)
+				{
+					mod.ClearPlayers();
+					mod.ClearWorld(mod._portals);
+					mod.ClearWorld(mod._items);
+					mod._frame = ScanIntervalFrames;
+					mod._nextWorld = 0f;
+				}
+				CapsuleEspModule.TriggerRelight();
+			}
+			catch { }
+		}
+
 		private void ClearPlayers()
 		{
 			var keys = new List<string>(_players.Keys);
@@ -331,6 +351,20 @@ namespace VRChatArchiveMod.Modules
 		// lighting and the liveness checks are spread over frames, a slice each, so the cost per frame
 		// is bounded and the same 1000 pickups light up over about a second with no spike.
 		private const float ItemEnumerateSec = 10f;
+
+		// ADAPTIVE ENUMERATE INTERVAL (2026-09-13). ItemEnumerate() is the one unbudgetable burst in
+		// this module: FindObjectsByType walks the entire scene in a single frame — 113 ms measured,
+		// the spike behind "[HighlightEsp] item step 119.0 ms". It cannot be sliced (the walk is
+		// atomic), but it CAN run less often: a world's set of pickups almost never changes once it
+		// has loaded. So each pass fingerprints what it found (count + order-free XOR of instance
+		// ids, so an unsorted walk still compares equal) and, when the set is identical to last
+		// time, the wait before the next walk doubles — 10 s, 20 s, 40 s, capped at 60 s. Any change
+		// snaps it back to 10 s, and an explicit request (toggle on, scene load) resets it too. In a
+		// stable world that is six times fewer 113 ms frames, and nothing anyone sees is different:
+		// a pickup that does appear is picked up on the next walk exactly as before.
+		private const float ItemEnumerateMaxSec = 60f;
+		private static float _itemEnumInterval = ItemEnumerateSec;
+		private static long _itemEnumSig = long.MinValue;
 		// VALIDATE IS THE EXPENSIVE HALF. IsLive = a VirtualQuery per renderer of the pickup (PruneDead),
 		// ~0.9 ms per item: 10 per frame, every frame, was 9.4 ms/frame = 552 ms/s on Murder 4 (the mod's
 		// own [Perf] line, owner at 20 fps). Pickups do not die 60 times a second — 2 items every 0.1 s
@@ -346,14 +380,23 @@ namespace VRChatArchiveMod.Modules
 		private static List<int> _itemKeys;
 		private static bool _itemReport;
 
-		internal static void RequestItemEnumerate() => _nextItemEnumerate = 0f;
+		// An explicit request (toggle on, scene load) also drops the adaptive back-off: a new world
+		// or a fresh enable must be walked at the fast cadence, not inherit a 60 s wait.
+		internal static void RequestItemEnumerate()
+		{
+			_nextItemEnumerate = 0f;
+			_itemEnumInterval = ItemEnumerateSec;
+			_itemEnumSig = long.MinValue;
+		}
 
 		private static float _nextItemCostLog;
 		private void ItemStep()
 		{
 			long t0 = System.Diagnostics.Stopwatch.GetTimestamp();
-			float now = Time.realtimeSinceStartup;
-			if (now >= _nextItemEnumerate) { _nextItemEnumerate = now + ItemEnumerateSec; ItemEnumerate(); }
+			float now = VaClock.Now;
+			// Interval is adaptive (see _itemEnumInterval): 10 s while the set keeps changing, up to
+			// 60 s once it has settled, so the full-scene walk stops landing every ten seconds.
+			if (now >= _nextItemEnumerate) { _nextItemEnumerate = now + _itemEnumInterval; ItemEnumerate(); }
 			long t1 = System.Diagnostics.Stopwatch.GetTimestamp();
 
 			// light a slice of the candidates
@@ -418,7 +461,7 @@ namespace VRChatArchiveMod.Modules
 				if (_pickupIl2 == null) _pickupIl2 = Il2CppType.Of<VRC_Pickup>();
 				// UNSORTED. FindObjectsOfType sorts its result by instance id; FindObjectsByType(None) is the
 				// same walk without the sort, and the 2026-09-04 log put the sorted call at 70 ms for 63 pickups.
-				var found = UnityEngine.Object.FindObjectsByType(_pickupIl2, FindObjectsSortMode.None);
+				var found = VRChatArchiveMod.Core.Live.AllOfType(_pickupIl2, FindObjectsSortMode.None);
 				if (found != null)
 				{
 					for (int i = 0; i < found.Length; i++)
@@ -441,6 +484,17 @@ namespace VRChatArchiveMod.Modules
 			// anything lit that the world no longer has stops glowing
 			DropUnseen(_items, _itemEnumIds);
 			_itemCursor = 0; _itemReport = true;
+
+			// FINGERPRINT THE SET AND PACE THE NEXT WALK. XOR is order-independent, so an unsorted
+			// FindObjectsByType that hands the same pickups back in a different order still matches.
+			int x = 0;
+			foreach (int id in _itemEnumIds) x ^= id;
+			long sig = ((long)_itemEnumIds.Count << 32) ^ (uint)x;
+			if (sig == _itemEnumSig)
+				_itemEnumInterval = Math.Min(_itemEnumInterval * 2f, ItemEnumerateMaxSec);   // settled: back off
+			else
+				_itemEnumInterval = ItemEnumerateSec;                                           // changed: watch closely
+			_itemEnumSig = sig;
 		}
 
 		// VRChat's own camera rig: "UserCamera", "PhotoCamera", "ViewFinder", "CameraObject"… — checked on
@@ -478,7 +532,7 @@ namespace VRChatArchiveMod.Modules
 			var seen = new HashSet<int>();
 			try
 			{
-				var found = UnityEngine.Object.FindObjectsOfType(_portalIl2);
+				var found = VRChatArchiveMod.Core.Live.AllOfType(_portalIl2);
 				if (found != null)
 				{
 					for (int i = 0; i < found.Length; i++)
@@ -510,9 +564,9 @@ namespace VRChatArchiveMod.Modules
 			try
 			{
 				if (_rigidbodyIl2 == null) _rigidbodyIl2 = Il2CppType.Of<Rigidbody>();
-				if (_rigidbodyIl2 != null && t.GetComponentInParent(_rigidbodyIl2) != null) return true;
+				if (_rigidbodyIl2 != null && t.GetComponentInParentSafe(_rigidbodyIl2) != null) return true;
 				if (_pickupIl2 == null) _pickupIl2 = Il2CppType.Of<VRC_Pickup>();
-				if (_pickupIl2 != null && t.GetComponentInParent(_pickupIl2) != null) return true;
+				if (_pickupIl2 != null && t.GetComponentInParentSafe(_pickupIl2) != null) return true;
 			}
 			catch { }
 			return false;
@@ -832,7 +886,7 @@ namespace VRChatArchiveMod.Modules
 		{
 			if (_fx != null && _addWithColor != null)
 			{
-				float tNow = Time.realtimeSinceStartup;
+				float tNow = VaClock.Now;
 				if (tNow - _fxCheckedAt < FxRevalidateSec) return true;   // trust the last answer between checks
 				_fxCheckedAt = tNow;
 				if (FxAlive(_fx)) return true;
@@ -886,7 +940,7 @@ namespace VRChatArchiveMod.Modules
 			// so the early misses are normal. The hunt is rate-limited to once a second while it
 			// fails (the scan is not free), and the warning waits until it has genuinely been
 			// failing for a while before saying anything at all.
-			float now = Time.realtimeSinceStartup;
+			float now = VaClock.Now;
 			if (_firstFxTry <= 0f) _firstFxTry = now;
 			if (now < _nextFxScan) return false;
 			_nextFxScan = now + 1f;
@@ -897,7 +951,10 @@ namespace VRChatArchiveMod.Modules
 				foreach (var p in _fxType.GetMethods(BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic))
 				{
 					if (p.GetParameters().Length != 0 || p.ReturnType.Name != "HighlightsFX") continue;
-					try { _fx = p.Invoke(null, null); } catch { }
+					// Through ProxyGuard: HighlightsFX's members cannot be placed on this build, and
+					// invoking this getter directly is an access violation. Refused here, the scan simply
+					// falls through to finding the effect on the main camera, which works.
+					try { _fx = Core.ProxyGuard.Invoke(p, null, null); } catch { }
 					if (_fx != null) { _how = "static getter"; break; }
 				}
 				// 2) on the main camera / anywhere in the scene
@@ -905,13 +962,13 @@ namespace VRChatArchiveMod.Modules
 				{
 					var il2 = Il2CppType.From(_fxType);
 					var cam = Camera.main;
-					if (cam != null) { _fx = cam.GetComponent(il2) ?? cam.GetComponentInChildren(il2, true); if (_fx != null) _how = "main camera"; }
-					if (_fx == null) { _fx = UnityEngine.Object.FindObjectOfType(il2); if (_fx != null) _how = "scene scan"; }
+					if (cam != null) { _fx = cam.GetComponentSafe(il2) ?? cam.GetComponentInChildrenSafe(il2, true); if (_fx != null) _how = "main camera"; }
+					if (_fx == null) { _fx = VRChatArchiveMod.Core.Live.FirstOfType(il2); if (_fx != null) _how = "scene scan"; }
 					// 3) attach one ourselves
 					if (_fx == null && cam != null)
 					{
 						var standalone = Assembly.Load("Assembly-CSharp").GetType("HighlightsFXStandalone");
-						if (standalone != null) { _fx = cam.gameObject.AddComponent(Il2CppType.From(standalone)); if (_fx != null) _how = "standalone attached by us"; }
+						if (standalone != null) { _fx = cam.gameObject.AddComponentSafe(Il2CppType.From(standalone)); if (_fx != null) _how = "standalone attached by us"; }
 					}
 				}
 				if (_fx != null)

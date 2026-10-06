@@ -1,7 +1,8 @@
-﻿using System;
+using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
+using System.Net.Http;
 using System.Text;
 using System.Text.Json;
 using Il2CppInterop.Runtime.InteropTypes.Arrays;
@@ -10,18 +11,14 @@ using VRChatArchiveMod.Core;
 
 namespace VRChatArchiveMod.Modules
 {
-	// ARCHIVE FAVOURITES — the user's unlimited favourites, in game.
+	// ARCHIVE & VRCX LOCAL FAVOURITES — the user's unlimited favourites, in game.
 	//
 	// Three layers, deliberately separate:
-	//   1. the LIST (ids + the name the server stored)
-	//   2. the METADATA (real name, author, thumbnail url) resolved in batches of 100
-	//   3. the THUMBNAIL itself, fetched only for cards actually on screen and kept on disk
+	//   1. the LIST (ids + metadata from Archive bridge and VRCX SQLite database)
+	//   2. the METADATA (real name, author, thumbnail url) resolved from VRCX or Archive bridge
+	//   3. the THUMBNAIL itself, fetched only for cards actually on screen and cached on disk
 	//
-	// A favourites list you cannot look at is a wall of avtr_ strings, which is what this was
-	// before: layers 2 and 3 exist so a card can show the avatar instead of its id.
-	//
-	// Everything goes through the desktop client's bridge, so the account session never reaches
-	// this process — including the thumbnails, which the server fetches and caches on our behalf.
+	// Integrates VRCX Local Favorites (%APPDATA%\VRCX\VRCX.sqlite3) seamlessly with Archive favourites.
 	public class FavoritesModule : IModule
 	{
 		public override string Name => "Favorites";
@@ -29,9 +26,9 @@ namespace VRChatArchiveMod.Modules
 		public sealed class Fav
 		{
 			public string Id;
-			public string Name;          // server-stored name, replaced by the real one once resolved
+			public string Name;          // server-stored or VRCX-cached name
 			public string Author = "";
-			public string Image = "";    // full-size image url from the avatar page
+			public string Image = "";    // thumbnail or full-size image url
 			public bool MetaDone;
 
 			public Texture2D Thumb;
@@ -44,17 +41,27 @@ namespace VRChatArchiveMod.Modules
 		private static readonly Dictionary<string, Fav> ById = new Dictionary<string, Fav>(StringComparer.OrdinalIgnoreCase);
 		private static readonly object Gate = new object();
 
+		private static readonly HttpClient DirectHttp = MakeDirectHttp();
+		private static HttpClient MakeDirectHttp()
+		{
+			var c = new HttpClient { Timeout = TimeSpan.FromSeconds(10) };
+			c.DefaultRequestHeaders.TryAddWithoutValidation("User-Agent",
+				"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36 VRChatArchiveMod/3.9");
+			return c;
+		}
+
 		public static string LastStatus = "";
 
 		// Bumped on every change to the list. Anything DISPLAYING these favourites watches this and
-		// redraws when it moves — without it, adding or removing left the native grid showing the
-		// list as it was when the category was last selected.
+		// redraws when it moves.
 		public static int Revision { get; private set; }
 		private static void Bump() { unchecked { Revision++; } }
 		public static bool Loaded { get; private set; }
 		public static int Count { get { lock (Gate) return Ids.Count; } }
 
 		private float _nextRefresh;
+		private float _nextVrcxCheck;
+		private static bool _vrcxLoaded;
 		private static bool _busy;
 
 		public static List<string> Snapshot() { lock (Gate) return new List<string>(Ids); }
@@ -65,19 +72,46 @@ namespace VRChatArchiveMod.Modules
 			lock (Gate) return ById.ContainsKey(id);
 		}
 
+		public static string IdForName(string name)
+		{
+			if (string.IsNullOrEmpty(name)) return null;
+			string want = name.Trim();
+			lock (Gate)
+			{
+				foreach (var f in Items)
+				{
+					if (!string.IsNullOrEmpty(f.Name) && string.Equals(f.Name.Trim(), want, StringComparison.OrdinalIgnoreCase))
+						return f.Id;
+				}
+			}
+			return null;
+		}
+
 		public override void OnUpdate()
 		{
 			try
 			{
-				// Only meaningful inside the desktop client, and only once it is signed in.
-				if (!VaAuth.InsideClient) return;
-
 				// Decoding happens here because creating a Texture2D is main-thread only. A couple
 				// per frame: a full grid arriving at once would otherwise be a visible hitch.
 				DrainThumbs(2);
 
-				float now = Time.realtimeSinceStartup;
-				if (now >= _nextMeta) { _nextMeta = now + 1f; PumpMeta(); }
+				float now = VaClock.Now;
+
+				// Check VRCX database changes every 1.0 second
+				if (now >= _nextVrcxCheck)
+				{
+					_nextVrcxCheck = now + 1.0f;
+					if (VrcxLocalFavorites.HasChanged() || (!_vrcxLoaded && VrcxLocalFavorites.Exists))
+					{
+						_vrcxLoaded = true;
+						_ = RefreshAsync();
+					}
+				}
+
+				if (VaAuth.InsideClient)
+				{
+					if (now >= _nextMeta) { _nextMeta = now + 1f; PumpMeta(); }
+				}
 
 				if (now < _nextRefresh) return;
 				_nextRefresh = now + (Loaded ? 120f : 15f);
@@ -94,50 +128,83 @@ namespace VRChatArchiveMod.Modules
 			_busy = true;
 			try
 			{
-				var (ok, raw, status) = await VaAuth.FavAsync("list", "");
-				if (!ok) { LastStatus = Error(raw) ?? ("could not read favourites (" + status + ")"); return; }
-
 				var found = new List<Fav>();
+
+				// 1. Load from VRCX Local SQLite database (%APPDATA%\VRCX\VRCX.sqlite3)
 				try
 				{
-					using var doc = JsonDocument.Parse(raw);
-					Collect(doc.RootElement, found);
+					var vrcxAvatars = VrcxLocalFavorites.LoadAll();
+					foreach (var v in vrcxAvatars)
+					{
+						if (string.IsNullOrEmpty(v.Id)) continue;
+						var f = new Fav
+						{
+							Id = v.Id,
+							Name = !string.IsNullOrWhiteSpace(v.Name) ? v.Name : v.Id,
+							Author = v.AuthorName ?? "",
+							Image = !string.IsNullOrWhiteSpace(v.ThumbnailUrl) ? v.ThumbnailUrl : (v.ImageUrl ?? ""),
+							MetaDone = true // VRCX cache_avatar already holds complete metadata
+						};
+						found.Add(f);
+						AvatarIndex.Register(f.Id, f.Name, f.Author, f.Image);
+					}
 				}
-				catch (Exception e) { LastStatus = "favourites: bad response (" + e.Message + ")"; return; }
+				catch (Exception ex)
+				{
+					VRChatArchiveModPlugin.Logger.LogWarning("[Favorites] VRCX local favorites load failed: " + ex.Message);
+				}
+
+				// 2. Load from Archive bridge if connected
+				if (VaAuth.InsideClient)
+				{
+					try
+					{
+						var (ok, raw, status) = await VaAuth.FavAsync("list", "");
+						if (ok && !string.IsNullOrEmpty(raw))
+						{
+							using var doc = JsonDocument.Parse(raw);
+							Collect(doc.RootElement, found);
+						}
+					}
+					catch (Exception ex)
+					{
+						VRChatArchiveModPlugin.Logger.LogWarning("[Favorites] Archive bridge load failed: " + ex.Message);
+					}
+				}
 
 				lock (Gate)
 				{
-					// Merge rather than replace: a refresh every two minutes must not throw away the
-					// resolved names and the already-decoded thumbnails.
+					// Merge rather than replace: keep resolved names and already-decoded thumbnails
 					var kept = new Dictionary<string, Fav>(ById, StringComparer.OrdinalIgnoreCase);
 					Items.Clear(); Ids.Clear(); ById.Clear();
 					foreach (var f in found)
 					{
 						if (ById.ContainsKey(f.Id)) continue;
 						Fav use = kept.TryGetValue(f.Id, out var old) ? old : f;
-						if (use != f && !use.MetaDone && !string.IsNullOrEmpty(f.Name)) use.Name = f.Name;
+						if (use != f)
+						{
+							if (!use.MetaDone && !string.IsNullOrEmpty(f.Name)) use.Name = f.Name;
+							if (string.IsNullOrEmpty(use.Author) && !string.IsNullOrEmpty(f.Author)) use.Author = f.Author;
+							if (string.IsNullOrEmpty(use.Image) && !string.IsNullOrEmpty(f.Image)) use.Image = f.Image;
+							if (f.MetaDone) use.MetaDone = true;
+						}
 						Ids.Add(use.Id); Items.Add(use); ById[use.Id] = use;
 					}
 				}
 				Loaded = true;
 				Bump();
-				LastStatus = Count + " Archive favourite(s)";
-				VRChatArchiveModPlugin.Logger.LogInfo($"[Favorites] {Count} avatar favourite(s) from the Archive.");
+				LastStatus = Count + " favourite(s) (VRCX + Archive)";
+				VRChatArchiveModPlugin.Logger.LogInfo($"[Favorites] {Count} avatar favourite(s) active.");
 			}
 			catch (Exception e) { LastStatus = "favourites failed: " + e.Message; }
 			finally { _busy = false; }
 		}
 
-		// The list endpoint's exact shape is the server's business and has changed before, so rather
-		// than bind to one layout this walks the JSON and takes every avtr_ string it finds. A
-		// favourite IS an id; anything else in the payload is decoration.
 		private static void Collect(JsonElement e, List<Fav> outp)
 		{
 			switch (e.ValueKind)
 			{
 				case JsonValueKind.Object:
-					// An {id, name} pair is the shape the endpoint actually returns, and taking both
-					// together is what lets the list show a name instead of a wall of avtr_ strings.
 					if (e.TryGetProperty("id", out var idEl) && idEl.ValueKind == JsonValueKind.String)
 					{
 						string id = idEl.GetString();
@@ -155,7 +222,6 @@ namespace VRChatArchiveMod.Modules
 					foreach (var c in e.EnumerateArray()) Collect(c, outp);
 					break;
 				case JsonValueKind.String:
-					// Bare id, for a response shape that carries no names.
 					string v = e.GetString();
 					if (!string.IsNullOrEmpty(v) && v.StartsWith("avtr_", StringComparison.Ordinal))
 						outp.Add(new Fav { Id = v, Name = v });
@@ -169,9 +235,6 @@ namespace VRChatArchiveMod.Modules
 		private static bool _metaBusy;
 		public static int MetaPending { get; private set; }
 
-		// One batch per second, 100 at a time. The server resolves them in parallel and keeps a
-		// persistent cache, so this is one round trip per hundred favourites and nearly free after
-		// the first time.
 		private static void PumpMeta()
 		{
 			if (_metaBusy || !Loaded) return;
@@ -207,8 +270,6 @@ namespace VRChatArchiveMod.Modules
 				var (ok, raw, status) = await VaAuth.FavRawAsync(sb.ToString());
 				if (!ok)
 				{
-					// Marked done anyway: a failing batch retried every second forever would hammer
-					// the bridge for as long as the menu is open. The next full refresh retries.
 					foreach (var f in batch) f.MetaDone = true;
 					VRChatArchiveModPlugin.Logger.LogWarning("[Favorites] metadata batch failed (" + status + ")");
 					return;
@@ -248,19 +309,6 @@ namespace VRChatArchiveMod.Modules
 		private static string Str(JsonElement e, string prop)
 			=> e.TryGetProperty(prop, out var v) && v.ValueKind == JsonValueKind.String ? (v.GetString() ?? "") : "";
 
-		// The avatar page's og:title is "Name by Author", while the author is scraped separately out
-		// of og:description — and that second one is missing whenever the description is not phrased
-		// the way the scraper expects. So a card showed "Particle Kon! by BananasaurusRex" on its
-		// name line and an empty "By:" underneath, while its neighbour showed both correctly.
-		//
-		// The author is right there in the title either way. Split on the LAST " by ", because
-		// avatar names contain the word themselves often enough to make the first one wrong.
-		// The author arrives with VRChat's page boilerplate glued to it. Its og:description reads
-		// "<name> by <author> - an avatar on VRChat. Click to view this avatar.", and the scraper
-		// takes everything after "by", so the author came through as
-		// "Kaichi Sama - an avatar on VRChat. Click to view this avatar."
-		// Fixed at the source too, but the server's OG cache is persistent — everything already
-		// scraped still carries it, so it is cleaned here as well.
 		private static readonly string[] Boilerplate =
 		{
 			" - an avatar on VRChat", " - an avatar on vrchat", " on VRChat. Click", ". Click to view",
@@ -285,7 +333,6 @@ namespace VRChatArchiveMod.Modules
 				if (string.IsNullOrWhiteSpace(title)) return;
 				const string sep = " by ";
 
-				// Author already known: just take the duplicate off the end of the name.
 				if (!string.IsNullOrWhiteSpace(author))
 				{
 					string tail = sep + author;
@@ -321,12 +368,10 @@ namespace VRChatArchiveMod.Modules
 			}
 		}
 
-		// Asks for one card's thumbnail. Called from the menu while drawing, so it only ever fires
-		// for cards the user can actually see — 150 favourites do not mean 150 downloads.
 		public static void RequestThumb(Fav f)
 		{
 			if (f == null || f.ThumbState != 0) return;
-			if (!f.MetaDone || string.IsNullOrEmpty(f.Image)) return;   // nothing to fetch yet
+			if (!f.MetaDone || string.IsNullOrEmpty(f.Image)) return;
 			if (_inflight >= MaxInflight) return;
 			f.ThumbState = 1;
 			_inflight++;
@@ -343,9 +388,6 @@ namespace VRChatArchiveMod.Modules
 
 				if (data == null || data.Length < 100)
 				{
-					// Small variant first. The page's og:image is the FULL-SIZE original (~1200x900):
-					// a hundred of those decoded into textures is hundreds of megabytes of VRAM for a
-					// grid of 200px cards, so the resized endpoint is what we ask for.
 					data = await GetImageAsync(Small(f.Image));
 					if (data == null) data = await GetImageAsync(f.Image);
 					if (data != null && data.Length >= 100)
@@ -363,23 +405,38 @@ namespace VRChatArchiveMod.Modules
 			try
 			{
 				if (string.IsNullOrEmpty(url)) return null;
-				string body = "{\"action\":\"image\",\"url\":\"" + url.Replace("\"", "") + "\"}";
-				var (ok, raw, _) = await VaAuth.FavRawAsync(body);
-				if (!ok) return null;
-				using var doc = JsonDocument.Parse(raw);
-				if (!doc.RootElement.TryGetProperty("b64", out var b) || b.ValueKind != JsonValueKind.String) return null;
-				return Convert.FromBase64String(b.GetString());
+
+				// 1. Bridge image request if inside Archive client
+				if (VaAuth.InsideClient)
+				{
+					try
+					{
+						string body = "{\"action\":\"image\",\"url\":\"" + url.Replace("\"", "") + "\"}";
+						var (ok, raw, _) = await VaAuth.FavRawAsync(body);
+						if (ok)
+						{
+							using var doc = JsonDocument.Parse(raw);
+							if (doc.RootElement.TryGetProperty("b64", out var b) && b.ValueKind == JsonValueKind.String)
+								return Convert.FromBase64String(b.GetString());
+						}
+					}
+					catch { }
+				}
+
+				// 2. Direct HTTP fallback (works for public VRChat API avatar thumbnails)
+				if (url.StartsWith("http://", StringComparison.OrdinalIgnoreCase) || url.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
+				{
+					using var resp = await DirectHttp.GetAsync(url);
+					if (resp.IsSuccessStatusCode)
+					{
+						return await resp.Content.ReadAsByteArrayAsync();
+					}
+				}
 			}
-			catch { return null; }
+			catch { }
+			return null;
 		}
 
-		// Rewrite any VRChat asset url to its 256px variant:
-		//   /api/1/file/file_xxx/1/file    -> /api/1/image/file_xxx/1/256
-		//   /api/1/image/file_xxx/1/1024   -> /api/1/image/file_xxx/1/256
-		// Both forms occur in the wild. Handling only the first is why a third of the cached
-		// thumbnails came down at 1200x900: the rewrite silently returned the url unchanged and we
-		// fetched the original.
-		// Same host either way, so the client's and the server's url guards both still apply.
 		private static string Small(string image)
 		{
 			try
@@ -397,10 +454,6 @@ namespace VRChatArchiveMod.Modules
 			return image;
 		}
 
-		// Whatever actually arrives, cap it here. The url rewrite is a REQUEST, not a guarantee —
-		// the endpoint can ignore the size, the fallback path deliberately fetches the original, and
-		// a card 214px wide has no use for a 1200x900 texture either way. 35 of those cost 150 MB of
-		// VRAM on their own.
 		private const int MaxThumbWidth = 320;
 		private const int ThumbWidth = 256;
 
@@ -426,7 +479,6 @@ namespace VRChatArchiveMod.Modules
 				RenderTexture.ReleaseTemporary(rt);
 				UnityEngine.Object.Destroy(src);
 
-				// Rewrite the cache with the small version so this only ever happens once per avatar.
 				try
 				{
 					var png = ImageConversion.EncodeToPNG(dst);
@@ -469,52 +521,88 @@ namespace VRChatArchiveMod.Modules
 
 		// ---------------------------------------------------------------- writes
 
-		public static async System.Threading.Tasks.Task<bool> AddAsync(string avatarId)
+		public static async System.Threading.Tasks.Task<bool> AddAsync(string avatarId, string name = null, string author = null, string image = null)
 		{
 			if (string.IsNullOrEmpty(avatarId)) return false;
-			var (ok, raw, status) = await VaAuth.FavAsync("add", avatarId);
-			if (ok)
+
+			string safeName = !string.IsNullOrEmpty(name) ? name : avatarId;
+			string safeAuthor = author ?? "";
+			string safeImg = image ?? "";
+
+			// 1. Write to VRCX Local SQLite database (%APPDATA%\VRCX\VRCX.sqlite3)
+			try
 			{
-				// Applied locally straight away: waiting for the next refresh to show it would make
-				// the button feel broken for up to two minutes.
-				lock (Gate)
-				{
-					if (!ById.ContainsKey(avatarId))
-					{
-						// FRONT of the list, not the end. The server returns favourites newest-first
-						// (sort=newest), so appending made a freshly saved avatar appear last and then
-						// jump to the top on the next refresh two minutes later. Inserting at 0 means
-						// the optimistic local update already matches the order the server will send.
-						var f = new Fav { Id = avatarId, Name = avatarId };
-						Ids.Insert(0, avatarId); Items.Insert(0, f); ById[avatarId] = f;
-					}
-				}
-				Bump();
-				LastStatus = "added to your Archive favourites";
+				VrcxLocalFavorites.AddFavorite(avatarId, safeName, safeAuthor, safeImg, safeImg);
 			}
-			else LastStatus = Error(raw) ?? ("could not add (" + status + ")");
-			return ok;
+			catch (Exception ex)
+			{
+				VRChatArchiveModPlugin.Logger.LogWarning("[Favorites] VrcxLocalFavorites.AddFavorite failed: " + ex.Message);
+			}
+
+			// 2. Immediately update memory
+			lock (Gate)
+			{
+				if (!ById.TryGetValue(avatarId, out var f))
+				{
+					f = new Fav { Id = avatarId, Name = safeName, Author = safeAuthor, Image = safeImg, MetaDone = true };
+					Ids.Insert(0, avatarId);
+					Items.Insert(0, f);
+					ById[avatarId] = f;
+				}
+				else
+				{
+					if (!string.IsNullOrEmpty(safeName)) f.Name = safeName;
+					if (!string.IsNullOrEmpty(safeAuthor)) f.Author = safeAuthor;
+					if (!string.IsNullOrEmpty(safeImg)) f.Image = safeImg;
+					f.MetaDone = true;
+				}
+			}
+			AvatarIndex.Register(avatarId, safeName, safeAuthor, safeImg);
+			Bump();
+			LastStatus = "saved to your Archive favourites";
+
+			// 3. Sync to Archive bridge if connected
+			if (VaAuth.InsideClient)
+			{
+				try { _ = VaAuth.FavAsync("add", avatarId); } catch { }
+			}
+
+			return true;
 		}
 
 		public static async System.Threading.Tasks.Task<bool> RemoveAsync(string avatarId)
 		{
 			if (string.IsNullOrEmpty(avatarId)) return false;
-			var (ok, raw, status) = await VaAuth.FavAsync("remove", avatarId);
-			if (ok)
+
+			// 1. Remove from VRCX Local SQLite database
+			try
 			{
-				lock (Gate)
-				{
-					if (ById.Remove(avatarId))
-					{
-						Ids.RemoveAll(x => string.Equals(x, avatarId, StringComparison.OrdinalIgnoreCase));
-						Items.RemoveAll(x => string.Equals(x.Id, avatarId, StringComparison.OrdinalIgnoreCase));
-					}
-				}
-				Bump();
-				LastStatus = "removed from your Archive favourites";
+				VrcxLocalFavorites.RemoveFavorite(avatarId);
 			}
-			else LastStatus = Error(raw) ?? ("could not remove (" + status + ")");
-			return ok;
+			catch (Exception ex)
+			{
+				VRChatArchiveModPlugin.Logger.LogWarning("[Favorites] VrcxLocalFavorites.RemoveFavorite failed: " + ex.Message);
+			}
+
+			// 2. Immediately update memory
+			lock (Gate)
+			{
+				if (ById.Remove(avatarId))
+				{
+					Ids.RemoveAll(x => string.Equals(x, avatarId, StringComparison.OrdinalIgnoreCase));
+					Items.RemoveAll(x => string.Equals(x.Id, avatarId, StringComparison.OrdinalIgnoreCase));
+				}
+			}
+			Bump();
+			LastStatus = "removed from your Archive favourites";
+
+			// 3. Sync to Archive bridge if connected
+			if (VaAuth.InsideClient)
+			{
+				try { _ = VaAuth.FavAsync("remove", avatarId); } catch { }
+			}
+
+			return true;
 		}
 
 		private static string Error(string raw)

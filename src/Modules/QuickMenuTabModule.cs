@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Reflection;
 using System.Runtime.InteropServices;
@@ -53,6 +53,9 @@ namespace VRChatArchiveMod.Modules
 		private bool _loggedOnce;
 		private bool _tabWasActive, _pageWasActive;
 		private static Sprite _logoSprite;
+		private static float _lastTabClickTime;
+		private static bool _tabClickHooked;
+		private static GameObject _pageRef;
 
 		// Unity components worth keeping on a clone ROOT. Everything else (VRChat's obfuscated
 		// tab / page / style / tooltip controllers) is destroyed so the game cannot drive it.
@@ -74,9 +77,15 @@ namespace VRChatArchiveMod.Modules
 					if (_tab != null || _page != null) Teardown();
 					return;
 				}
+
+				if (!Core.QuickMenu.Visible)
+				{
+					_lastTabClickTime = 0f;
+				}
+
 				if (_tab != null && _page != null) { Pump(); return; }
 
-				float now = Time.realtimeSinceStartup;
+				float now = VaClock.Now;
 				if (now < _nextTry) return;
 				_nextTry = now + 3f;              // the QuickMenu only exists once the UI is built
 				if (_fails > 40) return;          // give up quietly rather than scan forever
@@ -91,7 +100,9 @@ namespace VRChatArchiveMod.Modules
 
 		public override void OnSceneLoaded(int buildIndex)
 		{
-			if (_tab == null || _page == null) { _tab = null; _page = null; _fails = 0; _nextTry = 0f; _wasActive = false; }
+			_tabClickHooked = false;
+			_lastTabClickTime = 0f;
+			if (_tab == null || _page == null) { _tab = null; _page = null; _pageRef = null; _fails = 0; _nextTry = 0f; _wasActive = false; }
 		}
 
 		public override void OnShutdown() => Teardown();
@@ -122,7 +133,7 @@ namespace VRChatArchiveMod.Modules
 			// rendered as a flat coloured square that matched nothing — we simply switch the real
 			// ones ON and fill the page. The tab is then genuinely VRChat's: its hover, selected
 			// state and page-opening are driven by the game's own controller, for free.
-			Transform tab = strip.Find("Page_DevTools");
+			Transform tab = strip.Find("Page_DevTools") ?? strip.Find("VRCHAT ARCHIVE");
 			Transform page = body.Find("Menu_DevTools");
 			if (tab == null || page == null)
 			{
@@ -148,6 +159,7 @@ namespace VRChatArchiveMod.Modules
 
 			_tab = tab.gameObject;
 			_page = page.gameObject;
+			_pageRef = _page;
 			VRChatArchiveModPlugin.Logger.LogInfo("[QMTab] VRChat's own DevTools tab enabled and re-purposed as the VRChat Archive tab.");
 			return true;
 		}
@@ -244,6 +256,7 @@ namespace VRChatArchiveMod.Modules
 					foreach (var prop in t.GetProperties(BindingFlags.Instance | BindingFlags.Public))
 					{
 						if (prop.PropertyType != typeof(string) || !prop.CanRead || !prop.CanWrite) continue;
+						if (string.Equals(prop.Name, "name", StringComparison.OrdinalIgnoreCase)) continue; // Never overwrite GameObject / Object name
 						try
 						{
 							if (prop.GetValue(comp) is string cur && LooksLikeStockCaption(cur))
@@ -255,6 +268,7 @@ namespace VRChatArchiveMod.Modules
 					foreach (var fld in t.GetFields(BindingFlags.Instance | BindingFlags.Public))
 					{
 						if (fld.FieldType != typeof(string)) continue;
+						if (string.Equals(fld.Name, "name", StringComparison.OrdinalIgnoreCase)) continue;
 						try
 						{
 							if (fld.GetValue(comp) is string cur && LooksLikeStockCaption(cur))
@@ -306,14 +320,14 @@ namespace VRChatArchiveMod.Modules
 		// IconName: hints, '|'-separated, matched case-insensitively against the names of the sprites
 		// VRChat itself has loaded (SpriteIndex). The first hint that names a real sprite wins, so a
 		// tile wears the game's own glyph for what it does instead of whatever the donor carried.
-		private struct Act { public string Label; public Action Do; public Func<bool> State; public Func<Texture2D> Icon; public string IconName; }
+		private struct Act { public string Label; public Action Do; public Func<bool> State; public Func<Texture2D> Icon; public string IconName; public string SecondaryIconName; }
 
 		// SPRITE INDEX. Every Sprite the game has loaded, by name, built once per page fill and
 		// thrown away with the page. Lets a tile wear one of VRChat's own icons by asking for it
 		// by (part of) its name. The first fill also writes every candidate name to
 		// BepInEx/qm_sprites.txt, once, so the hints in ActsFor can be tuned against the real
 		// list instead of guessed.
-		private static class SpriteIndex
+		internal static class SpriteIndex
 		{
 			private static readonly Dictionary<string, Sprite> _byName = new Dictionary<string, Sprite>(StringComparer.OrdinalIgnoreCase);
 			private static readonly List<string> _names = new List<string>();
@@ -380,651 +394,1013 @@ namespace VRChatArchiveMod.Modules
 		private sealed class ToggleTile { public Transform Card; public Func<bool> State; public bool Last; }
 		private readonly List<ToggleTile> _toggles = new List<ToggleTile>();
 
-		// VRChat assigns card sprites through StyleElement when a page is first shown. We build our
-		// page at startup, before the QuickMenu has ever been opened, so at that moment the DONOR
-		// cards have null sprites too — which is why three tiles had no icon and no border while
-		// the others (whose sprites are baked) looked right. Keep the pairs and re-copy until the
-		// game has resolved them.
 		private sealed class Pair { public Transform Clone; public Transform Donor; }
 		private readonly List<Pair> _pairs = new List<Pair>();
 		private bool _spritesResolved;
 
-		// ------------------------------------------------------------------ sub-pages
-		//
-		// The page is a MENU, so it navigates like one. A flat grid of nine tiles cannot grow —
-		// every new feature either pushes another card into an already-full 3x3, or does not get a
-		// tile at all — and it also forces unrelated things to sit together: a soundboard clip
-		// beside the switch that stops every script in the world.
-		//
-		// So a tile can now open another SET of tiles on the same page. This is a content swap, not
-		// a VRChat page push: we rebuild the grid we already own and retitle the header. That keeps
-		// it entirely inside Unity — no obfuscated page-stack API to break on the next update — and
-		// the Back arrow is VRChat's own, which ships in this header already disabled.
-		public enum QmPage { Root = 0, Protection = 1, Overlays = 2, Sounds = 3, Movement = 4 }
-
-		private static QmPage _qmPage = QmPage.Root;
-		private static bool _pageDirty;
-
-		public static void GoTo(QmPage page)
+		private sealed class StepperRef
 		{
-			if (_qmPage == page) return;
-			_qmPage = page;
-			_pageDirty = true;
+			public Transform Card;
+			public string Title;
+			public BepInEx.Configuration.ConfigEntry<float> Cfg;
+			public float LastVal;
+			public string Format;
+		}
+		private readonly List<StepperRef> _steppers = new List<StepperRef>();
+
+		private sealed class SectionUI
+		{
+			public string Title;
+			public Transform Header;
+			public Transform Body;
+			public bool Expanded;
+			public TMPro.TMP_Text HeaderText;
+		}
+		private readonly List<SectionUI> _sections = new List<SectionUI>();
+
+		// ------------------------------------------------------------------ interaction helpers
+		private static GameObject _fullbrightGo;
+		private static bool _fullbright;
+		public static bool FullbrightActive => _fullbright;
+		public static void ToggleFullbright()
+		{
+			_fullbright = !_fullbright;
+			try
+			{
+				if (_fullbright)
+				{
+					if (_fullbrightGo == null)
+					{
+						_fullbrightGo = new GameObject("VA_FullbrightLight");
+						var l = _fullbrightGo.AddComponent<Light>();
+						l.type = LightType.Directional;
+						l.color = Color.white;
+						l.intensity = 1.2f;
+						l.shadows = LightShadows.None;
+						UnityEngine.Object.DontDestroyOnLoad(_fullbrightGo);
+					}
+					var cam = Camera.main;
+					if (cam != null)
+					{
+						_fullbrightGo.transform.SetParent(cam.transform, false);
+						_fullbrightGo.transform.localPosition = Vector3.zero;
+						_fullbrightGo.transform.localRotation = new Quaternion(0f, 0f, 0f, 1f);
+					}
+					_fullbrightGo.SetActive(true);
+					Toast.Show("Fullbright ON");
+				}
+				else
+				{
+					if (_fullbrightGo != null) _fullbrightGo.SetActive(false);
+					Toast.Show("Fullbright OFF");
+				}
+			}
+			catch (Exception e) { VRChatArchiveModPlugin.Logger.LogWarning("[QMTab] Fullbright failed: " + e.Message); }
 		}
 
-		private static string TitleFor(QmPage p)
+		private static bool _deafened;
+		public static bool DeafenActive => _deafened;
+		public static void ToggleDeafen()
 		{
-			switch (p)
+			_deafened = !_deafened;
+			try
 			{
-				case QmPage.Protection: return "Archive · Protection";
-				case QmPage.Overlays:   return "Archive · On screen";
-				case QmPage.Sounds:     return "Archive · Sounds";
-				case QmPage.Movement:   return "Archive · Movement";
-				default:                return "VRChat Archive";
+				AudioListener.pause = _deafened;
+				Toast.Show(_deafened ? "Mute / Deafen ON" : "Mute / Deafen OFF");
+			}
+			catch { }
+		}
+
+		public static void RespawnAllPickups()
+		{
+			try
+			{
+				var il2 = Il2CppInterop.Runtime.Il2CppType.Of<VRC.SDKBase.VRC_Pickup>();
+				var found = Resources.FindObjectsOfTypeAll(il2);
+				int respawned = 0;
+				if (found != null)
+				{
+					var me = VRC.SDKBase.Networking.LocalPlayer;
+					for (int i = 0; i < found.Length; i++)
+					{
+						var pk = found[i]?.TryCast<VRC.SDKBase.VRC_Pickup>();
+						if (pk == null || pk.gameObject == null) continue;
+						try
+						{
+							if (me != null && VRC.SDKBase.Networking.GetOwner(pk.gameObject) != me)
+								VRC.SDKBase.Networking.SetOwner(me, pk.gameObject);
+							pk.transform.position = new Vector3(0, -1000f, 0);
+							respawned++;
+						}
+						catch { }
+					}
+				}
+				Toast.Show($"Respawned {respawned} pickup(s)");
+			}
+			catch (Exception e)
+			{
+				VRChatArchiveModPlugin.Logger.LogWarning("[QMTab] Respawn pickups: " + e.Message);
 			}
 		}
 
-		private List<Act> ActsFor(QmPage page)
+		// ------------------------------------------------------------------ VRTool layout builders
+		private void CreateSection(Transform content, string title, out Transform rowHost, bool startExpanded = true)
 		{
-			// No Back tile. The header carries VRChat's own back arrow (SyncBackButton clones and
-			// wires it), so a tile that did the same thing only spent a slot and wore a borrowed
-			// lightning-bolt icon that meant nothing.
+			var secGo = new GameObject("Section_" + title.Replace(" ", ""), Il2CppInterop.Runtime.Il2CppType.Of<RectTransform>());
+			var secRt = secGo.GetComponent<RectTransform>();
+			secRt.SetParent(content, false);
+			secRt.sizeDelta = new Vector2(980f, 0f);
 
-			switch (page)
+			var sLe = secGo.AddComponent<UnityEngine.UI.LayoutElement>();
+			sLe.flexibleWidth = 1f;
+			sLe.minHeight = -1f;
+			sLe.preferredHeight = -1f;
+
+			var sVlg = secGo.AddComponent<UnityEngine.UI.VerticalLayoutGroup>();
+			sVlg.childForceExpandHeight = false;
+			sVlg.childControlHeight = true;
+			sVlg.childForceExpandWidth = true;
+			sVlg.childControlWidth = true;
+			sVlg.spacing = 10f;
+			sVlg.padding = new RectOffset(0, 0, 4, 12);
+
+			var csf = secGo.AddComponent<UnityEngine.UI.ContentSizeFitter>();
+			csf.verticalFit = UnityEngine.UI.ContentSizeFitter.FitMode.PreferredSize;
+			csf.horizontalFit = UnityEngine.UI.ContentSizeFitter.FitMode.Unconstrained;
+
+			// Header Banner
+			var hdrGo = new GameObject("Header", Il2CppInterop.Runtime.Il2CppType.Of<RectTransform>());
+			var hdrRt = hdrGo.GetComponent<RectTransform>();
+			hdrRt.SetParent(secRt, false);
+
+			var hLe = hdrGo.AddComponent<UnityEngine.UI.LayoutElement>();
+			hLe.minHeight = 44f;
+			hLe.preferredHeight = 44f;
+			hLe.flexibleWidth = 1f;
+
+			var hImg = hdrGo.AddComponent<UnityEngine.UI.Image>();
+			hImg.color = new Color(0.10f, 0.11f, 0.14f, 0.0f);
+
+			var hBtn = hdrGo.AddComponent<UnityEngine.UI.Button>();
+			hBtn.targetGraphic = hImg;
+			hBtn.transition = UnityEngine.UI.Selectable.Transition.ColorTint;
+			hBtn.colors = Core.MenuCard.Tint(new Color(0.14f, 0.15f, 0.19f, 0.3f));
+
+			// Header Text
+			var txtGo = new GameObject("Text", Il2CppInterop.Runtime.Il2CppType.Of<RectTransform>());
+			var txtRt = txtGo.GetComponent<RectTransform>();
+			txtRt.SetParent(hdrRt, false);
+			txtRt.anchorMin = Vector2.zero;
+			txtRt.anchorMax = Vector2.one;
+			txtRt.offsetMin = new Vector2(16f, 0f);
+			txtRt.offsetMax = new Vector2(-16f, 0f);
+
+			var tmp = txtGo.AddComponent<TMPro.TextMeshProUGUI>();
+			var font = Core.MenuCard.StealFont();
+			if (font != null) tmp.font = font;
+			tmp.fontSize = 24f;
+			tmp.fontStyle = TMPro.FontStyles.Bold;
+			tmp.alignment = TMPro.TextAlignmentOptions.MidlineLeft;
+			tmp.color = new Color(0.85f, 0.88f, 0.94f, 1f);
+			tmp.text = (startExpanded ? "▼ " : "▶ ") + title;
+
+			// Row Host (Container for rows)
+			var bodyGo = new GameObject("RowsHost", Il2CppInterop.Runtime.Il2CppType.Of<RectTransform>());
+			var bodyRt = bodyGo.GetComponent<RectTransform>();
+			bodyRt.SetParent(secRt, false);
+			bodyRt.sizeDelta = new Vector2(980f, 0f);
+
+			var bLe = bodyGo.AddComponent<UnityEngine.UI.LayoutElement>();
+			bLe.flexibleWidth = 1f;
+			bLe.minHeight = -1f;
+			bLe.preferredHeight = -1f;
+
+			var bVlg = bodyGo.AddComponent<UnityEngine.UI.VerticalLayoutGroup>();
+			bVlg.childForceExpandHeight = false;
+			bVlg.childControlHeight = true;
+			bVlg.childForceExpandWidth = true;
+			bVlg.childControlWidth = true;
+			bVlg.spacing = 10f;
+
+			var bCsf = bodyGo.AddComponent<UnityEngine.UI.ContentSizeFitter>();
+			bCsf.verticalFit = UnityEngine.UI.ContentSizeFitter.FitMode.PreferredSize;
+			bCsf.horizontalFit = UnityEngine.UI.ContentSizeFitter.FitMode.Unconstrained;
+
+			bodyGo.SetActive(startExpanded);
+			rowHost = bodyRt;
+
+			var secItem = new SectionUI
 			{
-				case QmPage.Protection:
-					return new List<Act>
-					{
+				Title = title,
+				Header = hdrRt,
+				Body = bodyRt,
+				Expanded = startExpanded,
+				HeaderText = tmp
+			};
+			_sections.Add(secItem);
 
-						new Act { IconName = "Icon_Shield|Icon_Shield_Custom|shield", Label = "Crash protection", Do = () => { ModConfig.AntiCrashEnabled.Value = !ModConfig.AntiCrashEnabled.Value; }, State = () => ModConfig.AntiCrashEnabled.Value },
-						new Act { IconName = "BlockUser|Blocked_White_Transparent|icon_listener_blocked|block", Label = "Block crasher scripts", Do = () => { ModConfig.UdonBlockCrashers.Value = !ModConfig.UdonBlockCrashers.Value; }, State = () => ModConfig.UdonBlockCrashers.Value },
-						// The destructive one, and it says what it costs. A user reported "mirrors
-						// don't work" and could not find this switch, because the tile that turns it
-						// on never mentioned that mirrors are world scripts too.
-						new Act { IconName = "StopIcon|stop|Icon_Close_X", Label = "STOP all world scripts (breaks mirrors)", Do = () => { ModConfig.UdonBlockAll.Value = !ModConfig.UdonBlockAll.Value; }, State = () => ModConfig.UdonBlockAll.Value },
-						new Act { IconName = "Unblock|Eye|visibility", Label = "Anti-block", Do = () => { ModConfig.AntiBlockEnabled.Value = !ModConfig.AntiBlockEnabled.Value; }, State = () => ModConfig.AntiBlockEnabled.Value },
-						new Act { IconName = "ReloadIcon|ic_reset|reset", Label = "Re-check everyone", Do = () => { Core.Menu.RequestRescan(); } },
-					};
+			Core.UiClick.AddClick(hBtn, () =>
+			{
+				secItem.Expanded = !secItem.Expanded;
+				secItem.Body.gameObject.SetActive(secItem.Expanded);
+				secItem.HeaderText.text = (secItem.Expanded ? "▼ " : "▶ ") + secItem.Title;
+				Core.MenuCard.PlayClick();
+			});
+		}
 
-				case QmPage.Overlays:
-					return new List<Act>
-					{
+		private static Transform AddRow(Transform rowsHost)
+		{
+			var rowGo = new GameObject("Row", Il2CppInterop.Runtime.Il2CppType.Of<RectTransform>());
+			var rowRt = rowGo.GetComponent<RectTransform>();
+			rowRt.SetParent(rowsHost, false);
+			rowRt.sizeDelta = new Vector2(980f, 170f);
 
-						// ONE GLOW, ONE TILE. The screen-space "Box around players" is gone; the 3D
-						// capsule is what shows a player through a wall, and every glow below is a
-						// switch of its own — none of them needs another to be on (HighlightEspModule,
-						// CapsuleEspModule).
-						new Act { IconName = "Icon_Safety_Avatar_Shape|Hand_Avatar|icon_user", Label = "Player capsules", Do = () => { ModConfig.EspCapsule.Value = !ModConfig.EspCapsule.Value; }, State = () => ModConfig.EspCapsule.Value },
-						new Act { IconName = "Eye|visibility|Eye_Disabled", Label = "See through walls", Do = () => { ModConfig.EspThroughWalls.Value = !ModConfig.EspThroughWalls.Value; }, State = () => ModConfig.EspThroughWalls.Value },
-						new Act { IconName = "Icon_Spotlight|glow|DynamicLight", Label = "Glow around avatars", Do = () => { ModConfig.EspHighlight.Value = !ModConfig.EspHighlight.Value; }, State = () => ModConfig.EspHighlight.Value },
-						new Act { IconName = "Grab|hand|Handshake", Label = "Glow on pickups", Do = () => { ModConfig.EspItems.Value = !ModConfig.EspItems.Value; }, State = () => ModConfig.EspItems.Value },
-						new Act { IconName = "DropPortal|Portal|TeleportTo", Label = "Glow on portals", Do = () => { ModConfig.EspPortals.Value = !ModConfig.EspPortals.Value; }, State = () => ModConfig.EspPortals.Value },
-						new Act { IconName = "prints_location|LocationUnavailable|TeleportToMe", Label = "Radar", Do = () => { ModConfig.RadarEnabled.Value = !ModConfig.RadarEnabled.Value; }, State = () => ModConfig.RadarEnabled.Value },
-						new Act { IconName = "Social|Friends|icon_user", Label = "Player list", Do = () => { ModConfig.InstancePanelsEnabled.Value = !ModConfig.InstancePanelsEnabled.Value; }, State = () => ModConfig.InstancePanelsEnabled.Value },
-					};
+			var rLe = rowGo.AddComponent<UnityEngine.UI.LayoutElement>();
+			rLe.minHeight = 170f;
+			rLe.preferredHeight = 170f;
+			rLe.flexibleWidth = 1f;
+			rLe.flexibleHeight = 0f;
 
-				case QmPage.Movement:
-					// PLAIN SWITCHES, and the VALUES live on the sliders below. These were tiles that
-					// cycled through preset numbers, which is not what a card is for — and it made
-					// "custom speed" a third switch that had to be on before the others did anything.
-					return new List<Act>
-					{
+			var hlg = rowGo.AddComponent<UnityEngine.UI.HorizontalLayoutGroup>();
+			hlg.childForceExpandHeight = true;
+			hlg.childControlHeight = true;
+			hlg.childForceExpandWidth = true;
+			hlg.childControlWidth = true;
+			hlg.childAlignment = TextAnchor.MiddleLeft;
+			hlg.spacing = 10f;
 
-						new Act { IconName = "ic_fly_mode|Drone_FlightModes|WingLeft", Label = "Fly", Do = () => { ModConfig.FlyEnabled.Value = !ModConfig.FlyEnabled.Value; }, State = () => ModConfig.FlyEnabled.Value },
-						new Act { IconName = "TeleportTo|TeleportToMe|DropPortal", Label = "Click to teleport", Do = () => { ModConfig.ClickTpEnabled.Value = !ModConfig.ClickTpEnabled.Value; }, State = () => ModConfig.ClickTpEnabled.Value },
-						new Act { IconName = "PlayerMove|BodyMode_Standing|Hand_Avatar", Label = "Walk mod", Do = () => { ModConfig.WalkMod.Value = !ModConfig.WalkMod.Value; }, State = () => ModConfig.WalkMod.Value },
-						new Act { IconName = "Arrow_Right|arrow|PlayerMove", Label = "Run mod", Do = () => { ModConfig.RunMod.Value = !ModConfig.RunMod.Value; }, State = () => ModConfig.RunMod.Value },
-						new Act { IconName = "arrow_up|Arrow_Right", Label = "Jump mod", Do = () => { ModConfig.JumpMod.Value = !ModConfig.JumpMod.Value; }, State = () => ModConfig.JumpMod.Value },
-						new Act { IconName = "ic_reset|reset|Home_Reset", Label = "Back to normal", Do = SpeedModule.ResetToWorld },
-					};
+			return rowRt;
+		}
 
-				case QmPage.Sounds:
+		private void AddCard(Transform row, Act act, Transform donor, int colSpan = 1)
+		{
+			try
+			{
+				var cardGo = UnityEngine.Object.Instantiate(donor.gameObject, row);
+				cardGo.name = "Btn_" + act.Label.Replace(" ", "");
+				cardGo.SetActive(true);
+				var card = cardGo.transform;
+
+				float width = (colSpan == 2) ? 468f : 228f;
+				var le = card.GetComponent<UnityEngine.UI.LayoutElement>() ?? cardGo.AddComponent<UnityEngine.UI.LayoutElement>();
+				le.ignoreLayout = false;
+				le.minWidth = width;
+				le.preferredWidth = width;
+				le.minHeight = 170f;
+				le.preferredHeight = 170f;
+				le.flexibleWidth = colSpan;
+				le.flexibleHeight = 0f;
+
+				bool lit = false;
+				try { lit = act.State != null && act.State(); } catch { }
+
+				Action wrappedDo = null;
+				if (act.Do != null)
 				{
-					// Built FROM the clip list, not from hard-coded indices: adding a clip to
-					// SoundboardModule.Clips used to mean it silently never appeared here, and a
-					// removed one would have thrown. Each tile shows the clip's own image when it
-					// has one, so the board is readable instead of a column of identical hearts.
-					var sounds = new List<Act>();
-					foreach (var clip in SoundboardModule.Clips)
+					if (act.State != null)
 					{
-						var c = clip;   // captured per iteration, not by reference to the loop var
-						sounds.Add(new Act
+						float lastToggle = 0f;
+						wrappedDo = () =>
 						{
-							Label = c.Label,
-							Do = () => SoundboardModule.Send(c),
-							Icon = () => AssetLoader.Icon(c.Image) ?? AssetLoader.HeartIcon,
-						});
+							float now = VaClock.Now;
+							if (now - lastToggle < 0.08f) return;
+							lastToggle = now;
+							act.Do();
+							try
+							{
+								bool newState = act.State();
+								Core.MenuCard.SetLit(card, newState, false);
+							}
+							catch { }
+						};
 					}
-					return sounds;
+					else
+					{
+						wrappedDo = act.Do;
+					}
 				}
 
-				default:
-					return new List<Act>
+				Core.MenuCard.Setup(card, donor, act.Label, wrappedDo, lit, keepStyle: false, hasState: act.State != null);
+				Core.MenuCard.StripBadges(card);
+
+				var bComp = card.GetComponent<Button>();
+				if (bComp != null) UiClick.SetDebounce(bComp, 0.05f);
+
+				if (!string.IsNullOrEmpty(act.IconName))
+				{
+					var sp = SpriteIndex.Find(act.IconName);
+					if (sp != null) Core.MenuCard.SetIcon(card, sp);
+				}
+
+				if (!string.IsNullOrEmpty(act.SecondaryIconName))
+				{
+					var sp2 = SpriteIndex.Find(act.SecondaryIconName);
+					if (sp2 != null) Core.MenuCard.SetSecondaryIcon(card, sp2);
+				}
+
+				if (act.Icon != null)
+				{
+					try
 					{
-						new Act { IconName = "Icon_Shield|Icon_Shield_Custom|shield", Label = "Protection ›",  Do = () => GoTo(QmPage.Protection), State = () => ModConfig.UdonBlockAll.Value || ModConfig.AntiCrashEnabled.Value },
-						new Act { IconName = "HUD|HUD_Verbose|Eye", Label = "On screen ›",   Do = () => GoTo(QmPage.Overlays) },
-						new Act { IconName = "PlayerMove|ic_fly_mode|BodyMode_Standing", Label = "Movement ›",    Do = () => GoTo(QmPage.Movement), State = () => ModConfig.FlyEnabled.Value || ModConfig.SpeedEnabled.Value },
-						new Act { IconName = "Icon_UdonSpotlight|Logging|debug", Label = "Udon Console",  Do = () => { ModConfig.UdonLogEnabled.Value = !ModConfig.UdonLogEnabled.Value; }, State = () => ModConfig.UdonLogEnabled.Value },
-						new Act { IconName = "Tag|Tag_Disabled|ReloadIcon", Label = "Refresh Tags",  Do = VaTagsModule.RequestRefresh },
-						new Act { Label = "Sounds ›",      Do = () => GoTo(QmPage.Sounds), Icon = () => AssetLoader.HeartIcon },
-					};
+						var tex = act.Icon();
+						if (tex != null) Core.MenuCard.SetIcon(card, tex);
+					}
+					catch { }
+				}
+
+				_pairs.Add(new Pair { Clone = card, Donor = donor });
+				if (act.State != null)
+				{
+					_toggles.Add(new ToggleTile { Card = card, State = act.State, Last = !lit });
+				}
+			}
+			catch (Exception e)
+			{
+				VRChatArchiveModPlugin.Logger.LogWarning($"[QMTab] AddCard '{act.Label}' failed: {e.Message}");
 			}
 		}
+
+		private void AddStepper(Transform row, string title, BepInEx.Configuration.ConfigEntry<float> cfg,
+			float step, float defVal, float min, float max, Transform donor, string format = "0.#")
+		{
+			try
+			{
+				var cardGo = UnityEngine.Object.Instantiate(donor.gameObject, row);
+				cardGo.name = "Stepper_" + title.Replace(" ", "");
+				cardGo.SetActive(true);
+				var card = cardGo.transform;
+
+				var le = card.GetComponent<UnityEngine.UI.LayoutElement>() ?? cardGo.AddComponent<UnityEngine.UI.LayoutElement>();
+				le.ignoreLayout = false;
+				le.minWidth = 468f;
+				le.preferredWidth = 468f;
+				le.minHeight = 170f;
+				le.preferredHeight = 170f;
+				le.flexibleWidth = 2f;
+				le.flexibleHeight = 0f;
+
+				Core.MenuCard.SetupStepper(card, title, () => cfg.Value,
+					onDec: () =>
+					{
+						cfg.Value = Mathf.Clamp(cfg.Value - step, min, max);
+						if (cfg == ModConfig.JumpImpulse)
+						{
+							if (ModConfig.ForceJumpForce != null) ModConfig.ForceJumpForce.Value = cfg.Value;
+							if (ModConfig.JumpMod != null) ModConfig.JumpMod.Value = true;
+							try { PlayerRef.LocalApi()?.SetJumpImpulse(cfg.Value); } catch { }
+							Toast.Show($"Jump Power: {cfg.Value:0.#} m/s");
+						}
+					},
+					onInc: () =>
+					{
+						cfg.Value = Mathf.Clamp(cfg.Value + step, min, max);
+						if (cfg == ModConfig.JumpImpulse)
+						{
+							if (ModConfig.ForceJumpForce != null) ModConfig.ForceJumpForce.Value = cfg.Value;
+							if (ModConfig.JumpMod != null) ModConfig.JumpMod.Value = true;
+							try { PlayerRef.LocalApi()?.SetJumpImpulse(cfg.Value); } catch { }
+							Toast.Show($"Jump Power: {cfg.Value:0.#} m/s");
+						}
+					},
+					onReset: () =>
+					{
+						cfg.Value = defVal;
+						if (cfg == ModConfig.JumpImpulse)
+						{
+							if (ModConfig.ForceJumpForce != null) ModConfig.ForceJumpForce.Value = cfg.Value;
+							if (ModConfig.JumpMod != null) ModConfig.JumpMod.Value = true;
+							try { PlayerRef.LocalApi()?.SetJumpImpulse(cfg.Value); } catch { }
+							Toast.Show($"Jump Power: {cfg.Value:0.#} m/s");
+						}
+					},
+					format: format
+				);
+
+				foreach (var b in card.GetComponentsInChildren<Button>(true))
+				{
+					if (b != null) UiClick.SetDebounce(b, 0.05f);
+				}
+
+				_steppers.Add(new StepperRef
+				{
+					Card = card,
+					Title = title,
+					Cfg = cfg,
+					LastVal = cfg.Value,
+					Format = format
+				});
+			}
+			catch (Exception e)
+			{
+				VRChatArchiveModPlugin.Logger.LogWarning($"[QMTab] AddStepper '{title}' failed: {e.Message}");
+			}
+		}
+
+		private void AddSpeedStepper(Transform row, Transform donor)
+		{
+			try
+			{
+				var cardGo = UnityEngine.Object.Instantiate(donor.gameObject, row);
+				cardGo.name = "Stepper_Speed";
+				cardGo.SetActive(true);
+				var card = cardGo.transform;
+
+				var le = card.GetComponent<UnityEngine.UI.LayoutElement>() ?? cardGo.AddComponent<UnityEngine.UI.LayoutElement>();
+				le.ignoreLayout = false;
+				le.minWidth = 468f;
+				le.preferredWidth = 468f;
+				le.minHeight = 170f;
+				le.preferredHeight = 170f;
+				le.flexibleWidth = 2f;
+				le.flexibleHeight = 0f;
+
+				Action<float> setSpeed = (val) =>
+				{
+					ModConfig.RunSpeed.Value = val;
+					ModConfig.WalkSpeed.Value = val;
+					ModConfig.StrafeSpeed.Value = val;
+					try
+					{
+						var api = PlayerRef.LocalApi();
+						if (api != null)
+						{
+							api.SetRunSpeed(val);
+							api.SetWalkSpeed(val);
+							api.SetStrafeSpeed(val);
+						}
+					}
+					catch { }
+				};
+
+				Core.MenuCard.SetupStepper(card, "Speed", () => ModConfig.RunSpeed.Value,
+					onDec: () =>
+					{
+						float val = Mathf.Clamp(ModConfig.RunSpeed.Value - 1f, 1f, 40f);
+						setSpeed(val);
+						Toast.Show($"Speed: {val:0.#}");
+					},
+					onInc: () =>
+					{
+						float val = Mathf.Clamp(ModConfig.RunSpeed.Value + 1f, 1f, 40f);
+						setSpeed(val);
+						Toast.Show($"Speed: {val:0.#}");
+					},
+					onReset: () =>
+					{
+						float val = 4f;
+						setSpeed(val);
+						Toast.Show("Speed: Reset (4)");
+					},
+					format: "0.#"
+				);
+
+				foreach (var b in card.GetComponentsInChildren<Button>(true))
+				{
+					if (b != null) UiClick.SetDebounce(b, 0.05f);
+				}
+
+				_steppers.Add(new StepperRef
+				{
+					Card = card,
+					Title = "Speed",
+					Cfg = ModConfig.RunSpeed,
+					LastVal = ModConfig.RunSpeed.Value,
+					Format = "0.#"
+				});
+			}
+			catch (Exception e)
+			{
+				VRChatArchiveModPlugin.Logger.LogWarning($"[QMTab] AddSpeedStepper failed: {e.Message}");
+			}
+		}
+
 
 		private void FillPage(Transform page, Transform body)
 		{
 			try
 			{
+				// DARK SCRIM BACKDROP: Add a solid black/charcoal background behind the entire page
+				// so that all buttons, icons, and text are crisp and clearly legible against custom wallpapers/bright worlds.
+				Transform scrim = page.Find("Background_Scrim");
+				if (scrim == null)
+				{
+					var scrimGo = new GameObject("Background_Scrim", Il2CppInterop.Runtime.Il2CppType.Of<RectTransform>());
+					var scrimRt = scrimGo.GetComponent<RectTransform>();
+					scrimRt.SetParent(page, false);
+					scrimRt.anchorMin = Vector2.zero;
+					scrimRt.anchorMax = Vector2.one;
+					scrimRt.offsetMin = Vector2.zero;
+					scrimRt.offsetMax = Vector2.zero;
+					var sImg = scrimGo.AddComponent<UnityEngine.UI.Image>();
+					sImg.color = new Color(0.08f, 0.09f, 0.11f, 0.98f);
+					sImg.raycastTarget = false;
+					scrimGo.transform.SetAsFirstSibling();
+				}
+				else
+				{
+					scrim.SetAsFirstSibling();
+					var sImg = scrim.GetComponent<UnityEngine.UI.Image>();
+					if (sImg != null)
+					{
+						sImg.color = new Color(0.08f, 0.09f, 0.11f, 0.98f);
+						sImg.raycastTarget = false;
+					}
+				}
+
 				Transform content = FindContent(page);
 				if (content == null) { VRChatArchiveModPlugin.Logger.LogWarning("[QMTab] page has no content node."); return; }
 
 				Transform donorGrid = body.Find(QuickLinksPath);
-				if (donorGrid == null)
+				if (donorGrid == null || donorGrid.childCount == 0)
 				{
 					VRChatArchiveModPlugin.Logger.LogWarning("[QMTab] Launchpad quick-links grid not found — page left as-is.");
 					return;
 				}
+				Transform donorCard = donorGrid.GetChild(0);
 
-				// Wipe whatever the DevTools page came with, then drop in a clone of the real,
-				// already-styled quick-links grid. It ships exactly six cards, each with its own
-				// icon — which is also why we no longer duplicate one card six times.
+				// Clear existing content and forget old buttons
 				for (int i = content.childCount - 1; i >= 0; i--)
 				{
-					try { UnityEngine.Object.DestroyImmediate(content.GetChild(i).gameObject); } catch { }
-				}
-				// That loop just destroyed VA_Sliders along with the cards, but the slider list
-				// still held its rows, so SyncSliders saw "sliders exist" and never rebuilt them:
-				// Movement → Back → Movement lost the sliders for good. Forgetting them here lets
-				// SyncSliders rebuild the host on the next Pump tick.
-				_sliders.Clear(); _sliderHost = null;
-
-				var grid = UnityEngine.Object.Instantiate(donorGrid.gameObject, content);
-				grid.name = "Buttons_Archive";
-				grid.SetActive(true);
-
-				// The Launchpad grid is laid out for exactly its own six cards, so it flows as many
-				// columns as fit. Adding tiles pushed it to a fourth column that runs off the right
-				// edge of the panel. Pinning it to THREE columns makes extra tiles wrap onto a new
-				// row instead, which the page already scrolls.
-				try
-				{
-					var glg = grid.GetComponent<UnityEngine.UI.GridLayoutGroup>();
-					if (glg != null)
+					var ch = content.GetChild(i);
+					if (ch != null)
 					{
-						glg.constraint = UnityEngine.UI.GridLayoutGroup.Constraint.FixedColumnCount;
-						glg.constraintCount = 3;
-					}
-
-					// MAKE THE GRID DECLARE ITS REAL HEIGHT. The donor is the Launchpad's grid, whose
-					// rect is sized for its own six cards in two rows. Pinned to three columns and
-					// given seven tiles it DRAWS three rows, but its rect still reported two — so the
-					// page's vertical layout placed whatever came next (the sliders) on top of the
-					// third row, which is the overlap on screen. A ContentSizeFitter makes the rect
-					// follow what the grid actually lays out, so the sliders land below the last row
-					// and VRChat's own page scroll reaches them.
-					var fit = grid.GetComponent<UnityEngine.UI.ContentSizeFitter>();
-					if (fit == null) fit = grid.AddComponent<UnityEngine.UI.ContentSizeFitter>();
-					fit.verticalFit = UnityEngine.UI.ContentSizeFitter.FitMode.PreferredSize;
-					fit.horizontalFit = UnityEngine.UI.ContentSizeFitter.FitMode.Unconstrained;
-
-					// And let the parent layout size it rather than pinning it to the donor's height.
-					var gle = grid.GetComponent<UnityEngine.UI.LayoutElement>();
-					if (gle != null) { gle.ignoreLayout = false; gle.minHeight = -1f; gle.preferredHeight = -1f; }
-				}
-				catch (Exception e) { VRChatArchiveModPlugin.Logger.LogWarning($"[QMTab] grid constraint failed: {e.Message}"); }
-
-				SpriteIndex.Invalidate();
-				var acts = ActsFor(_qmPage);
-
-				var cards = new List<Transform>();
-				for (int i = 0; i < grid.transform.childCount; i++) cards.Add(grid.transform.GetChild(i));
-
-				// The page is built from the Launchpad's OWN cards, and that grid ships exactly six.
-				// Anything past the sixth act has no card to land on, so it would silently never
-				// appear — clone more from the last real one until there are enough. Cloning an
-				// already-styled sibling is what keeps the new tiles looking native.
-				if (cards.Count > 0 && acts.Count > cards.Count)
-				{
-					var template = cards[cards.Count - 1];
-					int missing = acts.Count - cards.Count;
-					for (int k = 0; k < missing; k++)
-					{
-						try
+						var btns = ch.GetComponentsInChildren<Button>(true);
+						if (btns != null)
 						{
-							var extra = UnityEngine.Object.Instantiate(template.gameObject, grid.transform);
-							extra.name = "Button_VAExtra" + k;
-							extra.SetActive(true);
-							extra.transform.SetAsLastSibling();
-							// Forget the template's icon so CopySprite pulls the ROTATED donor's one in.
-							try { var ei = extra.transform.Find("Icons/Icon")?.GetComponent<UnityEngine.UI.Image>(); if (ei != null) ei.sprite = null; } catch { }
-							cards.Add(extra.transform);
+							foreach (var b in btns) Core.UiClick.Forget(b);
 						}
-						catch (Exception e)
-						{
-							VRChatArchiveModPlugin.Logger.LogWarning($"[QMTab] could not add tile {k}: {e.Message}");
-							break;
-						}
+						try { UnityEngine.Object.DestroyImmediate(ch.gameObject); } catch { }
 					}
 				}
 
 				_toggles.Clear();
+				_steppers.Clear();
+				_sections.Clear();
 				_pairs.Clear();
 				_spritesResolved = false;
-				int used = 0;
-				for (int i = 0; i < cards.Count; i++)
+
+				var contentRt = content.GetComponent<RectTransform>();
+				if (contentRt != null)
 				{
-					var card = cards[i];
-					if (card == null) continue;
-					if (i >= acts.Count) { try { UnityEngine.Object.DestroyImmediate(card.gameObject); } catch { } continue; }
-					// Cloned-in tiles have no donor of their own; reuse the last real one so they are
-					// styled from a card VRChat has actually themed.
-					// Rotated, not pinned to the last card: every extra tile used to borrow the sixth
-					// card's icon, which is how Radar and Player list came out as two storefronts.
-					Transform donorCard = donorGrid.childCount > 0 ? donorGrid.GetChild(i % donorGrid.childCount) : null;
-					SetupCard(card, acts[i], donorCard);
-					if (donorCard != null) _pairs.Add(new Pair { Clone = card, Donor = donorCard });
-					if (acts[i].State != null)
-						_toggles.Add(new ToggleTile { Card = card, State = acts[i].State, Last = !acts[i].State() });
-					used++;
+					contentRt.anchorMin = new Vector2(0f, 1f);
+					contentRt.anchorMax = new Vector2(1f, 1f);
+					contentRt.pivot = new Vector2(0.5f, 1f);
 				}
+
+				var vlg = content.GetComponent<UnityEngine.UI.VerticalLayoutGroup>();
+				if (vlg != null)
+				{
+					vlg.spacing = 16f;
+					vlg.padding = new RectOffset(14, 14, 14, 100);
+					vlg.childForceExpandHeight = false;
+					vlg.childControlHeight = true;
+					vlg.childForceExpandWidth = true;
+					vlg.childControlWidth = true;
+				}
+				var csf = content.GetComponent<UnityEngine.UI.ContentSizeFitter>();
+				if (csf == null) csf = content.gameObject.AddComponent<UnityEngine.UI.ContentSizeFitter>();
+				csf.verticalFit = UnityEngine.UI.ContentSizeFitter.FitMode.PreferredSize;
+				csf.horizontalFit = UnityEngine.UI.ContentSizeFitter.FitMode.Unconstrained;
+
+				// Ensure ScrollRect is enabled, vertical, clamped, and sensitive
+				var sr = page.GetComponentInChildren<UnityEngine.UI.ScrollRect>(true);
+				if (sr != null)
+				{
+					sr.enabled = true;
+					sr.vertical = true;
+					sr.horizontal = false;
+					sr.movementType = UnityEngine.UI.ScrollRect.MovementType.Clamped;
+					sr.scrollSensitivity = 1.0f;
+					sr.inertia = true;
+					sr.decelerationRate = 0.135f;
+
+					var srRt = sr.GetComponent<RectTransform>();
+					if (srRt != null)
+					{
+						srRt.anchorMin = new Vector2(0f, 0f);
+						srRt.anchorMax = new Vector2(1f, 1f);
+						srRt.pivot = new Vector2(0.5f, 0.5f);
+						srRt.offsetMin = new Vector2(10f, 25f);
+						srRt.offsetMax = new Vector2(-10f, -105f);
+					}
+
+					var vp = sr.viewport ?? sr.transform.Find("Viewport")?.GetComponent<RectTransform>();
+					if (vp != null)
+					{
+						vp.anchorMin = new Vector2(0f, 0f);
+						vp.anchorMax = new Vector2(1f, 1f);
+						vp.pivot = new Vector2(0.5f, 0.5f);
+						vp.anchoredPosition = Vector2.zero;
+						vp.sizeDelta = Vector2.zero;
+
+						var mask = vp.GetComponent<UnityEngine.UI.RectMask2D>();
+						if (mask == null) mask = vp.gameObject.AddComponent<UnityEngine.UI.RectMask2D>();
+						mask.enabled = true;
+					}
+
+					if (contentRt != null) sr.content = contentRt;
+					SetupScrollbar(page, sr, body);
+
+					var srGo = sr.gameObject;
+					var bgImg = srGo.GetComponent<UnityEngine.UI.Image>();
+					if (bgImg == null) bgImg = srGo.AddComponent<UnityEngine.UI.Image>();
+					bgImg.color = new Color(0.12f, 0.13f, 0.16f, 0.98f);
+					bgImg.raycastTarget = false;
+				}
+
+				SpriteIndex.Invalidate();
+
+				// ==================== SECTION 1: MOVEMENT ====================
+				CreateSection(content, "Movement", out var movHost, startExpanded: true);
+
+				// ROW 1: Ghost (Col 1) | Flight (Cols 2-3) | Save position (Col 4)
+				var movR1 = AddRow(movHost);
+				AddCard(movR1, new Act {
+					Label = "Ghost",
+					IconName = "visibility|Eye|Eye_Disabled",
+					Do = GhostModule.Toggle,
+					State = () => GhostModule.Active
+				}, donorCard);
+
+				AddCard(movR1, new Act {
+					Label = "Flight",
+					IconName = "ic_fly_mode|Drone_FlightModes|WingLeft",
+					SecondaryIconName = "PlayerMove|BodyMode_Standing|Hand_Avatar",
+					Do = () => {
+						ModConfig.FlyEnabled.Value = !ModConfig.FlyEnabled.Value;
+						Toast.Show(ModConfig.FlyEnabled.Value ? "Flight: ON" : "Flight: OFF");
+					},
+					State = () => ModConfig.FlyEnabled.Value
+				}, donorCard, colSpan: 2);
+
+				AddCard(movR1, new Act {
+					Label = "Ghost Save Position",
+					IconName = "ic_save|TeleportTo|DropPortal|FileSave",
+					Do = () => {
+						ModConfig.GhostSavePosition.Value = !ModConfig.GhostSavePosition.Value;
+						Toast.Show(ModConfig.GhostSavePosition.Value ? "Ghost Save Pos: ON" : "Ghost Save Pos: OFF");
+					},
+					State = () => ModConfig.GhostSavePosition != null && ModConfig.GhostSavePosition.Value
+				}, donorCard);
+
+				// ROW 2: Speed mod (Col 1) | Speed Stepper (Cols 2-3) | Back to normal (Col 4)
+				var movR2 = AddRow(movHost);
+				AddCard(movR2, new Act {
+					Label = "Speed mod",
+					IconName = "PlayerMove|BodyMode_Standing|Arrow_Right",
+					Do = () => {
+						bool next = !(ModConfig.WalkMod.Value || ModConfig.RunMod.Value);
+						ModConfig.WalkMod.Value = next;
+						ModConfig.RunMod.Value = next;
+						Toast.Show(next ? "Speed Mod: ON" : "Speed Mod: OFF");
+					},
+					State = () => ModConfig.WalkMod.Value || ModConfig.RunMod.Value
+				}, donorCard);
+
+				AddSpeedStepper(movR2, donorCard);
+
+				AddCard(movR2, new Act {
+					Label = "Back to normal",
+					IconName = "ic_reset|reset|Home_Reset",
+					Do = SpeedModule.ResetToWorld
+				}, donorCard);
+
+				// ROW 3: Jump mod (Col 1) | Jump power Stepper (Cols 2-3) | Click to teleport (Col 4)
+				var movR3 = AddRow(movHost);
+				AddCard(movR3, new Act {
+					Label = "Jump mod",
+					IconName = "arrow_up|Arrow_Right",
+					Do = ForceJumpModule.Toggle,
+					State = () => ForceJumpModule.Active || (ModConfig.JumpMod != null && ModConfig.JumpMod.Value)
+				}, donorCard);
+
+				AddStepper(movR3, "Jump power", ModConfig.JumpImpulse, 0.5f, 3.0f, 0.5f, 30f, donorCard);
+
+				AddCard(movR3, new Act {
+					Label = "Click to teleport",
+					IconName = "TeleportTo|TeleportToMe|DropPortal",
+					Do = () => {
+						ModConfig.ClickTpEnabled.Value = !ModConfig.ClickTpEnabled.Value;
+						Toast.Show(ModConfig.ClickTpEnabled.Value ? "Click TP: ON" : "Click TP: OFF");
+					},
+					State = () => ModConfig.ClickTpEnabled.Value
+				}, donorCard);
+
+				// ==================== SECTION 2: ESP ====================
+				CreateSection(content, "ESP", out var espHost, startExpanded: true);
+				var espR1 = AddRow(espHost);
+				AddCard(espR1, new Act {
+					Label = "Player ESP",
+					IconName = "icon_user|Icon_Safety_Avatar_Shape|BodyMode_Standing|PlayerMove",
+					Do = () => {
+						ModConfig.EspCapsule.Value = !ModConfig.EspCapsule.Value;
+						CapsuleEspModule.TriggerRelight();
+						Toast.Show(ModConfig.EspCapsule.Value ? "Player ESP: ON" : "Player ESP: OFF");
+					},
+					State = () => ModConfig.EspCapsule.Value
+				}, donorCard);
+				AddCard(espR1, new Act {
+					Label = "Player list",
+					IconName = "Social|Friends|icon_user",
+					Do = () => {
+						ModConfig.InstancePanelsEnabled.Value = !ModConfig.InstancePanelsEnabled.Value;
+						Toast.Show(ModConfig.InstancePanelsEnabled.Value ? "Player List: ON" : "Player List: OFF");
+					},
+					State = () => ModConfig.InstancePanelsEnabled.Value
+				}, donorCard);
+				AddCard(espR1, new Act {
+					Label = "Avatar Outlines",
+					IconName = "Icon_Spotlight|glow|DynamicLight",
+					Do = () => {
+						ModConfig.EspHighlight.Value = !ModConfig.EspHighlight.Value;
+						HighlightEspModule.TriggerRelight();
+						Toast.Show(ModConfig.EspHighlight.Value ? "Outlines: ON" : "Outlines: OFF");
+					},
+					State = () => ModConfig.EspHighlight.Value
+				}, donorCard);
+				AddCard(espR1, new Act {
+					Label = "Pickups",
+					IconName = "Grab|hand|Handshake",
+					Do = () => {
+						ModConfig.EspItems.Value = !ModConfig.EspItems.Value;
+						HighlightEspModule.TriggerRelight();
+						Toast.Show(ModConfig.EspItems.Value ? "ESP Pickups: ON" : "ESP Pickups: OFF");
+					},
+					State = () => ModConfig.EspItems.Value
+				}, donorCard);
+
+				var espR2 = AddRow(espHost);
+				AddCard(espR2, new Act {
+					Label = "Box ESP",
+					IconName = "Icon_Safety_Avatar_Shape|ic_box|icon_user",
+					Do = () => {
+						ModConfig.EspEnabled.Value = !ModConfig.EspEnabled.Value;
+						Toast.Show(ModConfig.EspEnabled.Value ? "Box ESP: ON" : "Box ESP: OFF");
+					},
+					State = () => ModConfig.EspEnabled.Value
+				}, donorCard);
+				AddCard(espR2, new Act {
+					Label = "Portals",
+					IconName = "DropPortal|Portal|TeleportTo",
+					Do = () => {
+						ModConfig.EspPortals.Value = !ModConfig.EspPortals.Value;
+						HighlightEspModule.TriggerRelight();
+						Toast.Show(ModConfig.EspPortals.Value ? "ESP Portals: ON" : "ESP Portals: OFF");
+					},
+					State = () => ModConfig.EspPortals.Value
+				}, donorCard);
+				AddCard(espR2, new Act {
+					Label = "Radar",
+					IconName = "prints_location|LocationUnavailable|TeleportToMe",
+					Do = () => {
+						ModConfig.RadarEnabled.Value = !ModConfig.RadarEnabled.Value;
+						Toast.Show(ModConfig.RadarEnabled.Value ? "Radar: ON" : "Radar: OFF");
+					},
+					State = () => ModConfig.RadarEnabled.Value
+				}, donorCard);
+				AddCard(espR2, new Act {
+					Label = "See through walls",
+					IconName = "Eye|visibility|Eye_Disabled",
+					Do = () => {
+						ModConfig.EspThroughWalls.Value = !ModConfig.EspThroughWalls.Value;
+						HighlightEspModule.TriggerRelight();
+						CapsuleEspModule.TriggerRelight();
+						Toast.Show(ModConfig.EspThroughWalls.Value ? "Through Walls: ON" : "Through Walls: OFF");
+					},
+					State = () => ModConfig.EspThroughWalls.Value
+				}, donorCard);
+
+				var espR3 = AddRow(espHost);
+				AddCard(espR3, new Act {
+					Label = "ESP Nameplate",
+					IconName = "Tag|Chat|Social|Friends|icon_user",
+					Do = () => {
+						ModConfig.NameplateEsp.Value = !ModConfig.NameplateEsp.Value;
+						NameplateEspModule.ApplyNameplateEsp(ModConfig.NameplateEsp.Value);
+						Toast.Show(ModConfig.NameplateEsp.Value ? "ESP Nameplate: ON" : "ESP Nameplate: OFF");
+					},
+					State = () => ModConfig.NameplateEsp != null && ModConfig.NameplateEsp.Value
+				}, donorCard);
+				AddCard(espR3, new Act { Label = "Active Features HUD", IconName = "Logging|debug|Tag|Icon_UdonSpotlight|visibility", Do = () => { ModConfig.ActiveFeaturesHudEnabled.Value = !ModConfig.ActiveFeaturesHudEnabled.Value; Toast.Show(ModConfig.ActiveFeaturesHudEnabled.Value ? "Active Features HUD: ON" : "Active Features HUD: OFF"); }, State = () => ModConfig.ActiveFeaturesHudEnabled.Value }, donorCard);
+				AddCard(espR3, new Act { Label = "Bottom Roster", IconName = "arrow_down|Arrow_Right|Social|Friends", Do = () => { ModConfig.RosterBottom.Value = !ModConfig.RosterBottom.Value; Toast.Show(ModConfig.RosterBottom.Value ? "Roster: Bottom" : "Roster: Top"); }, State = () => ModConfig.RosterBottom.Value }, donorCard);
+				AddCard(espR3, new Act { Label = "Fast Sync", IconName = "Logging|debug|Icon_UdonSpotlight", Do = () => { if (ModConfig.FastSync != null) ModConfig.FastSync.Value = !ModConfig.FastSync.Value; }, State = () => ModConfig.FastSync != null && ModConfig.FastSync.Value }, donorCard);
+
+				// ==================== SECTION 3: INTERACTION ====================
+				CreateSection(content, "Interaction", out var intHost, startExpanded: true);
+				var intR1 = AddRow(intHost);
+				AddCard(intR1, new Act { Label = "Fullbright", IconName = "DynamicLight|Icon_Spotlight|glow", Do = ToggleFullbright, State = () => FullbrightActive }, donorCard);
+				AddCard(intR1, new Act { Label = "Force Pickup", IconName = "Grab|hand|Handshake", Do = ForcePickupModule.Toggle, State = () => ForcePickupModule.Active }, donorCard);
+				AddCard(intR1, new Act { Label = "Player Grab", IconName = "icon_user|Social|Friends|BodyMode_Standing|PlayerMove", Do = PlayerGrabModule.Toggle, State = () => PlayerGrabModule.Active }, donorCard);
+				AddCard(intR1, new Act { Label = "Respawn pickups", IconName = "ReloadIcon|ic_reset|reset", Do = RespawnAllPickups }, donorCard);
+
+				var intR2 = AddRow(intHost);
+				AddCard(intR2, new Act { Label = "Object Orbit", IconName = "Drone_FlightModes|ic_fly_mode|ReloadIcon", Do = ObjectOrbitModule.ToggleOnSelf, State = () => ObjectOrbitModule.Active }, donorCard);
+				AddCard(intR2, new Act { Label = "Elevator", IconName = "arrow_up|Arrow_Right", Do = ElevatorModule.ToggleOnSelf, State = () => ElevatorModule.Active }, donorCard);
+				AddCard(intR2, new Act { Label = "Player Rotator", IconName = "BodyMode_Standing|PlayerMove|Hand_Avatar", Do = PlayerRotatorModule.Toggle, State = () => PlayerRotatorModule.Active }, donorCard);
+				AddCard(intR2, new Act { Label = "Self Hide", IconName = "Eye_Disabled|visibility|Eye", Do = () => { if (ModConfig.SelfHide != null) ModConfig.SelfHide.Value = !ModConfig.SelfHide.Value; }, State = () => ModConfig.SelfHide != null && ModConfig.SelfHide.Value }, donorCard);
+
+				var intR3 = AddRow(intHost);
+				AddCard(intR3, new Act { Label = "Box Drop", IconName = "LocationUnavailable|prints_location|TeleportToMe", Do = BoxDropModule.Toggle, State = () => BoxDropModule.Active }, donorCard);
+				AddCard(intR3, new Act { Label = "Bad Apple", IconName = "Icon_Spotlight|glow|DynamicLight", Do = BadAppleModule.RequestToggle, State = () => BadAppleModule.Playing }, donorCard);
+				AddCard(intR3, new Act { Label = "Mute / Deafen", IconName = "Tag_Disabled|Tag|StopIcon", Do = ToggleDeafen, State = () => DeafenActive }, donorCard);
+
+				// ==================== SECTION 4: TOOLS ====================
+				CreateSection(content, "Tools", out var tlsHost, startExpanded: true);
+				var tlsR1 = AddRow(tlsHost);
+				AddCard(tlsR1, new Act { Label = "Crash protection", IconName = "Icon_Shield|Icon_Shield_Custom|shield", Do = () => ModConfig.AntiCrashEnabled.Value = !ModConfig.AntiCrashEnabled.Value, State = () => ModConfig.AntiCrashEnabled.Value }, donorCard);
+				AddCard(tlsR1, new Act { Label = "Block crashers", IconName = "BlockUser|Blocked_White_Transparent|icon_listener_blocked|block", Do = () => ModConfig.UdonBlockCrashers.Value = !ModConfig.UdonBlockCrashers.Value, State = () => ModConfig.UdonBlockCrashers.Value }, donorCard);
+				AddCard(tlsR1, new Act { Label = "Udon Block All", IconName = "StopIcon|stop|Icon_Close_X", Do = () => ModConfig.UdonBlockAll.Value = !ModConfig.UdonBlockAll.Value, State = () => ModConfig.UdonBlockAll.Value }, donorCard);
+				AddCard(tlsR1, new Act { Label = "Udon Console", IconName = "Icon_UdonSpotlight|Logging|debug", Do = () => ModConfig.UdonLogEnabled.Value = !ModConfig.UdonLogEnabled.Value, State = () => ModConfig.UdonLogEnabled.Value }, donorCard);
+
+				var tlsR2 = AddRow(tlsHost);
+				AddCard(tlsR2, new Act { Label = "Re-check players", IconName = "ReloadIcon|ic_reset|reset", Do = Core.Menu.RequestRescan }, donorCard);
+				AddCard(tlsR2, new Act { Label = "Refresh Tags", IconName = "Tag|Tag_Disabled|ReloadIcon", Do = VaTagsModule.RequestRefresh }, donorCard);
+				AddCard(tlsR2, new Act { Label = "Udon Rescan", IconName = "ReloadIcon|ic_reset|reset", Do = UdonManagerModule.Rescan }, donorCard);
+				AddCard(tlsR2, new Act { Label = "Restore Udon", IconName = "Home_Reset|ic_reset|reset", Do = () => { ModConfig.UdonBlockAll.Value = false; ModConfig.UdonBlockCrashers.Value = false; Toast.Show("Udon Blockers Reset"); } }, donorCard);
+
+				var tlsR3 = AddRow(tlsHost);
+				AddCard(tlsR3, new Act
+				{
+					Label = "Global Udon",
+					IconName = "Icon_UdonSpotlight|Globe|WorldIcon|NetworkIcon",
+					Do = () =>
+					{
+						ModConfig.GlobalUdonInteract.Value = !ModConfig.GlobalUdonInteract.Value;
+						Toast.Show(ModConfig.GlobalUdonInteract.Value ? "Global Udon: ON" : "Global Udon: OFF");
+					},
+					State = () => ModConfig.GlobalUdonInteract.Value
+				}, donorCard);
+
+				// ==================== SECTION 5: SOUNDS (Collapsed by default) ====================
+				CreateSection(content, "Sounds", out var sndHost, startExpanded: false);
+				var sndR1 = AddRow(sndHost);
+				foreach (var clip in SoundboardModule.Clips)
+				{
+					var c = clip;
+					AddCard(sndR1, new Act
+					{
+						Label = c.Label,
+						Do = () => SoundboardModule.Send(c),
+						Icon = () => AssetLoader.Icon(c.Image) ?? AssetLoader.HeartIcon,
+					}, donorCard);
+				}
+
 				RefreshToggles();
+
+				if (sr != null)
+				{
+					sr.verticalNormalizedPosition = 1f;
+					if (sr.verticalScrollbar != null) sr.verticalScrollbar.value = 1f;
+				}
 
 				var header = page.Find("Header_DevTools") ?? page.Find("Header_H1");
 				if (header != null)
 				{
-					var htmp = header.GetComponentInChildren<TMPro.TMP_Text>(true);
-					if (htmp != null) htmp.text = TitleFor(_qmPage);
-				}
+					// Bring header to the very front so it renders above the scrollrect and cards
+					header.SetAsLastSibling();
 
-				VRChatArchiveModPlugin.Logger.LogInfo($"[QMTab] page filled with {used} Launchpad-styled tile(s).");
-			}
-			catch (Exception e) { VRChatArchiveModPlugin.Logger.LogWarning($"[QMTab] page fill failed: {e.Message}"); }
-		}
-
-		// The card recipe now lives in Core.MenuCard and is shared with the per-user menu, so a fix
-		// on one is a fix on both. Keeping a second copy here is what let the two drift apart.
-		private static void SetupCard(Transform card, Act act, Transform donor)
-		{
-			bool lit = false;
-			try { lit = act.State != null && act.State(); } catch { }
-			// keepStyle: same as the per-user cards, and for the same reason — VRChat's own
-			// StyleElement themes the tile, so it matches the Launchpad cards it was cloned from
-			// instead of wearing a palette of ours. The ON state rides the game's Foreground
-			// overlay (see MenuCard.SetLit), which is how VRChat lights its own toggle cards.
-			Core.MenuCard.Setup(card, donor, act.Label, act.Do, lit, keepStyle: true);
-			Core.MenuCard.StripBadges(card);
-
-			// The game's own glyph for what the tile does, when one of the hints names a loaded
-			// sprite. Resolved from SpriteIndex (built once per page fill); a miss keeps the donor
-			// icon, which the rotated donor choice keeps from repeating across the grid.
-			if (!string.IsNullOrEmpty(act.IconName))
-			{
-				var sp = SpriteIndex.Find(act.IconName);
-				if (sp != null) Core.MenuCard.SetIcon(card, sp);
-			}
-			Core.MenuCard.TintIcon(card);
-
-			// Our own icon, if the tile brought one. Done after Setup so it overrides the sprite the
-			// clone inherited rather than being overwritten by it.
-			if (act.Icon != null)
-			{
-				try
-				{
-					var tex = act.Icon();
-					if (tex != null) Core.MenuCard.SetIcon(card, tex);
-				}
-				catch (Exception e) { VRChatArchiveModPlugin.Logger.LogWarning($"[QMTab] icon for '{act.Label}' failed: {e.Message}"); }
-			}
-		}
-
-
-		// ---------------------------------------------------------------- native sliders
-		//
-		// VRChat's own settings rows carry a plain Unity Slider inside a RightItemContainer, styled
-		// by the game. Cloning one gives a slider that looks and behaves like every other slider in
-		// the menu — where a card cannot: a QuickMenu card is a button, so the speed tiles could
-		// only ever cycle through preset values.
-		//
-		// Donor path comes from a live capture: a Settings row such as NameplateOpacity ->
-		// RightItemContainer -> Slider (+ Background / Fill Area / Fill / Handle Slide Area).
-		private sealed class SliderRow
-		{
-			public Transform Go;
-			public UnityEngine.UI.Slider S;
-			public TMPro.TMP_Text Label;
-			public TMPro.TMP_Text Value;   // the donor's own right-hand readout
-			public BepInEx.Configuration.ConfigEntry<float> Cfg;
-			public string Title;
-			public float Min, Max;
-		}
-
-		private readonly List<SliderRow> _sliders = new List<SliderRow>();
-		private Transform _sliderHost;
-		// BUILT FROM SCRATCH, NOT CLONED. Cloning VRChat's own slider row failed five different
-		// ways: its right-anchored container collapsed in a narrow page, its label refused to
-		// re-target, its rows stacked on top of each other. Every one of those was a fight with a
-		// layout the donor row was built for and this page is not.
-		//
-		// So the rows are made from plain Unity UI, where every piece is ours: a label, a Slider
-		// assembled from Background/Fill/Handle images, and a value readout. The ONE thing that
-		// cannot be made from nothing is a font — a fresh TextMeshPro has none and renders
-		// invisibly — so the font is lifted off a text the page already shows.
-		private static TMPro.TMP_FontAsset _font;
-
-		private static TMPro.TMP_FontAsset StealFont()
-		{
-			if (_font != null) return _font;
-			try
-			{
-				Transform root = Core.QuickMenu.Root() ?? Core.QuickMenu.Main();
-				var t = root != null ? root.GetComponentInChildren<TMPro.TMP_Text>(true) : null;
-				if (t != null) _font = t.font;
-			}
-			catch { }
-			return _font;
-		}
-
-		private void BuildSliders(Transform content)
-		{
-			if (_sliders.Count > 0)
-			{
-				if (_sliderHost != null && _sliderHost.gameObject != null) return;
-				_sliders.Clear(); _sliderHost = null;
-			}
-
-			// A NORMAL LAYOUT CHILD of `content` (the page's VerticalLayoutGroup), added AFTER the
-			// button grid so it flows BELOW the buttons and scrolls with VRChat's own page scroll.
-			// The previous "fixed footer pinned to the Viewport with ignoreLayout" reported zero
-			// height to the layout and the whole slider section vanished. A real
-			// LayoutElement.preferredHeight (plus an explicit sizeDelta, to cover a layout group that
-			// controls child height and one that does not) is what reserves the space and shows it.
-			const float RowH = 44f, Pad = 16f;
-			float panelH = 4 * RowH + 3 * 8f + 2 * Pad;   // 4 rows + gaps + padding = 232
-
-			var hostGo = new GameObject("VA_Sliders", Il2CppInterop.Runtime.Il2CppType.Of<RectTransform>());
-			var host = hostGo.GetComponent<RectTransform>();
-			host.SetParent(content, false);
-			host.anchorMin = new Vector2(0f, 1f);
-			host.anchorMax = new Vector2(1f, 1f);
-			host.pivot = new Vector2(0.5f, 1f);
-			host.sizeDelta = new Vector2(0f, panelH);
-
-			// The dark panel behind the rows — what makes it read like VRChat's Audio Volume block.
-			var bgIm = hostGo.AddComponent<UnityEngine.UI.Image>();
-			bgIm.color = new Color(0.06f, 0.07f, 0.11f, 0.86f);
-
-			// Real height so the page's VerticalLayoutGroup reserves and scrolls the panel.
-			var hostLe = hostGo.AddComponent<UnityEngine.UI.LayoutElement>();
-			hostLe.ignoreLayout = false;
-			hostLe.minHeight = panelH; hostLe.preferredHeight = panelH; hostLe.flexibleWidth = 1f;
-
-			var vlg = hostGo.AddComponent<UnityEngine.UI.VerticalLayoutGroup>();
-			vlg.childForceExpandHeight = false; vlg.childControlHeight = false;
-			vlg.childForceExpandWidth = true;  vlg.childControlWidth = true;
-			vlg.childAlignment = TextAnchor.UpperCenter;
-			vlg.spacing = 8f; vlg.padding = new RectOffset((int)Pad, (int)Pad, (int)Pad, (int)Pad);
-
-			host.SetAsLastSibling();   // after the button grid
-			_sliderHost = host.transform;
-
-			MakeRow(host, "Jump force", ModConfig.JumpImpulse, 0f, 15f);
-			MakeRow(host, "Fly speed",  ModConfig.FlySpeed,    1f, 60f);
-			MakeRow(host, "Walk speed", ModConfig.WalkSpeed,   0.1f, 20f);
-			MakeRow(host, "Run speed",  ModConfig.RunSpeed,    0.1f, 40f);
-
-			VRChatArchiveModPlugin.Logger.LogInfo($"[QMTab] built {_sliders.Count} slider row(s) below the buttons.");
-		}
-
-		private static RectTransform NewRect(string name, Transform parent)
-		{
-			var go = new GameObject(name, Il2CppInterop.Runtime.Il2CppType.Of<RectTransform>());
-			var rt = go.GetComponent<RectTransform>();
-			rt.SetParent(parent, false);
-			return rt;
-		}
-
-		private static UnityEngine.UI.Image Img(RectTransform rt, Color c)
-		{
-			var im = rt.gameObject.AddComponent<UnityEngine.UI.Image>();
-			im.color = c;
-			return im;
-		}
-
-		private static TMPro.TextMeshProUGUI Label(RectTransform rt, string text, float size, TMPro.TextAlignmentOptions align)
-		{
-			var tmp = rt.gameObject.AddComponent<TMPro.TextMeshProUGUI>();
-			var f = StealFont();
-			if (f != null) tmp.font = f;
-			tmp.text = text;
-			tmp.fontSize = size;
-			tmp.alignment = align;
-			tmp.enableWordWrapping = false;
-			tmp.color = new Color(0.92f, 0.90f, 1f);
-			return tmp;
-		}
-
-		private void MakeRow(Transform host, string title,
-							 BepInEx.Configuration.ConfigEntry<float> cfg, float min, float max)
-		{
-			try
-			{
-				// One row, laid out by hand in a fixed 48-high strip: label | slider | value.
-				var row = NewRect("VA_Row_" + title.Replace(" ", ""), host);
-				var rle = row.gameObject.AddComponent<UnityEngine.UI.LayoutElement>();
-				rle.minHeight = 44f; rle.preferredHeight = 44f; rle.flexibleWidth = 1f;
-				row.sizeDelta = new Vector2(0f, 44f);
-
-				// label — left third
-				var lab = NewRect("Label", row);
-				lab.anchorMin = new Vector2(0f, 0f); lab.anchorMax = new Vector2(0.32f, 1f);
-				lab.offsetMin = Vector2.zero; lab.offsetMax = Vector2.zero;
-				var labelTmp = Label(lab, title, 15f, TMPro.TextAlignmentOptions.MidlineLeft);
-
-				// value — right, fixed width
-				var val = NewRect("Value", row);
-				val.anchorMin = new Vector2(0.86f, 0f); val.anchorMax = new Vector2(1f, 1f);
-				val.offsetMin = Vector2.zero; val.offsetMax = Vector2.zero;
-				var valueTmp = Label(val, "", 15f, TMPro.TextAlignmentOptions.MidlineRight);
-
-				// slider — the middle, between label and value
-				var slRt = NewRect("Slider", row);
-				slRt.anchorMin = new Vector2(0.34f, 0.25f); slRt.anchorMax = new Vector2(0.84f, 0.75f);
-				slRt.offsetMin = Vector2.zero; slRt.offsetMax = Vector2.zero;
-				var sl = slRt.gameObject.AddComponent<UnityEngine.UI.Slider>();
-
-				// track
-				var bg = NewRect("Background", slRt);
-				bg.anchorMin = Vector2.zero; bg.anchorMax = Vector2.one;
-				bg.offsetMin = Vector2.zero; bg.offsetMax = Vector2.zero;
-				Img(bg, new Color(0.10f, 0.12f, 0.18f, 0.9f));
-
-				// fill
-				var fillArea = NewRect("Fill Area", slRt);
-				fillArea.anchorMin = Vector2.zero; fillArea.anchorMax = Vector2.one;
-				fillArea.offsetMin = Vector2.zero; fillArea.offsetMax = Vector2.zero;
-				var fill = NewRect("Fill", fillArea);
-				fill.anchorMin = Vector2.zero; fill.anchorMax = new Vector2(0f, 1f);
-				fill.offsetMin = Vector2.zero; fill.offsetMax = Vector2.zero;
-				Img(fill, new Color(0.24f, 0.72f, 0.80f, 1f));
-
-				// handle
-				var handleArea = NewRect("Handle Slide Area", slRt);
-				handleArea.anchorMin = Vector2.zero; handleArea.anchorMax = Vector2.one;
-				handleArea.offsetMin = Vector2.zero; handleArea.offsetMax = Vector2.zero;
-				var handle = NewRect("Handle", handleArea);
-				handle.sizeDelta = new Vector2(14f, 0f);
-				Img(handle, Color.white);
-
-				sl.fillRect = fill;
-				sl.handleRect = handle;
-				sl.targetGraphic = handle.GetComponent<UnityEngine.UI.Image>();
-				sl.direction = UnityEngine.UI.Slider.Direction.LeftToRight;
-				sl.minValue = min; sl.maxValue = max; sl.wholeNumbers = false;
-
-				var srow = new SliderRow { Go = row, S = sl, Label = labelTmp, Value = valueTmp, Cfg = cfg, Title = title, Min = min, Max = max };
-				try { sl.value = Mathf.Clamp(cfg.Value, min, max); } catch { }
-				Core.UiClick.AddValueChanged(sl, v =>
-				{
-					try { cfg.Value = v; } catch { }
-					Retitle(srow);
-				});
-
-				Retitle(srow);
-				_sliders.Add(srow);
-			}
-			catch (Exception e) { VRChatArchiveModPlugin.Logger.LogWarning("[QMTab] make row '" + title + "': " + e.Message); }
-		}
-
-
-
-
-
-
-		// Name on the left, value on the right — the row's own two slots, used for what they are.
-		// The readout is a PERCENTAGE of the slider's range, which is what the donor row shows and
-		// what makes four different units (metres per second, jump impulse) comparable at a glance.
-		private static void Retitle(SliderRow r)
-		{
-			try
-			{
-				if (r.Label != null) r.Label.text = r.Title;
-
-				if (r.Value != null)
-				{
-					float span = Mathf.Max(0.0001f, r.Max - r.Min);
-					int pct = Mathf.RoundToInt((r.Cfg.Value - r.Min) / span * 100f);
-					r.Value.text = pct + "%";
-				}
-				else if (r.Label != null)
-				{
-					// No second slot on this donor: fall back to putting the number in the label.
-					r.Label.text = r.Title + "   " + r.Cfg.Value.ToString("0.#");
-				}
-			}
-			catch { }
-		}
-
-		private static Transform FindDeep(Transform t, string name)
-		{
-			try
-			{
-				foreach (var c in t.GetComponentsInChildren<Transform>(true))
-					if (c != null && c.name == name) return c;
-			}
-			catch { }
-			return null;
-		}
-
-		// Sliders belong to the Movement page only.
-		private void SyncSliders()
-		{
-			try
-			{
-				bool want = _qmPage == QmPage.Movement;
-				if (want && _sliders.Count == 0 && _page != null)
-				{
-					var content = FindContent(_page.transform);
-					if (content != null) BuildSliders(content);
-				}
-				if (_sliderHost != null && _sliderHost.gameObject.activeSelf != want)
-					_sliderHost.gameObject.SetActive(want);
-
-				// Re-assert the order: FillPage adds the grid after us when the page changes.
-				if (want && _sliderHost != null
-					&& _sliderHost.GetSiblingIndex() != _sliderHost.parent.childCount - 1)
-					_sliderHost.SetAsLastSibling();
-
-				// The value can change from the mod's own menu too, so follow it.
-				if (want)
-					foreach (var r in _sliders)
+					// Enable and style HeaderBackground so the header is completely opaque
+					var bg = header.Find("HeaderBackground");
+					if (bg != null)
 					{
-						if (r?.S == null) continue;
-						try
+						bg.gameObject.SetActive(true);
+						var bgImg = bg.GetComponent<UnityEngine.UI.Image>();
+						if (bgImg != null)
 						{
-							float v = Mathf.Clamp(r.Cfg.Value, r.Min, r.Max);
-							if (Mathf.Abs(r.S.value - v) > 0.001f) { r.S.SetValueWithoutNotify(v); Retitle(r); }
+							bgImg.color = new Color(0.08f, 0.09f, 0.11f, 0.80f);
 						}
-						catch { }
 					}
+					else
+					{
+						var hImg = header.GetComponent<UnityEngine.UI.Image>();
+						if (hImg == null) hImg = header.gameObject.AddComponent<UnityEngine.UI.Image>();
+						hImg.color = new Color(0.08f, 0.09f, 0.11f, 0.80f);
+					}
+
+					var htmp = header.GetComponentInChildren<TMPro.TMP_Text>(true);
+					if (htmp != null) htmp.text = "VRChat Archive";
+
+				}
+
+				VRChatArchiveModPlugin.Logger.LogInfo($"[QMTab] page filled with continuous VRTool-style sections and {(_toggles.Count + _steppers.Count)} control(s).");
 			}
-			catch { }
+			catch (Exception e)
+			{
+				VRChatArchiveModPlugin.Logger.LogWarning($"[QMTab] page fill failed: {e.Message}");
+			}
 		}
 
-		// THE HEADER'S BACK ARROW — a CLONE of the Button_Back that Menu_DevTools ships disabled.
-		//
-		// It used to be VRChat's own object: we switched it on, wiped its listeners and re-pointed
-		// it at Root. That breaks rule 1 (never modify VRChat's objects) and it never held — the
-		// game's page controller still owned that button, re-styled it and re-armed it to ITS page
-		// stack, so the arrow either did nothing or popped a VRChat page instead of ours. The
-		// clone sits in the same slot (first in the header's left container, where every VRChat
-		// back arrow sits) and keeps the child icon's own styling; its ROOT is stripped like every
-		// other clone of ours, and it gets a fresh Button so none of VRChat's serialized onClick
-		// targets ride along. The original stays exactly as shipped: disabled, untouched.
-		private Transform _backBtn;      // VRChat's own — read as the donor, never written
-		private Transform _backClone;
-		private bool _backWired;
-
-		private void SyncBackButton()
+		private static void SetupScrollbar(Transform page, UnityEngine.UI.ScrollRect sr, Transform body)
 		{
+			if (sr == null || page == null) return;
 			try
 			{
-				if (_page == null) return;
-				if (_backBtn == null)
+				var oldSb = sr.transform.Find("Scrollbar_Vertical");
+				if (oldSb != null) UnityEngine.Object.DestroyImmediate(oldSb.gameObject);
+
+				// Sample native track/handle sprites from body if present in QM
+				Sprite donorTrackSprite = null;
+				Sprite donorHandleSprite = null;
+				if (body != null)
 				{
-					var header = _page.transform.Find("Header_DevTools") ?? _page.transform.Find("Header_H1");
-					if (header == null) return;
-					_backBtn = header.Find("LeftItemContainer/Button_Back") ?? header.Find("Button_Back");
-					if (_backBtn == null) return;
-				}
-
-				if (_backClone == null)
-				{
-					// Unity-null covers a canvas rebuild too: a dead clone means a dead listener,
-					// so the wire flag drops with it and the new clone is wired below.
-					_backWired = false;
-					var go = UnityEngine.Object.Instantiate(_backBtn.gameObject, _backBtn.parent);
-					go.name = "VA_Button_Back";
-					_backClone = go.transform;
-					_backClone.SetAsFirstSibling();
-
-					// The cloned Button carries VRChat's persistent onClick calls; a stripped root
-					// cannot be trusted to have nulled every one of them, so it goes and a clean
-					// Button takes its target graphic.
-					var old = go.GetComponent<UnityEngine.UI.Button>();
-					UnityEngine.UI.Graphic target = null;
-					try { if (old != null) target = old.targetGraphic; } catch { }
-					try { if (old != null) UnityEngine.Object.DestroyImmediate(old); } catch { }
-					StripRoot(_backClone);
-
-					var btn = go.AddComponent<UnityEngine.UI.Button>();
-					if (target == null) target = go.GetComponent<UnityEngine.UI.Graphic>() ?? go.GetComponentInChildren<UnityEngine.UI.Graphic>(true);
-					if (target != null) btn.targetGraphic = target;
-					// Same feedback rule as our cards (MenuCard.Setup): white tint = untouched at
-					// rest, brighter on hover/press, so the arrow visibly reacts to the pointer.
-					btn.transition = UnityEngine.UI.Selectable.Transition.ColorTint;
-					btn.colors = Core.MenuCard.Tint(Color.white);
-					btn.interactable = true;
-				}
-
-				if (!_backWired)
-				{
-					var btn = _backClone.GetComponent<UnityEngine.UI.Button>();
-					if (btn != null)
+					var donors = body.GetComponentsInChildren<UnityEngine.UI.Scrollbar>(true);
+					if (donors != null && donors.Length > 0)
 					{
-						Core.UiClick.AddClick(btn, () => GoTo(QmPage.Root));
-						_backWired = true;
+						foreach (var d in donors)
+						{
+							if (d != null && d.direction == UnityEngine.UI.Scrollbar.Direction.BottomToTop)
+							{
+								var trkImg = d.GetComponent<UnityEngine.UI.Image>();
+								if (trkImg != null && trkImg.sprite != null) donorTrackSprite = trkImg.sprite;
+								var hdlImg = d.handleRect != null ? d.handleRect.GetComponent<UnityEngine.UI.Image>() : null;
+								if (hdlImg != null && hdlImg.sprite != null) donorHandleSprite = hdlImg.sprite;
+								break;
+							}
+						}
 					}
 				}
 
-				// Shown only on a sub-page AND only once it actually does something — an arrow
-				// that is lit but unwired is a lie the user clicks three times.
-				bool want = _qmPage != QmPage.Root && _backWired;
-				if (_backClone.gameObject.activeSelf != want) _backClone.gameObject.SetActive(want);
+				// Build the custom scrollbar on sr.transform
+				var sbGo = new GameObject("Scrollbar_Vertical", Il2CppInterop.Runtime.Il2CppType.Of<RectTransform>());
+				var sbRt = sbGo.GetComponent<RectTransform>();
+				sbRt.SetParent(sr.transform, false);
+
+				// Position in the exact yellow rectangle area:
+				// Right edge of the page, full height between header line and bottom bar
+				sbRt.anchorMin = new Vector2(1f, 0f);
+				sbRt.anchorMax = new Vector2(1f, 1f);
+				sbRt.pivot = new Vector2(1f, 0.5f);
+				sbRt.sizeDelta = new Vector2(20f, 0f);
+				sbRt.offsetMin = new Vector2(-28f, 10f);
+				sbRt.offsetMax = new Vector2(-8f, -10f);
+
+				var trackImg = sbGo.AddComponent<UnityEngine.UI.Image>();
+				trackImg.sprite = donorTrackSprite ?? Core.MenuCard.RimSprite();
+				trackImg.type = UnityEngine.UI.Image.Type.Sliced;
+				trackImg.color = new Color(0.10f, 0.11f, 0.14f, 0.85f);
+				trackImg.raycastTarget = true;
+
+				var sb = sbGo.AddComponent<UnityEngine.UI.Scrollbar>();
+				sb.direction = UnityEngine.UI.Scrollbar.Direction.BottomToTop;
+
+				// Sliding Area
+				var slideGo = new GameObject("Sliding Area", Il2CppInterop.Runtime.Il2CppType.Of<RectTransform>());
+				var slideRt = slideGo.GetComponent<RectTransform>();
+				slideRt.SetParent(sbRt, false);
+				slideRt.anchorMin = Vector2.zero;
+				slideRt.anchorMax = Vector2.one;
+				slideRt.offsetMin = new Vector2(2f, 4f);
+				slideRt.offsetMax = new Vector2(-2f, -4f);
+
+				// Handle (thumb)
+				var handleGo = new GameObject("Handle", Il2CppInterop.Runtime.Il2CppType.Of<RectTransform>());
+				var handleRt = handleGo.GetComponent<RectTransform>();
+				handleRt.SetParent(slideRt, false);
+				handleRt.anchorMin = Vector2.zero;
+				handleRt.anchorMax = Vector2.one;
+				handleRt.offsetMin = Vector2.zero;
+				handleRt.offsetMax = Vector2.zero;
+
+				var handleImg = handleGo.AddComponent<UnityEngine.UI.Image>();
+				handleImg.sprite = donorHandleSprite ?? Core.MenuCard.RimSprite();
+				handleImg.type = UnityEngine.UI.Image.Type.Sliced;
+				handleImg.color = new Color(0.35f, 0.38f, 0.46f, 0.95f);
+				handleImg.raycastTarget = true;
+
+				// Grip Indicator in center of thumb
+				var gripGo = new GameObject("HandleIcon", Il2CppInterop.Runtime.Il2CppType.Of<RectTransform>());
+				var gripRt = gripGo.GetComponent<RectTransform>();
+				gripRt.SetParent(handleRt, false);
+				gripRt.anchorMin = new Vector2(0.5f, 0.5f);
+				gripRt.anchorMax = new Vector2(0.5f, 0.5f);
+				gripRt.pivot = new Vector2(0.5f, 0.5f);
+				gripRt.sizeDelta = new Vector2(8f, 22f);
+				var gripImg = gripGo.AddComponent<UnityEngine.UI.Image>();
+				gripImg.sprite = Core.MenuCard.RimSprite();
+				gripImg.type = UnityEngine.UI.Image.Type.Sliced;
+				gripImg.color = new Color(0.60f, 0.63f, 0.74f, 0.85f);
+				gripImg.raycastTarget = false;
+
+				sb.handleRect = handleRt;
+				sb.targetGraphic = handleImg;
+				sb.interactable = true;
+				sb.transition = UnityEngine.UI.Selectable.Transition.ColorTint;
+				sb.colors = Core.MenuCard.Tint(new Color(0.36f, 0.39f, 0.48f, 1f));
+
+				// Attach to ScrollRect
+				sr.verticalScrollbar = sb;
+				sr.verticalScrollbarVisibility = UnityEngine.UI.ScrollRect.ScrollbarVisibility.Permanent;
+				sr.verticalScrollbarSpacing = 0f;
+
+				sbGo.SetActive(true);
+				VRChatArchiveModPlugin.Logger.LogInfo("[QMTab] Vertical scrollbar created and attached to ScrollRect.");
 			}
-			catch { }
+			catch (Exception e)
+			{
+				VRChatArchiveModPlugin.Logger.LogWarning($"[QMTab] SetupScrollbar failed: {e.Message}");
+			}
 		}
 
-		// Every QuickMenu page shares <page>/ScrollRect/Viewport/VerticalLayoutGroup as its content.
 		private static Transform FindContent(Transform page)
 		{
 			string[] paths = { "ScrollRect/Viewport/VerticalLayoutGroup", "Scrollrect/Viewport/VerticalLayoutGroup" };
@@ -1032,13 +1408,6 @@ namespace VRChatArchiveMod.Modules
 			return null;
 		}
 
-		// VRChat's toggle tile shows its state by swapping two children, Icon_Off and Icon_On.
-		// Driving those from our config is what makes the tile behave like the game's own.
-		// VRChat's cards carry a 'Foreground' highlight layer that ships disabled — that is the
-		// game's own way of showing a card as lit. Driving it from our config gives the tiles a
-		// real ON/OFF state using VRChat's own artwork.
-		// Re-copy any sprite that was still unassigned when the page was built (VRChat resolves some
-		// of them only once a page has been shown). Runs while our page is open, then stops.
 		private void RepairSprites()
 		{
 			if (_spritesResolved || _pairs.Count == 0) return;
@@ -1069,17 +1438,13 @@ namespace VRChatArchiveMod.Modules
 				t.Last = on;
 				try
 				{
-					// Brighten the card's own Background for the lit state. Enabling VRChat's
-					// Foreground overlay washed the tile out and made ON read as "disabled".
-					Core.MenuCard.SetLit(t.Card, on, keepStyle: true);
+					Core.MenuCard.SetLit(t.Card, on, keepStyle: false);
 				}
 				catch { }
 			}
 		}
 
-		// VRChat's own tab controller decides when the page is shown, so there is nothing to
-		// force here any more — we only keep our toggle tiles reflecting the live config.
-		private bool _wasActive;   // our page's activeSelf on the previous tick: gives the "just shown" edge
+		private bool _wasActive;
 
 		private void Pump()
 		{
@@ -1088,43 +1453,14 @@ namespace VRChatArchiveMod.Modules
 				bool active = _page != null && _page.activeSelf;
 				bool shown = active && !_wasActive;
 				_wasActive = active;
-				if (!active)
+				if (!active) return;
+
+				if (shown)
 				{
-					// Hidden: forget the sub-page so the next open lands on Root, like every VRChat
-					// page does. Reopening straight onto Movement showed a lit Back arrow on a page
-					// the user never navigated to, and FillPage below rebuilds it from Root.
-					if (_qmPage != QmPage.Root) { _qmPage = QmPage.Root; _pageDirty = true; }
-					return;
+					_page.transform.SetAsLastSibling();
+					var h = _page.transform.Find("Header_DevTools") ?? _page.transform.Find("Header_H1");
+					if (h != null) h.SetAsLastSibling();
 				}
-
-				// A tile asked for another sub-page: rebuild the grid with that set. Done here, in
-				// the pump, rather than inside the click handler — a click runs during VRChat's own
-				// UI event dispatch, and destroying the very cards being dispatched to is how you
-				// get a crash instead of a menu.
-				if (_pageDirty)
-				{
-					_pageDirty = false;
-					try { FillPage(_page.transform, _body); }
-					catch (Exception e) { VRChatArchiveModPlugin.Logger.LogWarning("[QMTab] sub-page rebuild: " + e.Message); }
-				}
-
-				// VRChat's own back arrow ships in this header, disabled. Lit only on a sub-page,
-				// where it means what it says.
-				SyncBackButton();
-				SyncSliders();
-
-				// A live capture caught Menu_DevTools active AT THE SAME TIME as Menu_QM_Launchpad.
-				// In uGUI the later sibling draws on top, and Launchpad is the later one — so it
-				// covered our page and swallowed every click.
-				//
-				// The fix used to be "last sibling, EVERY frame". That kept us above every page
-				// VRChat stacks in Body after ours — whatever it opens on top while our tab is
-				// still active rendered underneath us and could not be clicked, one of the
-				// "buttons do nothing" reports. Now: one SetAsLastSibling on the show edge (the
-				// game has just reordered Body for its own page, so a single reorder lands above
-				// it), then only ever "just above Launchpad" — the one page the capture proved
-				// overlaps us — so anything VRChat stacks later stays on top and clickable.
-				if (shown) _page.transform.SetAsLastSibling();
 				var lp = _body != null ? _body.Find("Menu_QM_Launchpad") : null;
 				if (lp != null && lp.gameObject.activeSelf)
 				{
@@ -1133,13 +1469,25 @@ namespace VRChatArchiveMod.Modules
 				}
 
 				RepairSprites();
-
 				RefreshToggles();
 
-				// Re-assert card geometry twice a second while our page is open. Placing the icon
-				// and label once at build time was not holding — VRChat restyles and re-lays a page
-				// when it is shown, and whatever it does to ours happens after we are done building.
-				float now = Time.realtimeSinceStartup;
+				for (int i = 0; i < _steppers.Count; i++)
+				{
+					var s = _steppers[i];
+					if (s == null || s.Card == null || s.Cfg == null) continue;
+					try
+					{
+						float cur = s.Cfg.Value;
+						if (Mathf.Abs(cur - s.LastVal) > 0.001f)
+						{
+							s.LastVal = cur;
+							Core.MenuCard.UpdateStepperText(s.Card, s.Title, cur, s.Format);
+						}
+					}
+					catch { }
+				}
+
+				float now = VaClock.Now;
 				if (now >= _nextLayout)
 				{
 					_nextLayout = now + 0.5f;
@@ -1155,18 +1503,29 @@ namespace VRChatArchiveMod.Modules
 
 		private float _nextLayout;
 
-		// These are VRChat's OWN objects now, not clones — put them back the way we found them
-		// instead of destroying them.
 		private void Teardown()
 		{
 			try { if (_page != null) _page.SetActive(_pageWasActive); } catch { }
 			try { if (_tab != null) _tab.SetActive(_tabWasActive); } catch { }
-			// The back-arrow clone is OURS, parented under VRChat's header: destroy it so the page
-			// is left exactly as found. The original Button_Back was never touched.
-			try { if (_backClone != null) UnityEngine.Object.Destroy(_backClone.gameObject); } catch { }
-			_backClone = null; _backBtn = null; _backWired = false; _wasActive = false;
-			_page = null; _tab = null; _body = null; _fails = 0; _nextTry = 0f;
+
+			if (_page != null)
+			{
+				var content = FindContent(_page.transform);
+				if (content != null)
+				{
+					for (int i = content.childCount - 1; i >= 0; i--)
+					{
+						try { UnityEngine.Object.DestroyImmediate(content.GetChild(i).gameObject); } catch { }
+					}
+				}
+			}
+
+			_steppers.Clear();
+			_sections.Clear();
+			_pairs.Clear();
 			_toggles.Clear();
+			_wasActive = false;
+			_page = null; _tab = null; _body = null; _fails = 0; _nextTry = 0f;
 		}
 
 		private static string Il2CppName(Il2CppObjectBase o)

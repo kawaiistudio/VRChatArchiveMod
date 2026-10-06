@@ -275,7 +275,7 @@ namespace VRChatArchiveMod.Core
 			try
 			{
 				var il2 = Il2CppInterop.Runtime.Il2CppType.From(t);
-				var found = UnityEngine.Object.FindObjectsOfType(il2);
+				var found = VRChatArchiveMod.Core.Live.AllOfType(il2);
 				if (found == null) return;
 				for (int i = 0; i < found.Length; i++)
 				{
@@ -344,7 +344,7 @@ namespace VRChatArchiveMod.Core
 					EnforceCursor();   // apply this frame, not next
 				}
 
-				_fpsAccum += Time.unscaledDeltaTime;
+				_fpsAccum += VaClock.Delta;
 				_fpsFrames++;
 				if (_fpsAccum >= 0.5f)
 				{
@@ -377,7 +377,7 @@ namespace VRChatArchiveMod.Core
 
 				var prev = GUI.color;
 				GUI.color = new Color(1f, 0.72f, 0.72f, 1f);
-				GUI.Label(new Rect(r.x + 16f, r.y + 5f, r.width - 26f, 20f),
+				VRChatArchiveMod.Core.GuiCompat.Label(new Rect(r.x + 16f, r.y + 5f, r.width - 26f, 20f),
 					"WORLD SCRIPTS ARE BLOCKED — mirrors, doors, pens and videos will not work");
 				GUI.color = new Color(0.92f, 0.78f, 0.80f, 1f);
 				GUI.Label(new Rect(r.x + 16f, r.y + 24f, r.width - 26f, 18f),
@@ -403,7 +403,7 @@ namespace VRChatArchiveMod.Core
 				GuiKit.RoundedBorder(r, new Color(0f, 0f, 0f, 0f), new Color(0.55f, 0.36f, 0.98f, 0.9f), 9f, 1.5f);
 				var prev = GUI.color;
 				GUI.color = new Color(0.86f, 0.80f, 1f, 1f);
-				GUI.Label(new Rect(r.x + 14f, r.y + 4f, r.width - 24f, 20f), "FREE CURSOR  ·  release Alt to lock");
+				VRChatArchiveMod.Core.GuiCompat.Label(new Rect(r.x + 14f, r.y + 4f, r.width - 24f, 20f), "FREE CURSOR  ·  release Alt to lock");
 				GUI.color = prev;
 			}
 			catch { }
@@ -747,10 +747,8 @@ namespace VRChatArchiveMod.Core
 				guardLive
 					? "<color=#7CFF9E>on</color> \u2014 bundles must come from VRChat's own delivery, the CRC check stays "
 					  + "on, and a bad cache file is re-downloaded"
-						+ (Modules.AssetBundlePatchModule.Blocked > 0
-							? "   \u00b7   <color=#FF7A7A>" + Modules.AssetBundlePatchModule.Blocked + " refused</color>   (last: "
-							  + Trunc(Modules.AssetBundlePatchModule.LastBlocked, 40) + ")"
-							: "")
+						// [open-source build] AssetBundlePatchModule (plaintext-cache decryptor) is not part of
+						// this repository, so the "N refused" counter is omitted here.
 					: ModConfig.BundleGuardEnabled.Value
 						? "<color=#FFC08A>off</color> \u2014 the master is off, so the guard is off with it"
 						: "<color=#FFC08A>off</color> \u2014 any source is accepted and a cached file is trusted as-is",
@@ -1162,8 +1160,6 @@ namespace VRChatArchiveMod.Core
 			// capsules already built, so it takes effect on the frame it is flipped.
 			ModConfig.EspThroughWalls.Value = GuiKit.Toggle(new Rect(a.x, ty + 96f, colW, 40f),
 				"Capsules through walls", ModConfig.EspThroughWalls.Value);
-			ModConfig.AntiBlockEnabled.Value = GuiKit.Toggle(new Rect(a.x + colW + gap, ty + 96f, colW, 40f),
-				"Anti-Block", ModConfig.AntiBlockEnabled.Value);
 			// The 2D screen ESP: a box around each player with name and distance, drawn on screen.
 			ModConfig.EspEnabled.Value = GuiKit.Toggle(new Rect(a.x, ty + 144f, colW, 40f),
 				"Screen box (2D box · name · distance)", ModConfig.EspEnabled.Value);
@@ -1221,9 +1217,9 @@ namespace VRChatArchiveMod.Core
 			// SCANS ITSELF. It used to open empty and stay empty until you found the SCAN button,
 			// which reads as "this feature is broken" rather than "press that". It fills on open and
 			// refreshes every 10s while you are looking at it; SCAN is still there for right-now.
-			if (Modules.UdonManagerModule.Count == 0 && Time.realtimeSinceStartup > _umAutoScan)
+			if (Modules.UdonManagerModule.Count == 0 && VaClock.Now > _umAutoScan)
 			{
-				_umAutoScan = Time.realtimeSinceStartup + 10f;
+				_umAutoScan = VaClock.Now + 10f;
 				Modules.UdonManagerModule.Rescan();
 			}
 
@@ -1513,12 +1509,39 @@ namespace VRChatArchiveMod.Core
 
 		// Trust colour for a display name, taken from the roster the PLAYERS tab maintains
 		// (so the console costs nothing per event to colour its rows).
+		//
+		// ONE DICTIONARY HIT PER ROW, NOT A FULL ROSTER SCAN (2026-09-13).
+		//
+		// This walked all 35 roster entries for EVERY console row. The Udon/Network console draws
+		// dozens of rows, IMGUI repaints several times per frame, and the comparison is a
+		// case-insensitive string compare — so colouring the console cost tens of thousands of
+		// string compares a second in a full instance. That is quadratic work for a lookup.
+		//
+		// The map is rebuilt only when the roster actually changed (RosterVersion is bumped by
+		// RefreshRoster), so the answer is byte-for-byte what the scan returned — first match wins,
+		// same as the old loop — and the per-row cost becomes a hash lookup.
+		private static readonly System.Collections.Generic.Dictionary<string, string> _rosterColors =
+			new System.Collections.Generic.Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+		private static int _rosterColorsVersion = -1;
+
 		private static string RosterColor(string name)
 		{
-			foreach (var p in VaTagsModule.Roster)
-				if (p != null && string.Equals(p.Name, name, StringComparison.OrdinalIgnoreCase))
-					return p.IsLocal ? "#7CFF9E" : (p.TrustColor ?? "#CCCCCC");
-			return "#8FA3B8";
+			if (string.IsNullOrEmpty(name)) return "#8FA3B8";
+			int v = VaTagsModule.RosterVersion;
+			if (v != _rosterColorsVersion)
+			{
+				_rosterColorsVersion = v;
+				_rosterColors.Clear();
+				foreach (var p in VaTagsModule.Roster)
+				{
+					if (p == null || string.IsNullOrEmpty(p.Name)) continue;
+					// FIRST match wins, exactly like the loop this replaces: two players can share a
+					// display name, and the old code returned the earlier one.
+					if (_rosterColors.ContainsKey(p.Name)) continue;
+					_rosterColors[p.Name] = p.IsLocal ? "#7CFF9E" : (p.TrustColor ?? "#CCCCCC");
+				}
+			}
+			return _rosterColors.TryGetValue(name, out string c) ? c : "#8FA3B8";
 		}
 
 
@@ -1577,9 +1600,10 @@ namespace VRChatArchiveMod.Core
 			}
 		}
 
-		private static readonly Credit[] CoreTeam =
+		private static readonly Credit[] Devs =
 		{
-			new Credit("KaichiSama", "the mod, the client, the archive and everything wired between them", "vrchatarchive.org"),
+			new Credit("KaichiSama", "main dev — the mod, the client, the archive and everything wired between them", "vrchatarchive.org"),
+			new Credit("VRCXGOLD", "TrueView, and the variant builds", ""),
 		};
 
 		private static readonly Credit[] Contributors =
@@ -1609,14 +1633,14 @@ namespace VRChatArchiveMod.Core
 			var view = new Rect(a.x, a.y + 52f, a.width, a.height - 52f);
 			float rowH = 44f, headH = 30f;
 			float contentH = headH * 3f
-				+ rowH * (CoreTeam.Length + Contributors.Length + ThirdParty.Length)
+				+ rowH * (Devs.Length + Contributors.Length + ThirdParty.Length)
 				+ (Contributors.Length == 0 ? 34f : 0f) + 24f;
 
 			var content = new Rect(0f, 0f, view.width - 16f, Mathf.Max(view.height, contentH));
 			_creditScroll = GUI.BeginScrollView(view, _creditScroll, content);
 
 			float y = 4f;
-			y = CreditBlock(content.width, y, "BUILT BY", CoreTeam, rowH, headH);
+			y = CreditBlock(content.width, y, "CREDIT FROM DEVS", Devs, rowH, headH);
 
 			GUI.Label(new Rect(0f, y, content.width, 18f), "CONTRIBUTORS", _header);
 			y += headH;
@@ -1695,7 +1719,7 @@ namespace VRChatArchiveMod.Core
 			// --- modules + hotkeys (single flowing column, no overlap) ---
 			float my = a.y + 156f;
 			GUI.Label(new Rect(a.x, my, a.width, 16f), "MODULES", _header);
-			GUI.Label(new Rect(a.x, my + 22f, a.width, 18f), "• AntiCrash · Anti-Block · ESP · Radar · Movement", _dim);
+			GUI.Label(new Rect(a.x, my + 22f, a.width, 18f), "• AntiCrash · ESP · Radar · Movement", _dim);
 			GUI.Label(new Rect(a.x, my + 42f, a.width, 18f), "• Tags · FewTags · Watchlist · Udon console", _dim);
 			GUI.Label(new Rect(a.x, my + 62f, a.width, 18f), "• FewTags — community nameplate tags (DB by Fewdys).", _dim);
 
@@ -1880,12 +1904,25 @@ namespace VRChatArchiveMod.Core
 		private static Vector2 _fxScroll;
 		private static string _diagPath = "";
 
+		// A colour / effect the PICKER CANNOT REPRESENT, carried over from the tag being edited.
+		// The picker only knows 10 swatches and 14 effect ids, but tags also come from the website
+		// (full colour picker) and from older saves (alias ids). Before this, editing such a tag
+		// silently rewrote it: no swatch matched -> index 0 -> colour "" (white), no effect matched
+		// -> index 0 -> "none". Pressing EDIT then SAVE quietly stripped what the user had chosen.
+		// Kept here and written back unless the user actually clicks a swatch / an effect row.
+		private static string _tagColorCustom = "";
+		private static string _tagFxCustom = "";
+
 		private static VaTagsModule.VaTag BuildTagFromPicker(string text) => new VaTagsModule.VaTag
 		{
 			Text = text,
-			Color = TagColors[Mathf.Clamp(_tagColorIdx, 0, TagColors.Length - 1)].hex,
+			Color = string.IsNullOrEmpty(_tagColorCustom)
+				? TagColors[Mathf.Clamp(_tagColorIdx, 0, TagColors.Length - 1)].hex
+				: _tagColorCustom,
 			B = _tagB, I = _tagI, U = _tagU,
-			Fx = TagFx[Mathf.Clamp(_tagFxIdx, 0, TagFx.Length - 1)],
+			Fx = string.IsNullOrEmpty(_tagFxCustom)
+				? TagFx[Mathf.Clamp(_tagFxIdx, 0, TagFx.Length - 1)]
+				: _tagFxCustom,
 		};
 
 		// Load an existing tag into the NEW TAG editor for edit-in-place: select its owner so the
@@ -1899,23 +1936,41 @@ namespace VRChatArchiveMod.Core
 			_editUid = ownerUid;
 			_editOrig = tag.Text ?? "";
 
+			// COLOUR. A tag styled on the website can carry any hex, not just our 10 swatches, so a
+			// miss must KEEP the hex instead of falling back to swatch 0 (which is "", i.e. white).
 			_tagColorIdx = 0;
+			_tagColorCustom = "";
+			bool colorMatched = false;
 			for (int i = 0; i < TagColors.Length; i++)
-				if (!string.IsNullOrEmpty(tag.Color) && string.Equals(TagColors[i].hex, tag.Color, StringComparison.OrdinalIgnoreCase)) { _tagColorIdx = i; break; }
+				if (!string.IsNullOrEmpty(tag.Color) && string.Equals(TagColors[i].hex, tag.Color, StringComparison.OrdinalIgnoreCase)) { _tagColorIdx = i; colorMatched = true; break; }
+			if (!colorMatched && !string.IsNullOrEmpty(tag.Color)) _tagColorCustom = tag.Color;
+
 			_tagB = tag.B; _tagI = tag.I; _tagU = tag.U;
+
+			// EFFECT. Two ids are implemented but absent from the picker: "rainbow" and "wave".
+			// They are ALIASES — AnimatePlate handles them in the same switch arm as "rain" and
+			// "pulse" respectively — so mapping them onto the picker is lossless and lets the row
+			// highlight correctly. Anything else unknown is preserved verbatim rather than reset.
 			_tagFxIdx = 0;
+			_tagFxCustom = "";
 			string fx = string.IsNullOrEmpty(tag.Fx) ? "none" : tag.Fx;
+			if (string.Equals(fx, "rainbow", StringComparison.OrdinalIgnoreCase)) fx = "rain";
+			else if (string.Equals(fx, "wave", StringComparison.OrdinalIgnoreCase)) fx = "pulse";
+			bool fxMatched = false;
 			for (int i = 0; i < TagFx.Length; i++)
-				if (string.Equals(TagFx[i], fx, StringComparison.OrdinalIgnoreCase)) { _tagFxIdx = i; break; }
+				if (string.Equals(TagFx[i], fx, StringComparison.OrdinalIgnoreCase)) { _tagFxIdx = i; fxMatched = true; break; }
+			if (!fxMatched) _tagFxCustom = tag.Fx;
 		}
 
-		private static void CancelEdit() { _editUid = null; _editOrig = null; _newTag = ""; }
+		// Clearing the carried-over custom style matters here: leaving it set would silently apply
+		// the edited tag's colour/effect to whatever tag is composed next.
+		private static void CancelEdit() { _editUid = null; _editOrig = null; _newTag = ""; _tagColorCustom = ""; _tagFxCustom = ""; }
 
 		// Style picker: colour swatches, B/I/U, and the scrollable effect list with a live
 		// animated sample of every effect so the choice is obvious before you commit.
 		private static void DrawStylePicker(Rect a, string sampleText)
 		{
-			float t = Time.realtimeSinceStartup;
+			float t = VaClock.Now;
 			GUI.Label(new Rect(a.x, a.y, a.width, 18f), "TAG STYLE", _header);
 
 			// --- colours ---
@@ -1927,7 +1982,9 @@ namespace VRChatArchiveMod.Core
 				GuiKit.RoundedFill(r, c, 5f);
 				if (_tagColorIdx == i) { GUI.color = Color.white; GuiKit.Corners(r, 5f, 3f, 0f); GUI.color = Color.white; }
 				if (i == 0) GUI.Label(new Rect(r.x + 9f, r.y + 3f, sw, 22f), "∅", _rowName);
-				if (GUI.Button(r, "", _tabStyle)) _tagColorIdx = i;
+				// An explicit click is the user overriding a carried-over custom colour, so drop it
+				// — otherwise a website-styled tag could never be recoloured from here.
+				if (GUI.Button(r, "", _tabStyle)) { _tagColorIdx = i; _tagColorCustom = ""; }
 			}
 
 			// --- B / I / U ---
@@ -1957,7 +2014,7 @@ namespace VRChatArchiveMod.Core
 			{
 				var row = new Rect(4f, i * rowH, view.width - 8f, rowH - 4f);
 				if (_tagFxIdx == i) GuiKit.RoundedFill(row, new Color(GuiKit.Accent.r, GuiKit.Accent.g, GuiKit.Accent.b, 0.20f), 6f);
-				if (GUI.Button(row, "", _tabStyle)) _tagFxIdx = i;
+				if (GUI.Button(row, "", _tabStyle)) { _tagFxIdx = i; _tagFxCustom = ""; }
 
 				GUI.Label(new Rect(row.x + 8f, row.y + 2f, row.width * 0.52f, 20f),
 					(_tagFxIdx == i ? "▸ " : "") + TagFxList[i].label, _rowName);
@@ -1999,7 +2056,7 @@ namespace VRChatArchiveMod.Core
 			float colW = (a.width - gap * 2f) / 3f;
 			float midX = a.x + colW + gap;
 			float rightX = midX + colW + gap;
-			float t = Time.realtimeSinceStartup;
+			float t = VaClock.Now;
 
 			GUI.Label(new Rect(a.x, a.y, colW, 18f), "INSTANCE · " + VaTagsModule.Roster.Count + " PLAYERS", _header);
 			if (GuiKit.Button(new Rect(a.x + colW - 84f, a.y - 4f, 84f, 24f), "↻ tags")) VaTagsModule.RequestRefresh();
@@ -2098,7 +2155,10 @@ namespace VRChatArchiveMod.Core
 					if (editing && !string.Equals(txt, _editOrig, StringComparison.Ordinal))
 						VaTagsModule.RemoveTag(uid, _editOrig);
 					VaTagsModule.AddTag(uid, BuildTagFromPicker(txt));
-					_newTag = ""; _editUid = null; _editOrig = null;
+					// CancelEdit() rather than clearing the three edit fields by hand: it also drops
+					// the carried-over custom colour/effect, which would otherwise be applied to the
+					// next tag composed in this panel.
+					CancelEdit();
 				}
 				if (!string.IsNullOrWhiteSpace(_newTag))
 					GUI.Label(new Rect(midX, ay + 54f, colW, 22f),
@@ -2209,6 +2269,20 @@ namespace VRChatArchiveMod.Core
 				bool sel = p.UserId != null && p.UserId == _selectedUid;
 				if (sel) GuiKit.RoundedFill(row, new Color(GuiKit.Accent.r, GuiKit.Accent.g, GuiKit.Accent.b, 0.20f), 8f);
 				if (GUI.Button(row, "", _tabStyle)) { _selectedUid = p.UserId; _playerName = p.Name; _newTag = ""; }
+
+				// OFFSCREEN ROWS COST NOTHING BELOW THIS LINE (2026-09-13).
+				//
+				// The list draws one 50px row per player with no culling, so a 35-player instance
+				// built and laid out ~1750px of rich text — name gradient, trust colour, badge
+				// string concatenation, several GUI.Labels each — every repaint, and IMGUI repaints
+				// more than once a frame. Only a handful of rows are ever visible in the scroll view.
+				//
+				// The GUI.Button ABOVE is deliberately left outside this test: it is the only control
+				// here that allocates an IMGUI control id, and this panel is id-sensitive (see the
+				// login-popup note above). Keeping it unconditional means the id sequence is exactly
+				// what it was, so nothing can lose keyboard focus — only the drawing is skipped.
+				if (row.yMax < _rosterScroll.y || row.y > _rosterScroll.y + listRect.height) continue;
+
 				string col = string.IsNullOrEmpty(p.TrustColor) ? "#EAF6FF" : p.TrustColor;
 				string prefix = p.IsLocal ? "<color=#7CFF9E>★</color> " : (p.IsOwner ? "<color=#FFD24A>♛</color> " : "");
 				bool vaMember = VaTagsModule.IsMember(p.UserId);
@@ -2822,7 +2896,9 @@ namespace VRChatArchiveMod.Core
 				if (_previewBig != null) _previewBig.font = f;
 				if (_bigName != null) _bigName.font = f;
 				if (_dim != null) _dim.font = f;
-				if (GUI.skin != null && GUI.skin.textField != null) GUI.skin.textField.font = f;
+				// GUI.skin is NOT read here: GUISkin's getters are mis-bound on this build and reading
+				// one is a fatal access violation, not a catchable error (see GuiCompat.BaseStyle). The
+				// mod's own text-field style carries the emoji font instead.
 			}
 			catch { }
 		}

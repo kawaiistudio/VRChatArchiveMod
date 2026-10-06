@@ -20,7 +20,7 @@ namespace VRChatArchiveMod.Modules
 		public static int Hidden => _hidden.Count;
 		public static string Status = "";
 
-		private sealed class Held { public Renderer R; public bool Was; }
+		private sealed class Held { public Renderer R; public bool Was; public int Id; }
 		private static readonly List<Held> _hidden = new List<Held>();
 		private static readonly HashSet<int> _ids = new HashSet<int>();
 		private static readonly HashSet<int> _scannedAvatars = new HashSet<int>();
@@ -58,7 +58,7 @@ namespace VRChatArchiveMod.Modules
 					return;
 				}
 				if (!_wasOn) { _wasOn = true; _nextPass = 0f; _scannedAvatars.Clear(); }
-				float now = Time.realtimeSinceStartup;
+				float now = VaClock.Now;
 				if (now < _nextPass) return;
 				_nextPass = now + 2f;
 				RefreshKeywords();
@@ -75,15 +75,25 @@ namespace VRChatArchiveMod.Modules
 				var h = _hidden[i];
 				try
 				{
-					if (h.R == null || !NativeGuard.Alive(h.R)) { _hidden.RemoveAt(i); continue; }
+					if (h.R == null || !NativeGuard.Alive(h.R)) { Forget(i); continue; }
 					if (h.R.enabled) h.R.enabled = false;
 				}
-				catch { _hidden.RemoveAt(i); }
+				catch
+				{
+					// A THROW IS NOT A DEATH (2026-09-13). This used to drop the entry outright, so a
+					// renderer that merely threw once on the `enabled = false` write left _hidden — the
+					// only restore ledger — while still forced off, and its id stayed in _ids so the
+					// discovery pass could never re-adopt it either: a permanently invisible piece of
+					// somebody's avatar that RestoreAll() can no longer reach. Put it back visible if
+					// it is in fact alive, then forget it properly (id included).
+					try { if (h.R != null && NativeGuard.Alive(h.R)) h.R.enabled = h.Was; } catch { }
+					Forget(i);
+				}
 			}
 			if (_keywords.Length == 0) return;
 
 			// every REMOTE player's avatar, once per avatar instance (a new avatar = a new root id)
-			var players = VRC.SDKBase.VRCPlayerApi.AllPlayers;
+			var players = VRChatArchiveMod.Core.VaPlayers.All();
 			if (players == null) return;
 			int newlyHidden = 0;
 			for (int i = 0; i < players.Count; i++)
@@ -122,7 +132,10 @@ namespace VRChatArchiveMod.Modules
 					if (!Matches(r.transform)) continue;
 					int id = r.GetInstanceID();
 					if (!_ids.Add(id)) continue;
-					_hidden.Add(new Held { R = r, Was = r.enabled });
+					// Id recorded here, while the object is provably alive: Forget() needs it to clear
+					// _ids, and reading GetInstanceID() off an already-destroyed renderer would be an
+					// uncatchable access violation.
+					_hidden.Add(new Held { R = r, Was = r.enabled, Id = id });
 					r.enabled = false; n++;
 				}
 				catch { }
@@ -141,6 +154,15 @@ namespace VRChatArchiveMod.Modules
 				for (int k = 0; k < _keywords.Length; k++) if (n.Contains(_keywords[k])) return true;
 			}
 			return false;
+		}
+
+		/// <summary>Drops entry i from BOTH the ledger and the id set. Removing it from _hidden alone
+		/// left the renderer's instance id in _ids, which is the "already taken" guard — so the
+		/// renderer could never be re-adopted and never be restored: invisible forever.</summary>
+		private static void Forget(int i)
+		{
+			try { var h = _hidden[i]; if (h != null) _ids.Remove(h.Id); } catch { }
+			_hidden.RemoveAt(i);
 		}
 
 		private static void RestoreAll()

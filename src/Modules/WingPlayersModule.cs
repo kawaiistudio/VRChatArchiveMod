@@ -49,7 +49,7 @@ namespace VRChatArchiveMod.Modules
 				if (_panel == null || !_panel.Alive)
 				{
 					_panel = null;
-					float now = Time.realtimeSinceStartup;
+					float now = VaClock.Now;
 					if (now < _nextTry) return;
 					// Backing off rather than retrying every frame: a menu that does not exist yet must
 					// not turn this into a per-frame hierarchy walk, and one that never appears must not
@@ -127,7 +127,24 @@ namespace VRChatArchiveMod.Modules
 					var p = r[i];
 					if (p == null) continue;
 					h = h * 31 + (p.UserId != null ? p.UserId.GetHashCode() : 0);
-					h = h * 31 + (p.Plus ? 1 : 0) + (p.Adult ? 2 : 0);
+					// SAME RULE, THIRD TIME (2026-09-18). [B] is drawn in the badge column, and it was
+					// not in this hash -- so the wing list kept whatever it had built on join. The HUD
+					// roster showed [B] the moment the block landed and this panel never did, which read
+					// as "the marker does not work in the wings" when the marker was fine and the panel
+					// simply never rebuilt. A block is not a join, so nothing else moved the signature.
+					// BOTH directions hashed SEPARATELY: a flip from [B] to [b] (they unblock, you block)
+					// leaves a single "either" bit unchanged and the panel would keep the wrong marker.
+					bool bm = false, ib = false;
+					try
+					{
+						if (!p.IsLocal && p.UserId != null)
+						{
+							bm = BlockedByProbeModule.BlockedMe.Contains(p.UserId);
+							ib = BlockedByProbeModule.IBlocked.Contains(p.UserId);
+						}
+					}
+					catch { }
+					h = h * 31 + (p.Plus ? 1 : 0) + (p.Adult ? 2 : 0) + (bm ? 4 : 0) + (ib ? 8 : 0);
 				}
 				// The toggle is part of what is DRAWN, so it belongs in the signature: without it,
 				// flipping the switch changed nothing until a player happened to join or leave.
@@ -217,14 +234,6 @@ namespace VRChatArchiveMod.Modules
 			}
 			catch { }
 			if (p.IsOwner) name += PanelSkin.Tag("FFC800", " ★");
-			// Who has blocked YOU — the whole reason BlockedByProbeModule exists. Prefixed and red, so
-			// it is the first thing read on the line.
-			try
-			{
-				if (!string.IsNullOrEmpty(p.UserId) && BlockedByProbeModule.BlockedMe.Contains(p.UserId))
-					name = PanelSkin.Tag("FF4B4B", "<b>BLOCKED</b>") + " " + name;
-			}
-			catch { }
 			r.Name = name;
 
 			// Saturated rather than muted, and bold. The HUD's palette only looks electric because it
@@ -240,6 +249,26 @@ namespace VRChatArchiveMod.Modules
 				: "";
 
 			string badge = "";
+			// Blocked — ALWAYS shown, never behind a switch, and in the BADGE column with the other
+			// tags instead of glued in front of the name, where it shoved every marked row sideways.
+			// Both directions, exactly as the HUD roster does it (InstancePanelsModule). Two lists of the
+			// same players disagreeing about who is marked is worse than either rule on its own, and the
+			// condition here must stay identical to the one hashed in RosterSignature above or the panel
+			// goes back to not noticing.
+			// Both directions, told apart, same rule as the HUD roster: [B] red = they blocked YOU,
+			// [b] amber = you blocked them. The condition must stay identical to RosterSignature's hash
+			// above or the panel stops repainting on a block.
+			try
+			{
+				if (!p.IsLocal && !string.IsNullOrEmpty(p.UserId))
+				{
+					if (BlockedByProbeModule.BlockedMe.Contains(p.UserId))
+						badge += PanelSkin.Tag("FF4B4B", "<b>[B]</b>") + " ";
+					if (BlockedByProbeModule.IBlocked.Contains(p.UserId))
+						badge += PanelSkin.Tag("FFC800", "<b>[b]</b>") + " ";
+				}
+			}
+			catch { }
 			if (p.Plus) badge += PanelSkin.Tag("FFC800", "<b>VRC+</b>") + " ";
 			if (p.Adult) badge += PanelSkin.Tag("FF4FB0", "<b>18+</b>") + " ";
 			badge += p.Platform == "Quest" ? PanelSkin.Tag("3BFF7A", "<b>Q</b>")

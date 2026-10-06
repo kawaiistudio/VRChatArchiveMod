@@ -32,12 +32,16 @@ namespace VRChatArchiveMod.Modules
 		{
 			try
 			{
-				if (!ModConfig.InstancePanelsEnabled.Value) { Drop(); return; }
+				// ITS OWN SWITCH, NOT THE ON-SCREEN ONE (2026-09-21). This panel lives INSIDE VRChat's
+				// menu, beside the wing — it is not drawn over the game. Sharing InstancePanelsEnabled
+				// with the floating RShift+L panels meant the HUD master switch took this one down too,
+				// and the whole point of that switch is to clear the screen while the menus keep working.
+				if (!ModConfig.WingLogEnabled.Value) { Drop(); return; }
 
 				if (_panel == null || !_panel.Alive)
 				{
 					_panel = null;
-					float now = Time.realtimeSinceStartup;
+					float now = VaClock.Now;
 					if (now < _nextTry) return;
 					_nextTry = now + 3f;
 					if (_fails > 20) return;

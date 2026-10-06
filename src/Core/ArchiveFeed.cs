@@ -43,6 +43,17 @@ namespace VRChatArchiveMod.Core
 		/// cost a rebuild, and switching feeds must redraw even though no line arrived.</summary>
 		public static int Version { get; private set; }
 
+		// HOW MANY LINES HAVE EVER ARRIVED, per feed — which is not the same as how many are kept.
+		//
+		// The console header used to print the LIST LENGTH. That list is a 200-entry ring: once it
+		// is full every new line pushes an old one out, so the number reaches 200 and then never
+		// moves again no matter how much is happening. A counter that stops counting reads as a
+		// frozen panel, which is exactly how it was reported.
+		private static int _archiverTotal, _cacheTotal;
+
+		/// <summary>Lines received since launch on the feed currently being shown. Keeps rising.</summary>
+		public static int CurrentTotal => Showing == Kind.Cache ? _cacheTotal : _archiverTotal;
+
 		public static void Add(Kind kind, string text)
 		{
 			if (string.IsNullOrWhiteSpace(text)) return;
@@ -60,6 +71,7 @@ namespace VRChatArchiveMod.Core
 						Text = text.Length > 200 ? text.Substring(0, 199) + "…" : text,
 					});
 					if (list.Count > Capacity) list.RemoveAt(0);
+					if (kind == Kind.Cache) _cacheTotal++; else _archiverTotal++;
 				}
 				Version++;
 			}

@@ -58,43 +58,6 @@ namespace VRChatArchiveMod.Core
 			return t;
 		}
 
-		// Era artwork for the 2017 loading screen, extracted from the genuine Steam build.
-		// Cached by name so OnGUI can ask for them every frame.
-		private static readonly System.Collections.Generic.Dictionary<string, Texture2D> EraCache =
-			new System.Collections.Generic.Dictionary<string, Texture2D>();
-		// THE DISK WINS OVER THE EMBED. BepInEx\VRChatArchiveMod\loading\<key>.png replaces a
-		// piece of the 2017 artwork without a rebuild, and an empty folder leaves the original in
-		// place. Same folder convention as CrashTrail and the diagnostics dumps.
-		//
-		// Beware the rects: everything except the diamond and the logo is drawn StretchToFill
-		// against the sizes transcribed from the original canvas, so artwork of another aspect
-		// ratio is DISTORTED rather than letterboxed.
-		public static Texture2D EraTexture(string key)
-		{
-			if (EraCache.TryGetValue(key, out var t)) return t;
-			t = LoadFromLoadingFolder(key);
-			if (t == null) t = Load("era_" + key + ".png");
-			EraCache[key] = t;
-			return t;
-		}
-
-		private static Texture2D LoadFromLoadingFolder(string key)
-		{
-			try
-			{
-				string path = Path.Combine(BepInEx.Paths.BepInExRootPath,
-					"VRChatArchiveMod", "loading", key + ".png");
-				if (!File.Exists(path)) return null;
-				byte[] data = File.ReadAllBytes(path);
-				var tex = new Texture2D(2, 2, TextureFormat.RGBA32, false);
-				if (!ImageConversion.LoadImage(tex, new Il2CppStructArray<byte>(data))) return null;
-				tex.hideFlags = HideFlags.HideAndDontSave;
-				VRChatArchiveModPlugin.Logger.LogInfo("[AssetLoader] loading screen art overridden from disk: " + key + ".png");
-				return tex;
-			}
-			catch { return null; }
-		}
-
 		// The RAW bytes of an embedded image, for handing a picture to something that is not Unity \u2014
 		// the desktop client, which draws the soundboard icons itself and cannot read a Texture2D.
 		// Cached: the same few icons are asked for on a timer.

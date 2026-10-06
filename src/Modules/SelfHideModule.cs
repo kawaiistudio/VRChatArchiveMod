@@ -27,7 +27,16 @@ namespace VRChatArchiveMod.Modules
 		public static string Status = "";
 		public static int Hidden => _hidden.Count;
 
-		private sealed class Held { public Renderer R; public bool WasEnabled; }
+		private sealed class Held { public Renderer R; public bool WasEnabled; public int Id; }
+
+		/// <summary>Drops entry i from BOTH the ledger and the id set. Removing it from _hidden alone
+		/// left its instance id in _ids — the "already taken" guard — so the renderer could never be
+		/// re-adopted and never be restored: invisible for the rest of the session.</summary>
+		private static void Forget(int i)
+		{
+			try { var h = _hidden[i]; if (h != null) _ids.Remove(h.Id); } catch { }
+			_hidden.RemoveAt(i);
+		}
 		private static readonly List<Held> _hidden = new List<Held>();
 		private static readonly HashSet<int> _ids = new HashSet<int>();
 		private static int _rootId;
@@ -48,7 +57,7 @@ namespace VRChatArchiveMod.Modules
 					return;
 				}
 				if (!_on) { _on = true; _nextScan = 0f; }
-				float now = Time.realtimeSinceStartup;
+				float now = VaClock.Now;
 				if (now < _nextScan) return;
 				_nextScan = now + 1f;
 				Scan(now);
@@ -67,11 +76,21 @@ namespace VRChatArchiveMod.Modules
 				try
 				{
 					var r = h.R;
-					if (r == null || !NativeGuard.Alive(r)) { _hidden.RemoveAt(i); continue; }
+					if (r == null || !NativeGuard.Alive(r)) { Forget(i); continue; }
 					if (r.enabled) r.enabled = false;
 					if (!r.forceRenderingOff) r.forceRenderingOff = true;
 				}
-				catch { _hidden.RemoveAt(i); }
+				catch
+				{
+					// A THROW IS NOT A DEATH (2026-09-13). Dropping the entry on a transient write
+					// failure left a LIVE renderer at enabled = false with forceRenderingOff = true,
+					// outside _hidden — the only ledger RestoreAll() walks — and with its id still in
+					// _ids, so the scan could never re-adopt it either: a permanently invisible piece
+					// of your own avatar that switching self-hide off could not bring back. Put it
+					// back visible if it really is alive, then forget it properly (id included).
+					try { if (h.R != null && NativeGuard.Alive(h.R)) { h.R.forceRenderingOff = false; h.R.enabled = h.WasEnabled; } } catch { }
+					Forget(i);
+				}
 			}
 		}
 
@@ -104,12 +123,19 @@ namespace VRChatArchiveMod.Modules
 
 		private static void Scan(float now)
 		{
+			// RESTORE, DON'T JUST DROP (2026-09-13). Both of these are TRANSIENT states — the local
+			// player or the avatar root being momentarily unresolvable around a respawn or an avatar
+			// change — and Drop() is `_hidden.Clear(); _ids.Clear();` with no restore at all. Every
+			// renderer we had already written to enabled = false / forceRenderingOff = true left the
+			// ledger still hidden, so a later OFF ran RestoreAll() over an empty list and parts of
+			// the avatar stayed invisible for good. RestoreAll() puts them back first and then calls
+			// Drop() itself, which is the same reset with the undo actually performed.
 			var lt = PlayerRef.LocalTransform();
-			if (lt == null || !NativeGuard.Alive(lt)) { Drop(); Status = "self hide: no local player yet"; return; }
+			if (lt == null || !NativeGuard.Alive(lt)) { RestoreAll(); Status = "self hide: no local player yet"; return; }
 			var root = FindRoot(lt);
 			if (root == null)
 			{
-				Drop();
+				RestoreAll();
 				Status = "self hide: waiting for your avatar";
 				if (now >= _nextLog)
 				{
@@ -161,7 +187,10 @@ namespace VRChatArchiveMod.Modules
 					if (r == null || !NativeGuard.Alive(r)) continue;
 					int rid = r.GetInstanceID();
 					if (!_ids.Add(rid)) continue;
-					var h = new Held { R = r, WasEnabled = r.enabled };
+					// Id recorded while the renderer is provably alive: Forget() needs it to clear
+					// _ids, and reading GetInstanceID() off a destroyed renderer would be an
+					// uncatchable access violation.
+					var h = new Held { R = r, WasEnabled = r.enabled, Id = rid };
 					r.enabled = false;
 					r.forceRenderingOff = true;
 					_hidden.Add(h); added++;

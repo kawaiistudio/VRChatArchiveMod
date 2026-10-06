@@ -57,7 +57,7 @@ namespace VRChatArchiveMod.Modules
 				if (uid.Length == 0) return;
 				if (!_cache.TryGetValue(uid, out Cached c) || c == null) { c = new Cached(); _cache[uid] = c; }
 
-				float now = Time.realtimeSinceStartup;
+				float now = VaClock.Now;
 				if (c.VrOk && now - c.VrAt < 5f) { e.InVR = c.InVr; e.VrKnown = true; return; }
 
 				if (c.Api == null)
@@ -119,10 +119,17 @@ namespace VRChatArchiveMod.Modules
 		{
 			try
 			{
-				float now = Time.realtimeSinceStartup;
+				float now = VaClock.Now;
 				if (now < _nextPass) return;
-				_nextPass = now + 0.5f;
+				// 1 s, not 0.5 s (2026-09-13). This walks every player for AFK / Seated / InStation /
+				// VR — states that change on a human timescale, not twice a second — and in a
+				// 40-player instance the pass was 40-70 ms. Halving the cadence halves the cost with
+				// no visible change to the PLAYERS panel it feeds.
+				_nextPass = now + 1.0f;
+				long tPass = Core.PerfLog.Start();
 				Pass();
+				Core.PerfLog.Slow("PlayerStates/pass", tPass, 8.0,
+					_known + "/" + _total + " player state(s) known");
 			}
 			catch (Exception e) { Status = "player states: " + e.Message; }
 		}
@@ -214,6 +221,23 @@ namespace VRChatArchiveMod.Modules
 			c = null;
 			try
 			{
+				// CACHE FIRST (2026-09-13). The cache was consulted only AFTER a full
+				// GetComponentInChildren<Animator>(true) — a walk of every transform in the avatar,
+				// through il2cpp — plus two liveness syscalls, on EVERY pass for EVERY player. The
+				// walk was therefore never skipped, and the cache only ever saved the parameter-list
+				// read. In a 32-player instance that was this module's 43 ms/s and its 142 ms frame.
+				//
+				// A cached animator that is still alive IS this player's animator: an avatar change
+				// destroys the old Animator with the old avatar, so Alive() turns false and the full
+				// resolve below runs exactly as before. Same answers, one syscall instead of a
+				// hierarchy walk.
+				if (uid.Length > 0 && _cache.TryGetValue(uid, out c) && c != null && c.Anim != null)
+				{
+					if (NativeGuard.Alive(c.Anim)) return c.Anim;
+					_cache.Remove(uid);   // dead: the avatar changed, fall through and re-resolve
+					c = null;
+				}
+
 				var t = e.Transform;
 				if (t == null || !NativeGuard.Alive(t)) return null;
 

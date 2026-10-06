@@ -51,7 +51,7 @@ namespace VRChatArchiveMod.Modules
 			{
 				// No gate: the Archive category is always on.
 
-				float now = Time.realtimeSinceStartup;
+				float now = VaClock.Now;
 				if (now < _next) return;
 				_next = now + 2f;
 

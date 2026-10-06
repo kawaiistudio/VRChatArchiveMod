@@ -58,7 +58,7 @@ namespace VRChatArchiveMod.Modules
 			try
 			{
 				if (!_hooked) { InstallHook(); }
-				float now = Time.realtimeSinceStartup;
+				float now = VaClock.Now;
 				if (now < _nextRoll) return;
 				_nextRoll = now + 1f;
 				RollEvents();
@@ -94,6 +94,13 @@ namespace VRChatArchiveMod.Modules
 		private static void OnEventPostfix(object __0)
 		{
 			if (__0 == null) return;
+			// SWITCHED OFF, NOTHING MEASURED (2026-09-13). This postfix runs for EVERY inbound Photon
+			// event — hundreds a second — and had no switch test: with the probe off it still did
+			// three reflection GetValue calls, took a lock and added to a HashSet, while RollEvents()
+			// (the only thing that ever clears _sec) was gated off, so the buckets grew without
+			// bound for the whole session. The hook stays patched on purpose — un-patching a method
+			// on the Photon receive path at runtime is the risky operation, not the un-taken branch.
+			if (!Enabled) return;
 			try
 			{
 				var t = __0.GetType();

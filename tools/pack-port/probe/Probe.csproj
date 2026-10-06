@@ -1,0 +1,39 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- Diagnostic BepInEx IL2CPP plugin. References come from the LIVE install, not the pack source,
+       so the probe sees exactly the interop the game loads. -->
+
+  <PropertyGroup>
+    <TargetFramework>net6.0</TargetFramework>
+    <AssemblyName>VAProbe</AssemblyName>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <LangVersion>latest</LangVersion>
+    <Nullable>disable</Nullable>
+    <DebugType>none</DebugType>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+    <NoWarn>CS0649;CS0169;CS8632</NoWarn>
+    <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
+    <GenerateTargetFrameworkAttribute>false</GenerateTargetFrameworkAttribute>
+    <GameDir Condition="'$(GameDir)' == ''">$(VRCHAT_GAME_DIR)</GameDir>
+    <Live>$(GameDir)\BepInEx</Live>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="Probe.cs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Reference Include="BepInEx.Core"><HintPath>$(Live)\core\BepInEx.Core.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="BepInEx.Unity.IL2CPP"><HintPath>$(Live)\core\BepInEx.Unity.IL2CPP.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="BepInEx.Unity.Common"><HintPath>$(Live)\core\BepInEx.Unity.Common.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="Il2CppInterop.Runtime"><HintPath>$(Live)\core\Il2CppInterop.Runtime.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="Il2CppInterop.Common"><HintPath>$(Live)\core\Il2CppInterop.Common.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="SemanticVersioning"><HintPath>$(Live)\core\SemanticVersioning.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="0Harmony"><HintPath>$(Live)\core\0Harmony.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="Il2Cppmscorlib"><HintPath>$(Live)\interop\Il2Cppmscorlib.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="UnityEngine.CoreModule"><HintPath>$(Live)\interop\UnityEngine.CoreModule.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="Assembly-CSharp"><HintPath>$(Live)\interop\Assembly-CSharp.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="VRCCore-Standalone"><HintPath>$(Live)\interop\VRCCore-Standalone.dll</HintPath><Private>false</Private></Reference>
+  </ItemGroup>
+
+</Project>

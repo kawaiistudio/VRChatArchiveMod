@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Reflection;
 using UnityEngine;
 
@@ -100,15 +100,23 @@ namespace VRChatArchiveMod.Core
 
 		public static Component LocalPlayer()
 		{
+			if (!VaPlayers.Ready) return null;   // AllPlayers accessor is mis-bound on this build: do not read it
+			try
+			{
+				var all = VRChatArchiveMod.Core.VaPlayers.All();
+				if (all == null || all.Count == 0) return null;
+			}
+			catch { return null; }
+
 			if (_player != null)
 			{
-				float now = Time.realtimeSinceStartup;
+				float now = VaClock.Now;
 				if (now - _playerCheckedAt < RevalidateSec) return _player;   // trust the cache between checks
 				_playerCheckedAt = now;
 				if (NativeGuard.Alive(_player)) return _player;
 			}
 			_player = ResolveLocalPlayer();
-			_playerCheckedAt = Time.realtimeSinceStartup;
+			_playerCheckedAt = VaClock.Now;
 			return _player;
 		}
 
@@ -126,11 +134,16 @@ namespace VRChatArchiveMod.Core
 		{
 			try
 			{
+				Resolve();
+				// Do not invoke the getter unless VRC.Player is a real class on this build. Through the
+				// MissingTypeGuard placeholder it is an access violation, not a null, so the SDK-stable
+				// VRCPlayerApi is used to reach the same Component instead.
+				if (!PlayerClassIsReal()) return LocalPlayerFromApi();
 				// prop_Player_0 answers from the first frame, well before the local player exists,
 				// and what it hands back then is not a live object — reading any field off it is
 				// fatal. Everything downstream already treats null as "not spawned yet", which is
 				// exactly what this is.
-				var c = LocalPlayerProp?.GetValue(null) as Component;
+				var c = _propLocalPlayer?.GetValue(null) as Component;
 				if (c == null || NativeGuard.Alive(c)) return c;
 				// Said once, because it is the difference between "the guard is doing something"
 				// and "the crash moved somewhere else".
@@ -142,6 +155,47 @@ namespace VRChatArchiveMod.Core
 						+ "(normal before spawn) — refused instead of read.");
 				}
 				return null;
+			}
+			catch { return null; }
+		}
+
+		// VRC.Player is one of VRChat's obfuscated internal classes: its name is not stable across
+		// builds, so on this one GetIl2CppClass cannot find it and MissingTypeGuard stands System.Object
+		// in for it. Invoking prop_Player_0 through that placeholder is the access violation that took
+		// the game down. This is the cheap, safe check before the call: a real, present class or nothing.
+		private static readonly System.Collections.Generic.Dictionary<string, bool> _realClass = new System.Collections.Generic.Dictionary<string, bool>();
+		private static bool ClassIsReal(string ns, string name)
+		{
+			string key = ns + "." + name;
+			if (_realClass.TryGetValue(key, out bool real)) return real;
+			try
+			{
+				IntPtr k = Il2CppInterop.Runtime.IL2CPP.GetIl2CppClass("Assembly-CSharp.dll", ns, name);
+				// Recovered-but-renamed counts as unusable HERE: this path invokes a getter, and a
+				// recovered class's members cannot be named on this build.
+				real = k != IntPtr.Zero && !MissingTypeGuard.IsPlaceholder(k) && !ObfuscatedClassFinder.IsRecovered(k);
+				VRChatArchiveModPlugin.Logger.LogInfo("[PlayerRef] " + key + " il2cpp class=0x" + k.ToString("X")
+					+ " reelle=" + real + (real ? "" : " — ses getters sont evites, le SDK (VRCPlayerApi) prend le relais."));
+			}
+			catch { real = false; }
+			_realClass[key] = real;
+			return real;
+		}
+		private static bool PlayerClassIsReal() => ClassIsReal("VRC", "Player");
+		private static bool VrcPlayerClassIsReal() => ClassIsReal("", "VRCPlayer");
+
+		// The same Component reached through the SDK-stable VRCPlayerApi: its gameObject's Transform IS
+		// a Component, and it is what every consumer actually wants (a transform, a position). The one
+		// thing it lacks is field_Private_VRCPlayerApi_0, which ZeroVelocity now no longer needs.
+		private static Component LocalPlayerFromApi()
+		{
+			try
+			{
+				var api = LocalApi();
+				if (api == null || !NativeGuard.Alive(api)) return null;
+				var go = api.gameObject;
+				if (go == null || !NativeGuard.Alive(go)) return null;
+				return go.transform;
 			}
 			catch { return null; }
 		}
@@ -169,32 +223,60 @@ namespace VRChatArchiveMod.Core
 
 		public static VRC.SDKBase.VRCPlayerApi LocalApi()
 		{
+			if (!VaPlayers.Ready) return null;   // AllPlayers accessor is mis-bound on this build: do not read it
+			try
+			{
+				var all = VRChatArchiveMod.Core.VaPlayers.All();
+				if (all == null || all.Count == 0) return null;
+			}
+			catch { return null; }
+
 			if (_api != null)
 			{
-				float now = Time.realtimeSinceStartup;
+				float now = VaClock.Now;
 				if (now - _apiCheckedAt < RevalidateSec) return _api;
 				_apiCheckedAt = now;
 				if (NativeGuard.Alive(_api)) return _api;
 			}
 			_api = ResolveApi();
-			_apiCheckedAt = Time.realtimeSinceStartup;
+			_apiCheckedAt = VaClock.Now;
 			return _api;
 		}
 
 		private static VRC.SDKBase.VRCPlayerApi ResolveApi()
 		{
+			if (!VaPlayers.Ready) return null;   // AllPlayers accessor is mis-bound on this build: do not read it
+			try
+			{
+				var all = VRChatArchiveMod.Core.VaPlayers.All();
+				if (all == null || all.Count == 0) return null;
+
+				for (int i = 0; i < all.Count; i++)
+				{
+					var a = all[i];
+					if (a != null && NativeGuard.Alive(a) && a.isLocal)
+					{
+						return a;
+					}
+				}
+			}
+			catch { }
+
 			Resolve();
 			try
 			{
-				if (_propVrcPlayerSelf != null && _propApiOnSelf != null)
+				// VRCPlayer is obfuscated and absent under its 1886 name on this build: through the
+				// placeholder its static self-pointer getter is an access violation. Skip straight to
+				// the SDK's AllPlayers when the class is not really there.
+				if (VrcPlayerClassIsReal() && _propVrcPlayerSelf != null && _propApiOnSelf != null)
 				{
 					object self = null;
 					try { self = _propVrcPlayerSelf.GetValue(null); } catch { }
-					if (self != null)
+					if (self != null && NativeGuard.Alive(self))
 					{
 						try
 						{
-							if (_propApiOnSelf.GetValue(self) is VRC.SDKBase.VRCPlayerApi api && api != null)
+							if (_propApiOnSelf.GetValue(self) is VRC.SDKBase.VRCPlayerApi api && api != null && NativeGuard.Alive(api))
 								return api;
 						}
 						catch { }
@@ -203,24 +285,6 @@ namespace VRChatArchiveMod.Core
 			}
 			catch { }
 
-			// FALLBACK, and deliberately not run every frame. Before the local player exists the
-			// path above legitimately fails on every call, and without this gate the failure case
-			// walks the whole player list once a frame — the loading screen would pay for it.
-			try
-			{
-				float now = Time.realtimeSinceStartup;
-				if (now < _nextScan) return null;
-				_nextScan = now + 0.5f;
-
-				var all = VRC.SDKBase.VRCPlayerApi.AllPlayers;
-				if (all != null)
-					for (int i = 0; i < all.Count; i++)
-					{
-						var a = all[i];
-						if (a != null && a.isLocal) return a;
-					}
-			}
-			catch { }
 			return null;
 		}
 
@@ -250,6 +314,9 @@ namespace VRChatArchiveMod.Core
 				}
 
 				object api = _propApiOnComponent?.GetValue(player);
+				// A Transform handed out by LocalPlayerFromApi has no such field: the SDK handle IS
+				// the api, and it is exactly as good for SetVelocity.
+				if (api == null) api = LocalApi();
 				if (api == null) return;
 
 				if (_setVelocity == null)

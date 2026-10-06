@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using Il2CppInterop.Runtime;
 using UnityEngine;
@@ -61,6 +61,7 @@ namespace VRChatArchiveMod.Modules
 
 		private static bool _panelLogged;
 		private static float _lastWaitLog;
+		private static int _findFails;
 
 		public override void OnUpdate()
 		{
@@ -82,22 +83,45 @@ namespace VRChatArchiveMod.Modules
 				// tick below would make a 147-avatar list take five minutes to fill in.
 				PumpFetches();
 
-				float now = Time.realtimeSinceStartup;
+				float now = VaClock.Now;
 				if (now < _next) return;
 				_next = now + 2f;
 
 				// CACHE THE PANEL. This used to run a process-wide Resources scan every two
 				// seconds forever, which the spike hunter measured at 48 ms/s — the panel does not
 				// move once the menu exists, so look for it only while we do not have one.
-				if (_panel == null) _panel = FindPanel();
+				// A SEARCH THAT CANNOT SUCCEED MUST STOP SEARCHING.
+				//
+				// FindPanel deliberately stopped caching a panel that holds no categories, so that it
+				// would keep looking for the real one. On 1903 there IS no real one -- the obfuscated
+				// panel type was reassigned to another class -- so "keep looking" became a full
+				// Resources.FindObjectsOfTypeAll sweep plus a category read per candidate, every two
+				// seconds, for ever. The profiler caught it at ArchiveHijack=641 ms/s: a dead feature
+				// costing two thirds of the mod's entire budget.
+				//
+				// Ten attempts is generous for a panel that appears the moment the avatar menu opens.
+				// After that this stands down for the session; ArchiveFavGridModule renders the Archive
+				// favourites without borrowing any VRChat type, so nothing is lost by stopping.
+				if (_panel == null && _findFails < 10) _panel = FindPanel();
 				if (_panel == null)
 				{
-					Status = "waiting for the avatar menu";
-					// Said once every ~30s while stuck: the difference between "you haven't opened the
-					// avatar menu yet" and "the panel type no longer resolves on this game build".
-					if (now - _lastWaitLog > 30f) { _lastWaitLog = now; VRChatArchiveModPlugin.Logger.LogWarning("[ArchiveHijack] still cannot find the avatar-menu panel (FindPanel returned null)."); }
+					if (_findFails < 10 && ++_findFails >= 10)
+					{
+						Status = "avatar-menu panel not resolvable on this build — ARCHIVE FAVORITES is drawn by the grid instead";
+						VRChatArchiveModPlugin.Logger.LogWarning(
+							"[ArchiveHijack] panneau introuvable apres 10 essais — le type obfusque 1886 pointe sur une autre "
+							+ "classe sur ce build. Module en veille pour la session (ArchiveFavGrid dessine les favoris).");
+					}
+					else if (_findFails < 10)
+					{
+						Status = "waiting for the avatar menu";
+						// Said once every ~30s while stuck: the difference between "you haven't opened the
+						// avatar menu yet" and "the panel type no longer resolves on this game build".
+						if (now - _lastWaitLog > 30f) { _lastWaitLog = now; VRChatArchiveModPlugin.Logger.LogWarning("[ArchiveHijack] still cannot find the avatar-menu panel (FindPanel returned null)."); }
+					}
 					return;
 				}
+				_findFails = 0;
 				if (!_panelLogged) { _panelLogged = true; VRChatArchiveModPlugin.Logger.LogInfo("[ArchiveHijack] avatar-menu panel found."); }
 
 				if (string.IsNullOrEmpty(_targetId) && !PickTarget()) return;
@@ -119,6 +143,25 @@ namespace VRChatArchiveMod.Modules
 				// This catches any bound before their record existed, and runs only while OUR
 				// category is the one on screen.
 				if (_showing && _refillAt > 0f && now >= _refillAt) { _refillAt = 0f; Refill(); }
+
+				// RE-ASSERT WHILE OUR CATEGORY IS ON SCREEN (2026-09-13).
+				//
+				// The borrowed row is SDK Test Avatars, and for most accounts that list is EMPTY.
+				// Selecting it starts VRChat's OWN async load for it, which finishes AFTER our
+				// postfix has handed the grid our 127 avatars — and hands the grid its empty list,
+				// wiping ours. The log shows exactly that: "grid filled from the Archive" and then a
+				// blank page. Nothing re-filled afterwards, because the revision had not changed and
+				// the single _refillAt shot had already been spent.
+				//
+				// SETTLE, THEN LEAVE IT ALONE (2026-09-13). Re-assert on a fast cadence ONLY inside
+				// the short window opened at selection — long enough to beat VRChat's one async
+				// blank, then it stops so the grid is never re-bound (and never flashes) again. A
+				// Save/Remove is handled by the revision path above; navigating away clears _showing.
+				if (_showing && _reassertAt > 0f && now >= _reassertAt)
+				{
+					if (now < _reassertUntil) { _reassertAt = now + 0.3f; Refill(); }
+					else _reassertAt = 0f;   // window closed: grid stays as filled, no more re-binds
+				}
 			}
 			catch (Exception e)
 			{
@@ -127,7 +170,7 @@ namespace VRChatArchiveMod.Modules
 			}
 		}
 
-		public override void OnSceneLoaded(int buildIndex) { _targetId = ""; Active = false; }
+		public override void OnSceneLoaded(int buildIndex) { _targetId = ""; Active = false; _findFails = 0; }
 
 		// ------------------------------------------------------------------ target
 
@@ -138,8 +181,44 @@ namespace VRChatArchiveMod.Modules
 			try
 			{
 				var obs = _panel.field_Private_ReactiveProperty_1_List_1_ObjectPublicStBo1BoILSt1NuBoInUnique_0;
-				var live = obs != null ? obs.prop_T_0 : null;
-				if (live == null || live.Count == 0) { Status = "no categories yet"; return false; }
+				var native = obs != null ? obs.prop_T_0 : null;
+
+				// SNAPSHOT, NEVER live[i].
+				//
+				// This method used to index the il2cpp list directly, and that is `List<T>.get_Item` --
+				// mis-bound on VRChat 1903, which the mod reports at startup ("le token 0x060035A6
+				// tombe sur une methode de forme 'o5' au lieu de 'g5'"). Calling it jumped into the
+				// wrong method and ended the process:
+				//
+				//     System.AccessViolationException
+				//       at Il2CppInterop.Runtime.IL2CPP.il2cpp_runtime_invoke
+				//       at Il2CppSystem.Collections.Generic.List`1.get_Item(Int32)
+				//       at ArchiveHijackModule.PickTarget()
+				//
+				// Opening ARCHIVE FAVORITE crashed the game every time. Il2CppSeq.Items reads the
+				// list's `_items`/`_size` FIELDS instead, which are offset reads, not calls.
+				var live = Core.Il2CppSeq.Items(native);
+
+				// SAY WHY, ONCE. PickTarget returned false from three different branches without a word,
+				// so "the category never appears" and "the list is empty" and "nothing borrowable" all
+				// looked identical -- the same silence that hid every other 1903 break this session. The
+				// raw counts separate them: no field, no native list, or an empty snapshot.
+				if (live.Count == 0)
+				{
+					if (!_pickDiag)
+					{
+						_pickDiag = true;
+						int rawSize = -1;
+						try { if (native != null) rawSize = native._size; } catch { }
+						VRChatArchiveModPlugin.Logger.LogWarning(
+							"[ArchiveHijack] aucune categorie a emprunter : obs=" + (obs != null)
+							+ " liste native=" + (native != null) + " _size=" + rawSize
+							+ " snapshot=" + live.Count + ". Ouvre l'onglet AVATARS pour que VRChat remplisse la liste.");
+					}
+					Status = "no categories yet";
+					return false;
+				}
+				_pickDiag = false;
 
 				var names = new List<string>();
 				Category chosen = null;
@@ -177,7 +256,19 @@ namespace VRChatArchiveMod.Modules
 						chosen = c; chosenName = nm; break;
 					}
 				}
-				if (chosen == null) { Status = "no borrowable (non-VRC+) category to take over"; return false; }
+				if (chosen == null)
+				{
+					if (!_pickDiag2)
+					{
+						_pickDiag2 = true;
+						VRChatArchiveModPlugin.Logger.LogWarning(
+							"[ArchiveHijack] aucune categorie empruntable (toutes VRC+ ou une seule) parmi : "
+							+ string.Join(", ", names));
+					}
+					Status = "no borrowable (non-VRC+) category to take over";
+					return false;
+				}
+				_pickDiag2 = false;
 
 				_targetId = chosen.field_Public_String_0 ?? "";
 				if (string.IsNullOrEmpty(_targetId)) { Status = "category has no id"; return false; }
@@ -196,6 +287,7 @@ namespace VRChatArchiveMod.Modules
 		}
 
 		private static string _targetName = "";
+		private static bool _pickDiag, _pickDiag2;
 
 		private static string NameOf(Category c)
 		{
@@ -226,24 +318,41 @@ namespace VRChatArchiveMod.Modules
 		// The heading over the grid. It is whatever text sits in the page's header and currently
 		// reads the borrowed category's own name, so it is matched by that name rather than by a
 		// path — the header moves between VRChat versions, the name does not.
-		private void RetitleHeader()
+		// RENAMED BY ITS TEXT, NEVER BY ITS PATH.
+		//
+		// This used to walk "Avatars Container" and read "Mask/Text_Name" out of each row. Both are
+		// VRChat's own object names, and VRChat renames its menu objects between builds -- on 1903 the
+		// container was not found at all, so the sidebar kept reading "SDK Test Avatars" and the log
+		// never printed the retitle line. The label we are replacing is a string we already know, and
+		// a string cannot rot: every active TMP_Text under the main menu that still reads the borrowed
+		// category's name becomes ours. That covers the sidebar row, the page header and any breadcrumb
+		// VRChat adds later, with nothing hardcoded but the text itself.
+		private int RetitleTexts()
 		{
+			int done = 0;
 			try
 			{
 				Transform root = Core.QuickMenu.Main();
-				if (root == null) return;
+				if (root == null) return 0;
 				var texts = root.GetComponentsInChildren<TMPro.TMP_Text>(false);
-				if (texts == null) return;
+				if (texts == null) return 0;
 				for (int i = 0; i < texts.Length; i++)
 				{
 					var t = texts[i];
 					if (t == null) continue;
 					string s2;
 					try { s2 = t.text ?? ""; } catch { continue; }
-					if (string.Equals(s2, _targetName, StringComparison.Ordinal)) t.text = Title;
+					if (string.Equals(s2, _targetName, StringComparison.Ordinal))
+					{
+						try { t.text = Title; done++; } catch { }
+					}
+					// Already ours from an earlier pass: still counts, otherwise the module would
+					// report itself inactive the moment the rename succeeded.
+					else if (string.Equals(s2, Title, StringComparison.Ordinal)) done++;
 				}
 			}
 			catch { }
+			return done;
 		}
 
 		private void Retitle()
@@ -251,35 +360,35 @@ namespace VRChatArchiveMod.Modules
 			try
 			{
 				if (string.IsNullOrEmpty(_targetName)) return;
-				Transform box = FindActive("Avatars Container");
-				if (box == null) return;
 
-				int done = 0;
-				for (int i = 0; i < box.childCount; i++)
+				int done = RetitleTexts();
+
+				if (done > 0)
 				{
-					var row = box.GetChild(i);
-					if (row == null) continue;
-					var tmp = row.Find("Mask/Text_Name")?.GetComponent<TMPro.TMP_Text>();
-					if (tmp == null) continue;
-					string txt = tmp.text ?? "";
-					if (string.Equals(txt, _targetName, StringComparison.Ordinal)) { tmp.text = Title; done++; }
-					else if (string.Equals(txt, Title, StringComparison.Ordinal)) done++;
+					if (!Active)
+					{
+						Active = true;
+						Status = "'" + _targetName + "' now shows your Archive favourites";
+						VRChatArchiveModPlugin.Logger.LogInfo("[ArchiveHijack] row retitled to " + Title + " (" + done + " label(s)).");
+					}
+					return;
 				}
 
-				// THE PAGE HEADER TOO. Retitling only the sidebar row left the big heading above the
-				// grid still reading "SDK Test Avatars" — so the row said one thing and the page you
-				// landed on said another, which is worse than not renaming it at all.
-				RetitleHeader();
-
-				if (done > 0 && !Active)
-				{
-					Active = true;
-					Status = "'" + _targetName + "' now shows your Archive favourites";
-					VRChatArchiveModPlugin.Logger.LogInfo("[ArchiveHijack] row retitled to " + Title + ".");
-				}
+				// SAID ONCE EVERY 30 s WHILE IT FAILS, with the name we are hunting for. "The row still
+				// says SDK Test Avatars" and "the menu is not open" produce the same silence otherwise,
+				// and that silence is what let this sit broken.
+				float now;
+				try { now = VaClock.Now; } catch { return; }
+				if (now - _retitleWarnAt < 30f) return;
+				_retitleWarnAt = now;
+				VRChatArchiveModPlugin.Logger.LogWarning("[ArchiveHijack] aucun libelle '" + _targetName
+					+ "' trouve sous le menu principal — la ligne ne peut pas etre renommee en " + Title
+					+ " (menu ferme, ou VRChat n'affiche plus cette categorie).");
 			}
 			catch { }
 		}
+
+		private float _retitleWarnAt = -999f;
 
 		// ------------------------------------------------------------------ the grid
 
@@ -369,6 +478,16 @@ namespace VRChatArchiveMod.Modules
 					return;
 				}
 				_showing = true;
+				// A BOUNDED SETTLE WINDOW, NOT A FOREVER TIMER (2026-09-13). VRChat's async load for
+				// the borrowed category lands within a few hundred ms of selection and blanks the
+				// grid ONCE; re-asserting a handful of times over the next ~2.5 s wins that race. The
+				// old code kept re-asserting every 1.5 s for as long as the category was open, and
+				// each Refill re-binds the list — a visible flash — so the page flickered "shows /
+				// gone / shows" forever. The window closes and we stop touching the grid, which then
+				// stays filled.
+				float nowSel = VaClock.Now;
+				_reassertAt = nowSel + 0.3f;
+				_reassertUntil = nowSel + 2.5f;
 
 				var view = _panel._avatarListView;
 				if (view == null) { VRChatArchiveModPlugin.Logger.LogWarning("[ArchiveHijack] no grid view."); return; }
@@ -468,7 +587,7 @@ namespace VRChatArchiveMod.Modules
 			try
 			{
 				if (string.IsNullOrEmpty(_pendingId)) return;
-				if (Time.realtimeSinceStartup > _pendingUntil) { _pendingId = ""; return; }
+				if (VaClock.Now > _pendingUntil) { _pendingId = ""; return; }
 
 				var rec = API.FromCacheOrNew<ApiAvatar>(_pendingId);
 				bool done = false;
@@ -533,7 +652,7 @@ namespace VRChatArchiveMod.Modules
 							// record actually fills in — see PumpPendingPreview.
 							_pendingId = clickedId;
 							_pendingPtr = av.Pointer;
-							_pendingUntil = Time.realtimeSinceStartup + 12f;
+							_pendingUntil = VaClock.Now + 12f;
 							VRChatArchiveModPlugin.Logger.LogInfo("[ArchiveHijack] priority fetch for " + clickedId);
 						}
 					}
@@ -647,6 +766,12 @@ namespace VRChatArchiveMod.Modules
 		private static readonly Queue<string> Pending = new Queue<string>();
 		private const int PerTick = 8;
 		private static float _refillAt;
+		// Next re-assert of our list while our category is on screen. Counters VRChat's own async
+		// load for the borrowed (usually empty) category, which lands after our fill and blanks it.
+		private static float _reassertAt;
+		// End of the post-selection settle window: re-asserts run only until here, then stop so the
+		// grid is not re-bound (and does not flash) for the rest of the time the category is open.
+		private static float _reassertUntil;
 		private static bool _showing;
 		private static int _lastRev = -1;
 		private static float _nextFetch;
@@ -655,7 +780,7 @@ namespace VRChatArchiveMod.Modules
 		{
 			try
 			{
-				float now = Time.realtimeSinceStartup;
+				float now = VaClock.Now;
 				if (now < _nextFetch) return;
 				_nextFetch = now + 1f;
 
@@ -713,67 +838,7 @@ namespace VRChatArchiveMod.Modules
 
 		private static void ReapDeadFavourites(float now)
 		{
-			try
-			{
-				// No gate: auto-clean is always on now (see ModConfig — the ConfigEntry was removed).
-				if (now < _nextReap) return;
-				_nextReap = now + 5f;
-
-				var ids = FavoritesModule.Snapshot();
-				if (ids.Count == 0) return;
-
-				List<string> dead = null;
-				foreach (string id in ids)
-				{
-					if (string.IsNullOrEmpty(id)) continue;
-					if (Unavailable.Contains(id)) continue;   // already known gone; keep it, stop asking
-
-					// Alive the instant VRChat has ANY record — including a scan-failed one, which is
-					// real data. Forget the retry bookkeeping for it.
-					bool populated = false;
-					try { var a = API.FromCacheOrNew<ApiAvatar>(id); if (a != null) populated = a.Populated; } catch { }
-					if (populated) { _tries.Remove(id); _firstSeen.Remove(id); _lastTry.Remove(id); continue; }
-
-					if (!_firstSeen.ContainsKey(id)) _firstSeen[id] = now;
-					int tries = _tries.TryGetValue(id, out int tv) ? tv : 0;
-					float first = _firstSeen[id];
-
-					if (tries >= DeadTries && (now - first) >= DeadAge)
-						(dead ?? (dead = new List<string>())).Add(id);
-					else
-					{
-						// Not dead yet — give it another go, but no more than one fetch per RetryEvery
-						// so a handful of dead ids can never become a request storm.
-						float last = _lastTry.TryGetValue(id, out float lv) ? lv : 0f;
-						if (now - last >= RetryEvery) lock (Pending) Pending.Enqueue(id);
-					}
-				}
-
-				if (dead != null)
-					foreach (string id in dead)
-					{
-						_tries.Remove(id); _firstSeen.Remove(id); _lastTry.Remove(id);
-
-						// AUTO-CLEAN. This is the repair feature: a favourite VRChat cannot resolve is
-						// a dead id, and leaving it in the list means a card that never loads and a
-						// count that never matches. Removing it is the point.
-						//
-						// It is also parked in Unavailable first, so that between the removal and the
-						// next grid rebuild nothing keeps fetching an id already dealt with.
-						//
-						// ONE THING TO KNOW, because the two cases look identical from here: "VRChat
-						// returns nothing" is ALSO what a deleted or privated avatar looks like — the
-						// kind the Archive exists to keep. The thresholds are deliberately
-						// conservative for that reason (4 fetches AND 40 seconds), and it has never
-						// fired in any kept log. If a real archived avatar ever disappears from the
-						// list, this is the code that did it.
-						Unavailable.Add(id);
-						VRChatArchiveModPlugin.Logger.LogInfo(
-							"[ArchiveHijack] auto-clean: VRChat has no data for '" + id + "' — removing it from the Archive favourites.");
-						try { _ = FavoritesModule.RemoveAsync(id); } catch { }
-					}
-			}
-			catch { }
+			// Disabled: never auto-delete favorites (preserves VRCX local favorites)
 		}
 
 		// ------------------------------------------------------------------ helpers
@@ -822,6 +887,22 @@ namespace VRChatArchiveMod.Modules
 		// timer for as long as the panel has not been found.
 		private static Il2CppSystem.Type _panelIl2;
 
+		// The category list a panel exposes, snapshotted safely. The field name is a 1886 obfuscated
+		// name matched by shape; the read goes through the pointer-validated Il2CppSeq.Items, so a wrong
+		// panel yields an empty list instead of crashing.
+		private static List<Category> CategoriesOf(Panel p)
+		{
+			try
+			{
+				var obs = p.field_Private_ReactiveProperty_1_List_1_ObjectPublicStBo1BoILSt1NuBoInUnique_0;
+				var native = obs != null ? obs.prop_T_0 : null;
+				return Core.Il2CppSeq.Items(native);
+			}
+			catch { return new List<Category>(); }
+		}
+
+		private static bool _panelDiag;
+
 		private static Panel FindPanel()
 		{
 			try
@@ -829,17 +910,42 @@ namespace VRChatArchiveMod.Modules
 				if (_panelIl2 == null) _panelIl2 = Il2CppType.Of<Panel>();
 				var found = Resources.FindObjectsOfTypeAll(_panelIl2);
 				if (found == null) return null;
+
+				// PREFER THE INSTANCE THAT ACTUALLY HOLDS CATEGORIES.
+				//
+				// The old code took the FIRST scene-valid instance, and on 1903 that was an empty look-alike:
+				// PickTarget then read obs=True, native=True, _size=0 and gave up, so the sidebar never became
+				// ARCHIVE FAVORITES. Several objects of this type live in the menu (a template, a pooled copy,
+				// the live one); only the live one has the categories. Every candidate is checked and the one
+				// whose list is non-empty wins; the first scene-valid one is kept only as a fallback.
+				Panel firstScene = null;
+				int scanned = 0, sceneValid = 0;
 				for (int i = 0; i < found.Length; i++)
 				{
 					var o = found[i];
 					if (o == null) continue;
+					scanned++;
 					Panel p = null;
 					try { p = o.TryCast<Panel>(); } catch { continue; }
 					if (p == null) continue;
-					// Loaded assets and prefabs carry no valid scene: only a live menu object counts.
 					try { if (!p.gameObject.scene.IsValid()) continue; } catch { continue; }
-					return p;
+					sceneValid++;
+					if (firstScene == null) firstScene = p;
+					if (CategoriesOf(p).Count > 0) return p;   // the real one
 				}
+
+				// None held categories: say so once, with the counts, so "wrong panel type on this build"
+				// and "menu not open yet" are told apart instead of guessed at.
+				if (firstScene != null && !_panelDiag)
+				{
+					_panelDiag = true;
+					VRChatArchiveModPlugin.Logger.LogWarning(
+						"[ArchiveHijack] " + sceneValid + " panneau(x) du type attendu, aucun ne porte de categories ("
+						+ scanned + " objets scannes). Le type obfusque 1886 pointe probablement sur une autre classe sur ce build.");
+				}
+				// Not cached: returning null keeps the caller looking every tick instead of locking onto
+				// a category-less panel. A real panel (with categories) is returned above and cached.
+				return null;
 			}
 			catch { }
 			return null;

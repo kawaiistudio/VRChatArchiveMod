@@ -23,6 +23,13 @@ namespace VRChatArchiveMod.Modules
 		public override string Name => "ProfilerHud";
 
 		private static bool _on;
+		public static bool Active => _on;
+		public static void Toggle()
+		{
+			_on = !_on;
+			if (_on) { _profilerWasOn = ModuleManager.Profiling; ModuleManager.Profiling = true; }
+			else ModuleManager.Profiling = _profilerWasOn;
+		}
 		private static bool _profilerWasOn;
 		private static GUIStyle _mono, _dim, _hot;
 		private static float _fps, _worstFrameMs;
@@ -44,12 +51,12 @@ namespace VRChatArchiveMod.Modules
 				}
 				if (!_on) return;
 
-				// Frame time is measured here rather than taken from Time.deltaTime alone, because the
+				// Frame time is measured here rather than taken from VaClock.Delta alone, because the
 				// worst frame in the last second is what you felt, and the average is what hides it.
-				float dt = Time.unscaledDeltaTime;
+				float dt = VaClock.Delta;
 				if (dt > 0f) _fps = _fps <= 0f ? 1f / dt : Mathf.Lerp(_fps, 1f / dt, 0.05f);
 				float ms = dt * 1000f;
-				float now = Time.realtimeSinceStartup;
+				float now = VaClock.Now;
 				if (ms > _worstFrameMs) _worstFrameMs = ms;
 				if (now - _fpsAt > 1f) { _fpsAt = now; _worstFrameMs = ms; }
 			}
@@ -106,7 +113,9 @@ namespace VRChatArchiveMod.Modules
 		private static void EnsureStyles()
 		{
 			if (_mono != null) return;
-			_mono = new GUIStyle(GUI.skin.label) { fontSize = Mathf.RoundToInt(Hud.S(11f)), richText = false };
+			_mono = Core.GuiCompat.BaseStyle() ?? new GUIStyle();
+			try { _mono.fontSize = Mathf.RoundToInt(Hud.S(11f)); } catch { }
+			try { _mono.richText = false; } catch { }
 			_mono.normal.textColor = new Color(0.86f, 0.90f, 0.96f);
 			_dim = new GUIStyle(_mono); _dim.normal.textColor = new Color(0.45f, 0.53f, 0.63f);
 			_hot = new GUIStyle(_mono); _hot.normal.textColor = new Color(1f, 0.48f, 0.48f);

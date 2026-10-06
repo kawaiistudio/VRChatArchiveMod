@@ -16,7 +16,7 @@ namespace VRChatArchiveMod.Modules
 	// Styled to match the desktop client's Instance Log tab (mono font, same badge
 	// colours, "instance@vrchat:~$" header, present count).
 	//
-	// Data comes from VRCPlayerApi.AllPlayers (stable SDK API — same source as ESP), so it
+	// Data comes from VRChatArchiveMod.Core.VaPlayers.All() (stable SDK API — same source as ESP), so it
 	// survives VRChat updates. Join/leave are derived by diffing the roster each poll rather
 	// than parsing the game log, so the feed is live and needs no file access. This only
 	// DISPLAYS who is already in your instance (VRChat shows the same names on nameplates) —
@@ -81,7 +81,7 @@ namespace VRChatArchiveMod.Modules
 
 		// video-player log hook: Unity's log callback fires off-thread, so entries are queued
 		// and drained on the main thread. Passive listener — hooks nothing (see LogCapture).
-		private Application.LogCallback _logCallback;
+		private Action<string, string, LogType> _logHandler;
 		// Composed column strings and the signature they were built for. See the row loop.
 		private string[] _colLeft, _colRight, _colPos;
 		private int _colSig = -1;
@@ -106,24 +106,41 @@ namespace VRChatArchiveMod.Modules
 			VRChatArchiveModPlugin.Logger.LogInfo("[InstancePanels] ready — Right-Shift+L toggles the player list / instance log.");
 			try
 			{
-				// Threaded log listener to catch video-player URL resolutions the game logs.
-				_logCallback = Core.Il2CppDelegates.TryConvert<Application.LogCallback>(
-					(Action<string, string, LogType>)OnLog, "InstancePanels");
-				if (_logCallback != null) Application.add_logMessageReceivedThreaded(_logCallback);
+				// Log listener for the video-player URLs the game prints. Through Core.UnityLog, which
+				// hooks Application.CallLogCallback, so no il2cpp delegate is created -- asking for one
+				// is what kept this feature dark on 1903.
+				_logHandler = OnLog;
+				Core.UnityLog.Subscribe(_logHandler, "InstancePanels");
 			}
 			catch (Exception e) { VRChatArchiveModPlugin.Logger.LogWarning($"[InstancePanels] video log hook failed: {Core.Unwrap.Describe(e)}"); }
 		}
 
 		public override void OnShutdown()
 		{
-			try { if (_logCallback != null) Application.remove_logMessageReceivedThreaded(_logCallback); } catch { }
+			try { Core.UnityLog.Unsubscribe(_logHandler); } catch { }
+			_logHandler = null;
 		}
 
 		// Off-thread Unity log callback: pull the URL out of a video-player line, dedup, queue it.
+		//
+		// GATED, AND BOUNDED (2026-09-13). This runs for EVERY Unity log line, on the log thread, and
+		// the hook is installed at OnInitialize for the whole session. Two problems, both fixed here
+		// rather than by add/remove-ing the callback at runtime (installing an il2cpp delegate is the
+		// risky operation, doing it repeatedly on a toggle edge more so):
+		//   1. The regex ran even with both panels off. The switch is now the first thing tested, so
+		//      an inactive feature costs one bool read per log line instead of a regex match.
+		//   2. The drain in OnUpdate sits BELOW the enable check, so with the panels off nobody
+		//      emptied this queue and it grew without bound for the whole session. It cannot grow
+		//      now — nothing is enqueued while off — and OnUpdate also clears it on the off path.
+		// Note this is the LOG thread: ModConfig reads are plain managed dictionary lookups, which is
+		// safe here, and no Unity object is touched.
 		private void OnLog(string condition, string stackTrace, LogType type)
 		{
 			try
 			{
+				bool wanted = false;
+				try { wanted = ModConfig.InstancePanelsEnabled.Value || ModConfig.JoinNotifierEnabled.Value; } catch { }
+				if (!wanted) return;
 				if (string.IsNullOrEmpty(condition) || !VideoLine.IsMatch(condition)) return;
 				var m = UrlInLine.Match(condition);
 				if (!m.Success) return;
@@ -143,7 +160,13 @@ namespace VRChatArchiveMod.Modules
 				_hotkeyWasDown = combo;
 
 				// Poll runs if EITHER the panels OR the join notifier is on (both need the diff).
-				if (!ModConfig.InstancePanelsEnabled.Value && !ModConfig.JoinNotifierEnabled.Value) return;
+				if (!ModConfig.InstancePanelsEnabled.Value && !ModConfig.JoinNotifierEnabled.Value)
+				{
+					// Anything the log hook queued in the same frame the switch went off is dropped
+					// here, so nothing is left waiting to be replayed when the panels come back.
+					while (_videoUrls.TryDequeue(out _)) { }
+					return;
+				}
 
 				// Drain queued video URLs (from the off-thread log hook) on the main thread.
 				while (_videoUrls.TryDequeue(out string url))
@@ -166,8 +189,26 @@ namespace VRChatArchiveMod.Modules
 		// Keyed by user id (stable across renames) so we can also detect avatar changes.
 		// Enumerated through the same VRC.Player reflection path FewTags/VaTags use, which
 		// exposes the display name AND the current avatar name per player.
+		// SKIP THE REBUILD WHEN NOTHING CHANGED (2026-09-13). Poll() re-formats every row — rich-text
+		// badges, position strings, member lookups, two fresh collections — every 20 frames, but the
+		// roster it reads only refreshes every 60 frames: two polls in three rebuilt identical data
+		// (22 ms/s in the profiler, plus the GC churn of the allocations). The roster's version and
+		// the blocked-set size are the only inputs that can change between refreshes; when neither
+		// has, the previous rows are still exactly right. The join/leave diff is safe to skip too: an
+		// unchanged roster means nobody joined or left. Video URLs are drained before this in
+		// OnUpdate and are unaffected.
+		private static int _lastRosterVersion = -1;
+		private static int _lastBlockedCount = -1;
+
 		private void Poll()
 		{
+			int rv = VaTagsModule.RosterVersion;
+			int bc = 0;
+			try { bc = BlockedByProbeModule.BlockedMe.Count; } catch { }
+			if (rv == _lastRosterVersion && bc == _lastBlockedCount) return;
+			_lastRosterVersion = rv;
+			_lastBlockedCount = bc;
+
 			var current = new Dictionary<string, (string Name, string Avatar)>(StringComparer.OrdinalIgnoreCase);
 			var order = new List<(string Label, Color Col, string Badge, string Pid, bool Member, string Pos, bool Master)>();
 			_ownerName = "";
@@ -229,14 +270,29 @@ namespace VRChatArchiveMod.Modules
 								label += " → " + SpoofModule.Applied;
 						}
 						catch { }
+						// Blocked — ALWAYS shown, never behind a switch. The marker lives in the BADGE column
+						// on the right with VRC+/18+/PC, NOT as a "[B] " prefix on the name: the prefix shoved
+						// the name of every marked row sideways and read as part of it. The badge column is
+						// its own rich-text run, so the red belongs to the tag alone (the name column is one
+						// truncated single-<color> run, which is why an inline tag could never go there).
+						// The whole row still turns red, which is what makes a blocked line findable at a glance.
+						// BOTH DIRECTIONS, told apart. [B] red = they blocked YOU; [b] amber = you blocked
+						// them. The row turns red only for the first — being blocked BY someone is the one
+						// worth spotting across the panel; a person you blocked yourself is no surprise to you.
+						bool blockedByThem = false, iBlockedThem = false;
 						try
 						{
-							if (!pe.IsLocal && BlockedByProbeModule.BlockedMe.Contains(pe.UserId ?? ""))
-								label = "<color=#FF4B4B>BLOCKED</color> " + label;
+							if (!pe.IsLocal)
+							{
+								blockedByThem = BlockedByProbeModule.BlockedMe.Contains(pe.UserId ?? "");
+								iBlockedThem = BlockedByProbeModule.IBlocked.Contains(pe.UserId ?? "");
+							}
 						}
 						catch { }
+						if (iBlockedThem) badge = "<color=#FFC800>[b]</color> " + badge;
+						if (blockedByThem) badge = "<color=#FF4B4B>[B]</color> " + badge;
 
-						order.Add((label, Hex(pe.TrustColor), badge, pid, member, posText, pe.IsMaster));
+						order.Add((label, blockedByThem ? new Color(1f, 0.29f, 0.29f) : Hex(pe.TrustColor), badge, pid, member, posText, pe.IsMaster));
 						if (!pe.IsLocal) current[uid] = (pe.Name, pe.AvatarName ?? "");
 					}
 					catch { }
@@ -249,7 +305,7 @@ namespace VRChatArchiveMod.Modules
 			// DIAGNOSTIC (temporary): who the overlay sees with no platform, at most every 8s.
 			if (diagNoPlat.Count > 0)
 			{
-				float now = Time.realtimeSinceStartup;
+				float now = VaClock.Now;
 				if (now >= _diagNext)
 				{
 					_diagNext = now + 8f;
@@ -397,14 +453,14 @@ namespace VRChatArchiveMod.Modules
 		// Names can be 32-character hashes; clamp here so the pill never has to.
 		private void PushToast(string text, Color color)
 		{
-			_toasts.Add(new Toast { Text = Trunc(text, 46), Color = color, Until = Time.realtimeSinceStartup + 4f });
+			_toasts.Add(new Toast { Text = Trunc(text, 46), Color = color, Until = VaClock.Now + 4f });
 			if (_toasts.Count > 6) _toasts.RemoveAt(0);
 		}
 
 		private void DrawToasts()
 		{
 			if (_toasts.Count == 0) return;
-			float now = Time.realtimeSinceStartup;
+			float now = VaClock.Now;
 			_toasts.RemoveAll(t => now > t.Until);
 			if (_toasts.Count == 0) return;
 
@@ -426,8 +482,9 @@ namespace VRChatArchiveMod.Modules
 				// Width follows the TEXT. A fixed pill left a short name swimming in empty space
 				// and squeezed a 32-character name against the edges.
 				float textW;
-				try { textW = _toastStyle.CalcSize(new GUIContent(t.Text)).x; }
-				catch { textW = t.Text.Length * 8f; }
+				// GUIContent/CalcSize are mis-bound on this build (fatal AV) — width is estimated.
+				textW = Core.GuiCompat.TextWidth(t.Text, 14f);
+				if (textW <= 0f) textW = t.Text.Length * 8f;
 				float w = Mathf.Clamp(textW + padX * 2f + dot + 10f, minW, maxW);
 
 				var r = new Rect((Screen.width - w) * 0.5f, baseY - i * (h + gapY), w, h);
@@ -513,16 +570,10 @@ namespace VRChatArchiveMod.Modules
 		private float MonoCharW(float fs)
 		{
 			if (_monoCharAt == fs && _monoCharW > 0f) return _monoCharW;
-			float w = fs * 0.54f;                       // fallback if the style is not ready yet
-			try
-			{
-				if (_mono != null)
-				{
-					float m = _mono.CalcSize(new GUIContent("0")).x;
-					if (m > 0.1f) w = m;
-				}
-			}
-			catch { }
+			// Measured from the font size, never through GUIContent/CalcSize: both are mis-bound on
+			// this build and calling them is a fatal access violation (see GuiCompat.TextWidth).
+			float w = Core.GuiCompat.TextWidth("0", fs);
+			if (w <= 0.1f) w = fs * 0.54f;
 			_monoCharW = w;
 			_monoCharAt = fs;
 			return w;
@@ -657,7 +708,10 @@ namespace VRChatArchiveMod.Modules
 			// The id column has to FIT "[34071]" in a monospace face — seven glyphs at roughly
 			// 0.6 em each — plus a gap before the name. It was 3.4 em, so a five-digit id ran
 			// straight into the name and the two columns read as one string.
-			float badgeW = fs * 6.9f, pidW = fs * 5.1f;
+			// 6.9 em fitted "VRC+ 18+ PC" exactly; the blocked tag now rides in the same column, so the
+			// widest line is "[B] VRC+ 18+ PC" and the column has to grow with it or the leftmost tag
+			// spills over the name of every blocked row.
+			float badgeW = fs * 9.1f, pidW = fs * 5.1f;
 			bool anyPos = false;
 			try { anyPos = ModConfig.RosterPositions.Value; } catch { }
 			// The position column is the first thing to go when space runs out: two columns of names
@@ -710,7 +764,7 @@ namespace VRChatArchiveMod.Modules
 			// logo and members are not diverted to the per-row pass (line 663). With the logo present
 			// the bulk strings never contain a rainbow, so ticking the signature 12x/s only rebuilt
 			// byte-identical strings (and the undrawn _colRight/_colPos) twelve times a second.
-			int rainbowSlot = Core.AssetLoader.ArchiveLogo != null ? 0 : (int)(Time.realtimeSinceStartup * 12f);
+			int rainbowSlot = Core.AssetLoader.ArchiveLogo != null ? 0 : (int)(VaClock.Now * 12f);
 			int sig = _rosterVer * 397 ^ shown * 31 ^ cols * 17 ^ Mathf.RoundToInt(fs * 4f) ^ rainbowSlot;
 			if (sig != _colSig || _colLeft == null || _colLeft.Length != cols)
 			{
@@ -781,7 +835,7 @@ namespace VRChatArchiveMod.Modules
 
 						sbL.Append(id0).Append(crown0).Append(logoPad0)
 						   .Append(e0.Member
-							   ? Rainbow(shown0, Time.realtimeSinceStartup)
+							   ? Rainbow(shown0, VaClock.Now)
 							   : "<color=#" + ColorUtility.ToHtmlStringRGB(e0.Col) + ">" + shown0 + "</color>");
 
 						if (!string.IsNullOrEmpty(e0.Badge)) sbR.Append(e0.Badge);
@@ -820,13 +874,13 @@ namespace VRChatArchiveMod.Modules
 					string idTxt = "[" + e.Pid + "]";
 					Plain(new Rect(cx + 6f, y, colW, lh),
 						"<color=#" + ColorUtility.ToHtmlStringRGB(Hud.Dim) + ">" + idTxt + "</color>", _mono, Color.white);
-					x += _mono.CalcSize(new GUIContent(idTxt)).x + fs * 0.35f;
+					x += Core.GuiCompat.TextWidth(idTxt, fs) + fs * 0.35f;
 				}
 				if (e.Master)
 				{
 					Plain(new Rect(x, y, fs * 2f, lh),
 						"<color=#" + ColorUtility.ToHtmlStringRGB(CMaster) + ">♛</color>", _mono, Color.white);
-					x += _mono.CalcSize(new GUIContent("♛")).x + fs * 0.25f;
+					x += Core.GuiCompat.TextWidth("♛", fs) + fs * 0.25f;
 				}
 				GUI.DrawTexture(new Rect(x, y + (lh - fs) * 0.5f, fs, fs), logo, ScaleMode.ScaleToFit);
 				x += fs + 4f;
@@ -834,7 +888,7 @@ namespace VRChatArchiveMod.Modules
 					float posW = showPos ? posColW : 0f;
 					float room = colW - badgeW - (x - cx) - posW;
 					int chars = Mathf.Max(4, (int)(room / (fs * 0.5f)));
-					Plain(new Rect(x, y, room, lh), Rainbow(Trunc(e.Label, chars), Time.realtimeSinceStartup), _mono, Color.white);
+					Plain(new Rect(x, y, room, lh), Rainbow(Trunc(e.Label, chars), VaClock.Now), _mono, Color.white);
 				}
 
 				// Badge and position for the member row, in the same columns the bulk rows use, so a
